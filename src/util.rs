@@ -119,6 +119,16 @@ pub fn fmt_timeout(seconds: u64) -> String {
     }
 }
 
+/// A name (of an NVR or an address-list): 1 to `max` letters, digits, `_`,
+/// `-` and `.`.
+pub fn is_name(text: &str, max: usize) -> bool {
+    !text.is_empty()
+        && text.len() <= max
+        && text
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+}
+
 /// Printable ASCII only, at most `max` characters.
 pub fn sanitize(text: &str, max: usize) -> String {
     text.chars()

@@ -3,6 +3,7 @@
 use crate::config::NvrCfg;
 use crate::{http, util};
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::net::IpAddr;
 
 /// Per page. With `MAX_PAGES` and `MAX_EVENTS` this keeps one poll within a
@@ -15,6 +16,8 @@ const MAX_EVENTS: usize = MAX_PAGES * PAGE_SIZE;
 const MAX_FIELD: usize = 256;
 const MAX_USER: usize = 64;
 const MAX_META: usize = 128;
+/// Most `<` in one piece of XML handed to the parser (see `parse_xml`).
+const MAX_MARKUP: usize = 256;
 
 /// One log entry. `user` is whatever the remote party typed and must be
 /// treated as hostile text.
@@ -75,7 +78,6 @@ pub struct Page {
 
 impl Page {
     fn add(&mut self, item: Item) {
-        self.items += 1;
         match item {
             Item::Event(ev) => self.events.push(ev),
             Item::Ambiguous(ev) => {
@@ -89,7 +91,7 @@ impl Page {
 /// Replaces characters that XML 1.0 forbids even as character data (C0
 /// controls other than tab, LF and CR; U+FFFE; U+FFFF). An NVR copies the
 /// user name an attacker typed into its log verbatim, and one such
-/// character would otherwise make the whole reply unparseable.
+/// character would otherwise make that entry unparseable.
 pub fn xml_safe(text: &str) -> Cow<'_, str> {
     let bad = |c: char| {
         (c < ' ' && c != '\t' && c != '\n' && c != '\r') || c == '\u{fffe}' || c == '\u{ffff}'
@@ -105,8 +107,21 @@ pub fn xml_safe(text: &str) -> Cow<'_, str> {
     }
 }
 
-/// Text of the first `<tag>…</tag>` in raw markup, for pages that do not
-/// parse as a whole.
+/// Parses XML holding at most `MAX_MARKUP` `<`. roxmltree needs stack space
+/// for each level of nesting, so without this bound markup typed as a user
+/// name could exhaust the stack and abort the daemon. A real entry has about
+/// 20, a time or error reply fewer.
+fn parse_xml(text: &str) -> Result<roxmltree::Document<'_>, NvrError> {
+    if text.matches('<').count() > MAX_MARKUP {
+        return Err(NvrError::Other(
+            "bad XML from NVR: too deeply nested or too long".to_string(),
+        ));
+    }
+    roxmltree::Document::parse(text)
+        .map_err(|e| NvrError::Other(format!("bad XML from NVR: {}", e)))
+}
+
+/// Text of the first `<tag>…</tag>` in raw markup.
 fn raw_text<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
     let open = format!("<{}>", tag);
     let close = format!("</{}>", tag);
@@ -131,84 +146,54 @@ fn next_item(text: &str) -> Option<usize> {
     None
 }
 
-/// Parses a page item by item, when the page as a whole is not well-formed
-/// XML. Items that do not parse on their own are counted as skipped.
-/// Returns `None` when nothing in the text looks like a result page.
-fn salvage(nvr: &str, text: &str) -> Option<Page> {
+/// Parses one `logSearch` reply. Each `<searchMatchItem>…</searchMatchItem>`
+/// is cut out of the raw text and parsed on its own, so an entry that is
+/// malformed, or holds markup typed as a user name, costs only itself: it
+/// is counted as skipped and the rest of the page is read. The paging status
+/// is taken only from the text between entries.
+pub fn parse_page(nvr: &str, raw: &str) -> Result<Page, NvrError> {
     const CLOSE: &str = "</searchMatchItem>";
-    let status = raw_text(text, "responseStatusStrg").map(|s| s.trim().to_ascii_uppercase());
-    let mut page = Page {
-        more: status.as_deref() == Some("MORE"),
-        ..Page::default()
-    };
-    let mut rest = text;
+    let text = xml_safe(raw);
+    let mut page = Page::default();
+    let mut outside = String::new();
+    let mut rest: &str = &text;
     while let Some(start) = next_item(rest) {
-        let after = &rest[start..];
-        let Some(end) = after.find(CLOSE) else {
+        outside.push_str(&rest[..start]);
+        rest = &rest[start..];
+        page.items += 1;
+        let Some(end) = rest.find(CLOSE).map(|i| i + CLOSE.len()) else {
             // cut off: nothing after this can be an item either
-            page.items += 1;
             page.skipped += 1;
+            rest = "";
             break;
         };
-        let chunk = &after[..end + CLOSE.len()];
-        match roxmltree::Document::parse(chunk) {
+        // An item that holds another item's start tag (markup in a user
+        // name) ends at the inner close tag and so never parses.
+        match parse_xml(&rest[..end]) {
             Ok(doc) => page.add(parse_item(nvr, doc.root_element())),
-            Err(_) => {
-                page.items += 1;
-                page.skipped += 1;
-            }
+            Err(_) => page.skipped += 1,
         }
-        rest = &after[end + CLOSE.len()..];
+        rest = &rest[end..];
     }
-    if status.is_none() && page.items == 0 {
-        return None;
-    }
-    Some(page)
-}
-
-/// Parses one `logSearch` reply.
-pub fn parse_page(nvr: &str, raw: &str) -> Result<Page, NvrError> {
-    let text = xml_safe(raw);
-    let doc = match roxmltree::Document::parse(&text) {
-        Ok(doc) => doc,
-        Err(e) => {
-            return salvage(nvr, &text)
-                .ok_or_else(|| NvrError::Other(format!("bad XML from NVR: {}", e)))
-        }
-    };
-    if doc.root_element().tag_name().name() == "ResponseStatus" {
-        let field = |tag: &str| {
-            doc.descendants()
-                .find(|n| n.tag_name().name() == tag)
-                .and_then(|n| n.text())
-                .map(|t| util::sanitize(t, 60))
-                .unwrap_or_else(|| "?".to_string())
-        };
-        return Err(NvrError::Other(format!(
-            "NVR refused log search: {} / {}",
-            field("statusString"),
-            field("subStatusCode")
-        )));
-    }
-    let mut page = Page::default();
-    for node in doc.descendants().filter(|n| n.is_element()) {
-        // Anything inside an item may be markup injected through a user
-        // name: an inner "item" belongs to (and makes ambiguous) the outer
-        // one, and an inner status must not steer paging.
-        let in_item = node
-            .ancestors()
-            .skip(1)
-            .any(|a| a.tag_name().name() == "searchMatchItem");
-        match node.tag_name().name() {
-            "responseStatusStrg" if !in_item => {
-                page.more = node
-                    .text()
-                    .unwrap_or("")
-                    .trim()
-                    .eq_ignore_ascii_case("MORE")
-            }
-            "searchMatchItem" if !in_item => page.add(parse_item(nvr, node)),
-            _ => {}
+    outside.push_str(rest);
+    if let Some(status) = raw_text(&outside, "responseStatusStrg") {
+        page.more = status.trim().eq_ignore_ascii_case("MORE");
+    } else if page.items == 0 {
+        // not a result page: an error reply, or garbage
+        let doc = parse_xml(&outside)?;
+        if doc.root_element().tag_name().name() == "ResponseStatus" {
+            let field = |tag: &str| {
+                doc.descendants()
+                    .find(|n| n.tag_name().name() == tag)
+                    .and_then(|n| n.text())
+                    .map(|t| util::sanitize(t, 60))
+                    .unwrap_or_else(|| "?".to_string())
+            };
+            return Err(NvrError::Other(format!(
+                "NVR refused log search: {} / {}",
+                field("statusString"),
+                field("subStatusCode")
+            )));
         }
     }
     Ok(page)
@@ -497,8 +482,7 @@ impl Nvr {
     pub fn now(&mut self) -> Result<i64, NvrError> {
         let raw = self.request("GET", "/ISAPI/System/time", None)?;
         let raw = xml_safe(&raw);
-        let doc = roxmltree::Document::parse(&raw)
-            .map_err(|e| NvrError::Other(format!("bad XML from NVR: {}", e)))?;
+        let doc = parse_xml(&raw)?;
         doc.descendants()
             .find(|n| n.tag_name().name() == "localTime")
             .and_then(|n| n.text())
@@ -603,16 +587,9 @@ impl Nvr {
     }
 }
 
-fn usable(addr: IpAddr) -> Option<IpAddr> {
-    if addr.is_unspecified() {
-        None
-    } else {
-        Some(addr)
-    }
-}
-
 /// An address field's value. `::ffff:a.b.c.d` (how a dual-stack listener
-/// reports an IPv4 client) is the IPv4 address it wraps.
+/// reports an IPv4 client) is the IPv4 address it wraps; `::` and `0.0.0.0`
+/// (no remote address) are none.
 fn parse_addr(text: &str) -> Option<IpAddr> {
     let addr = match text.parse::<IpAddr>().ok()? {
         IpAddr::V6(v6) => v6
@@ -621,7 +598,7 @@ fn parse_addr(text: &str) -> Option<IpAddr> {
             .unwrap_or(IpAddr::V6(v6)),
         v4 => v4,
     };
-    usable(addr)
+    Some(addr).filter(|a| !a.is_unspecified())
 }
 
 /// Text the remote party chose (the login name). Never a source of an
@@ -677,7 +654,8 @@ fn flat_text(node: roxmltree::Node) -> String {
 /// twice is `Ambiguous` (injection that closes the user-name element first).
 pub fn parse_item(nvr: &str, item: roxmltree::Node) -> Item {
     let mut fields: Vec<(String, String)> = Vec::new();
-    let mut decisive: Vec<(String, usize)> = Vec::new();
+    let mut decisive: HashSet<String> = HashSet::new();
+    let mut ambiguous = false;
     // (is it exactly <userName>, flattened text) of each user-name element
     let mut users: Vec<(bool, String)> = Vec::new();
     for node in item.descendants().skip(1).filter(|n| n.is_element()) {
@@ -690,11 +668,8 @@ pub fn parse_item(nvr: &str, item: roxmltree::Node) -> Item {
             continue;
         }
         let key = node.tag_name().name().to_ascii_lowercase();
-        if decisive_key(&key) {
-            match decisive.iter_mut().find(|(k, _)| *k == key) {
-                Some((_, n)) => *n += 1,
-                None => decisive.push((key.clone(), 1)),
-            }
+        if decisive_key(&key) && !decisive.insert(key.clone()) {
+            ambiguous = true;
         }
         if attacker_typed(&key) {
             users.push((key == "username", flat_text(node)));
@@ -711,7 +686,6 @@ pub fn parse_item(nvr: &str, item: roxmltree::Node) -> Item {
             fields.push((key, text.chars().take(MAX_FIELD).collect()));
         }
     }
-    let ambiguous = decisive.iter().any(|(_, n)| *n > 1);
     let get = |name: &str| {
         fields
             .iter()
@@ -877,27 +851,49 @@ mod tests {
              </responseStatusStrg><matchList>{}</matchList></CMSearchResult>",
             body
         );
-        let page = parse_page("n", &whole).unwrap();
-        assert_eq!((page.items, page.events.len(), page.skipped), (4, 3, 1));
-        assert_eq!(page.ambiguous.len(), 1);
-        assert!(!page.more, "status injected into an item is ignored");
-        for ev in &page.events {
-            assert_eq!(ev.ip, Some("198.51.100.7".parse().unwrap()), "{:?}", ev);
-        }
-        // the same through salvage (a bare & breaks the document)
+        // the same with a bare & that breaks the document as a whole
         let broken = format!(
             "{}{}",
             whole.replace("</matchList>", ""),
             page_item("a & b")
         );
-        let page = parse_page("n", &broken).unwrap();
-        assert!(page.skipped >= 2, "sibling and the broken item: {:?}", page);
-        assert_eq!(page.ambiguous.len(), 1);
-        assert!(page
-            .events
-            .iter()
-            .all(|ev| ev.ip == Some("198.51.100.7".parse().unwrap())));
-        assert!(page.events.iter().any(|ev| ev.user.starts_with("a203")));
+        for (raw, items) in [(whole, 4), (broken, 5)] {
+            let page = parse_page("n", &raw).unwrap();
+            // counted: nested and status; skipped: sibling (ambiguous), the
+            // forged item (does not parse) and the bare &
+            assert_eq!(
+                (page.items, page.events.len(), page.skipped),
+                (items, 2, items - 2),
+                "{:?}",
+                page
+            );
+            assert_eq!(page.ambiguous.len(), 1);
+            assert!(!page.more, "status injected into an item is ignored");
+            for ev in &page.events {
+                assert_eq!(ev.ip, Some("198.51.100.7".parse().unwrap()), "{:?}", ev);
+            }
+            assert!(page.events.iter().any(|ev| ev.user.starts_with("a203")));
+        }
+    }
+
+    #[test]
+    fn deep_or_long_markup_costs_only_its_item() {
+        // in a test thread's small stack, nesting this deep would overflow it
+        let nest = |n: usize| format!("{}x{}", "<u>".repeat(n), "</u>".repeat(n));
+        let many: String = (0..20_000).map(|i| format!("<ip{}/>", i)).collect();
+        let raw = format!(
+            "{}{}{}{}{}</matchList></CMSearchResult>",
+            PAGE_HEAD,
+            page_item(&nest(100_000)),
+            page_item(&many),
+            page_item(&nest(100)),
+            page_item("admin")
+        );
+        let page = parse_page("n", &raw).unwrap();
+        assert_eq!((page.items, page.events.len(), page.skipped), (4, 2, 2));
+        assert_eq!(page.events[0].user, "x");
+        assert_eq!(page.events[1].user, "admin");
+        assert!(parse_page("n", &nest(100_000)).is_err());
     }
 
     #[test]
@@ -1092,6 +1088,18 @@ mod tests {
         // nothing recognisable at all
         assert!(parse_page("n", "<<< garbage").is_err());
         assert!(parse_page("n", "").is_err());
+        // an error reply, and a well-formed page without status or entries
+        let refused = parse_page(
+            "n",
+            "<ResponseStatus><statusString>Invalid Operation</statusString>\
+             <subStatusCode>badXmlFormat</subStatusCode></ResponseStatus>",
+        );
+        assert_eq!(
+            refused.unwrap_err().to_string(),
+            "NVR refused log search: Invalid Operation / badXmlFormat"
+        );
+        let empty = parse_page("n", "<CMSearchResult><matchList/></CMSearchResult>").unwrap();
+        assert_eq!((empty.items, empty.more), (0, false));
         // a longer tag name is not an item
         assert!(next_item("<searchMatchItemList>").is_none());
     }

@@ -118,7 +118,12 @@ fn digest_ok(method: &str, path: &str, auth: &str, nonce: &str) -> bool {
         && get("response") == expected
 }
 
+/// (status, extra header lines, content type, body)
 type Reply = (u16, String, &'static str, Vec<u8>);
+
+fn reply(code: u16, ctype: &'static str, body: impl Into<Vec<u8>>) -> Reply {
+    (code, String::new(), ctype, body.into())
+}
 
 fn search_page(f: &mut Fake, body: &str) -> Vec<u8> {
     let start = between(body, "<startTime>", "Z</startTime>").to_string();
@@ -205,19 +210,14 @@ fn route(
     let xml = "application/xml";
     let json = "application/json";
     if path.starts_with("/ISAPI/") && f.nvr_down {
-        return (DROP, String::new(), xml, Vec::new());
+        return reply(DROP, xml, "");
     }
     if path.starts_with("/rest/") {
         if f.router_unreachable {
-            return (DROP, String::new(), json, Vec::new());
+            return reply(DROP, json, "");
         }
         if auth != format!("Basic {}", util::b64(b"f2b:rpass")) {
-            return (
-                401,
-                String::new(),
-                json,
-                b"{\"error\":401,\"message\":\"Unauthorized\"}".to_vec(),
-            );
+            return reply(401, json, "{\"error\":401,\"message\":\"Unauthorized\"}");
         }
     }
     if method == "GET" && (path == "/rest/ip/firewall/raw" || path == "/rest/ip/firewall/filter") {
@@ -258,16 +258,11 @@ fn route(
                 member
             })
             .collect();
-        return (
-            200,
-            String::new(),
-            json,
-            format!("[{}]", ids.join(",")).into_bytes(),
-        );
+        return reply(200, json, format!("[{}]", ids.join(",")));
     }
     if method == "GET" && path == "/rest/system/identity" {
         f.identity_requests += 1;
-        return (200, String::new(), json, b"{\"name\":\"fake\"}".to_vec());
+        return reply(200, json, "{\"name\":\"fake\"}");
     }
     if path.starts_with("/ISAPI/") {
         f.isapi_requests += 1;
@@ -301,15 +296,15 @@ fn route(
                  <localTime>{}+02:00</localTime>\n</Time>\n",
                 f.now
             );
-            return (200, String::new(), xml, out.into_bytes());
+            return reply(200, xml, out);
         }
         if path == "/ISAPI/ContentMgmt/logSearch" && method == "POST" {
             f.search_requests += 1;
-            if let Some(raw) = f.raw_pages.pop_front() {
-                return (200, String::new(), xml, raw);
-            }
-            let out = search_page(&mut f, body);
-            return (200, String::new(), xml, out);
+            let out = match f.raw_pages.pop_front() {
+                Some(raw) => raw,
+                None => search_page(&mut f, body),
+            };
+            return reply(200, xml, out);
         }
     }
     if path.starts_with("/rest/ip/firewall/address-list") {
@@ -320,7 +315,7 @@ fn route(
             let address = param(query, "address").unwrap_or_default();
             let found = list == "cctv_ban" && f.bans.contains(&address);
             let out = if found { "[{\".id\":\"*1\"}]" } else { "[]" };
-            return (200, String::new(), json, out.as_bytes().to_vec());
+            return reply(200, json, out);
         }
         if method == "GET" {
             let list: Vec<String> = f
@@ -328,21 +323,11 @@ fn route(
                 .iter()
                 .map(|a| format!("{{\"address\":\"{}\"}}", a))
                 .collect();
-            return (
-                200,
-                String::new(),
-                json,
-                format!("[{}]", list.join(",")).into_bytes(),
-            );
+            return reply(200, json, format!("[{}]", list.join(",")));
         }
         if method == "PUT" {
             if f.router_down {
-                return (
-                    500,
-                    String::new(),
-                    json,
-                    b"{\"error\":500,\"message\":\"down\"}".to_vec(),
-                );
+                return reply(500, json, "{\"error\":500,\"message\":\"down\"}");
             }
             let address = between(body, "\"address\":\"", "\"").to_string();
             if f.bans.contains(&address) {
@@ -354,11 +339,11 @@ fn route(
                     "{{\"detail\":\"{}\",\"error\":400,\"message\":\"Bad Request\"}}",
                     detail
                 );
-                return (400, String::new(), json, out.into_bytes());
+                return reply(400, json, out);
             }
             f.bans.push(address);
             f.ban_bodies.push(body.to_string());
-            return (201, String::new(), json, b"{}".to_vec());
+            return reply(201, json, "{}");
         }
     }
     if path == format!("/bot{}/sendMessage", TOKEN) && method == "POST" {
@@ -368,12 +353,12 @@ fn route(
                 "{{\"ok\":false,\"description\":\"boom at /bot{}/x\"}}",
                 TOKEN
             );
-            return (500, String::new(), json, out.into_bytes());
+            return reply(500, json, out);
         }
         f.tg_sent.push(body.to_string());
-        return (200, String::new(), json, b"{\"ok\":true}".to_vec());
+        return reply(200, json, "{\"ok\":true}");
     }
-    (404, String::new(), "text/plain", b"not found".to_vec())
+    reply(404, "text/plain", "not found")
 }
 
 fn serve(stream: TcpStream, fake: Arc<Mutex<Fake>>) {

@@ -122,31 +122,28 @@ fn poll_nvr(
     // nothing about when they happened relative to new ones. Resync: read
     // from the new time, and record what the first window holds without
     // counting it, so old entries are never counted (again).
-    let mut since = st.since;
-    let mut baseline = false;
-    if now < since.saturating_sub(lookback) {
-        crate::warn!(
-            "{}: device clock went back from {} to {}; reading on from the new time, \
-             entries already in the log are not counted",
-            nvr.name,
-            util::fmt_ts(since),
+    let jump = if now < st.since.saturating_sub(lookback) {
+        Some(format!(
+            "went back from {} to {}",
+            util::fmt_ts(st.since),
             util::fmt_ts(now)
+        ))
+    } else {
+        st.offset
+            .map(|previous| offset.saturating_sub(previous))
+            .filter(|jump| *jump > CLOCK_JUMP)
+            .map(|jump| format!("jumped forward by {} s (to {})", jump, util::fmt_ts(now)))
+    };
+    let baseline = jump.is_some();
+    let mut since = st.since;
+    if let Some(jump) = jump {
+        crate::warn!(
+            "{}: device clock {}; reading on from the new time, entries already in the log \
+             are not counted",
+            nvr.name,
+            jump
         );
         since = now;
-        baseline = true;
-    } else if let Some(previous) = st.offset {
-        let jump = offset.saturating_sub(previous);
-        if jump > CLOCK_JUMP {
-            crate::warn!(
-                "{}: device clock jumped forward by {} s (to {}); reading on from the new time, \
-                 entries already in the log are not counted",
-                nvr.name,
-                jump,
-                util::fmt_ts(now)
-            );
-            since = now;
-            baseline = true;
-        }
     }
     // Entries older than findtime cannot contribute to a ban; skipping them
     // also avoids reading the whole log history after a long outage.
@@ -191,8 +188,10 @@ fn poll_nvr(
     };
     nvr.failed_polls = 0;
 
+    // The search window overlaps the previous one, so an entry is new only
+    // if it occurs more often than it did in the previous poll.
     let mut counter: HashMap<String, u32> = HashMap::new();
-    let mut by_key: HashMap<String, Event> = HashMap::new();
+    let mut fresh = Vec::new();
     let mut newest = since;
     for ev in search.events {
         if let Some(ts) = ev.ts {
@@ -207,12 +206,10 @@ fn poll_nvr(
         }
         let n = counter.entry(ev.key.clone()).or_insert(0);
         *n = n.saturating_add(1);
-        by_key.insert(ev.key.clone(), ev);
+        if !baseline && *n > st.seen.get(&ev.key).copied().unwrap_or(0) {
+            fresh.push(ev);
+        }
     }
-
-    // The search window overlaps the previous one, so an entry is new only
-    // if it occurs more often than it did in the previous poll.
-    let mut fresh = Vec::new();
     if baseline {
         crate::info!(
             "{}: {} existing log entr{} recorded as already seen",
@@ -220,15 +217,6 @@ fn poll_nvr(
             counter.len(),
             if counter.len() == 1 { "y" } else { "ies" }
         );
-    } else {
-        for (key, count) in &counter {
-            let before = st.seen.get(key).copied().unwrap_or(0);
-            if let Some(ev) = by_key.get(key) {
-                for _ in before..*count {
-                    fresh.push(ev.clone());
-                }
-            }
-        }
     }
     fresh.sort_by_key(|ev| ev.ts);
 
@@ -577,26 +565,7 @@ impl Engine {
                 }
                 Ok(polled) => {
                     self.alerts.pass(&check, host_now);
-                    for ev in &polled.fresh {
-                        let Some(ts) = ev.ts else { continue };
-                        let host_ts = ts.saturating_sub(polled.offset);
-                        if host_ts < now.saturating_sub(self.cfg.findtime)
-                            || host_ts > now.saturating_add(MAX_FUTURE)
-                        {
-                            crate::debug!(
-                                "{}: entry at {} (device time) is outside the counting window, \
-                                 not counted",
-                                ev.nvr,
-                                util::fmt_ts(ts)
-                            );
-                            continue;
-                        }
-                        if let Some((ip, pending)) =
-                            register(ev, host_ts, now, &self.cfg, &mut self.state, report_once)
-                        {
-                            self.queue_ban(ip, pending);
-                        }
-                    }
+                    self.count(polled, now, report_once);
                 }
             }
         }
@@ -605,6 +574,30 @@ impl Engine {
         self.report_health(host_now);
         self.flush_notifications();
         self.cleanup(host_now);
+    }
+
+    /// Counts one NVR's new failures at host time and queues the bans
+    /// they call for.
+    fn count(&mut self, polled: Polled, now: i64, report_once: bool) {
+        for ev in &polled.fresh {
+            let Some(ts) = ev.ts else { continue };
+            let host_ts = ts.saturating_sub(polled.offset);
+            if host_ts < now.saturating_sub(self.cfg.findtime)
+                || host_ts > now.saturating_add(MAX_FUTURE)
+            {
+                crate::debug!(
+                    "{}: entry at {} (device time) is outside the counting window, not counted",
+                    ev.nvr,
+                    util::fmt_ts(ts)
+                );
+                continue;
+            }
+            if let Some((ip, pending)) =
+                register(ev, host_ts, now, &self.cfg, &mut self.state, report_once)
+            {
+                self.queue_ban(ip, pending);
+            }
+        }
     }
 
     fn queue_ban(&mut self, ip: Ipv4Addr, pending: Pending) {
@@ -629,8 +622,7 @@ impl Engine {
 
     /// Applies waiting bans. Returns true when the firewall turned out to be
     /// unreachable.
-    fn flush_pending(&mut self, host_now: u64) -> bool {
-        let now = host_now;
+    fn flush_pending(&mut self, now: u64) -> bool {
         // A ban time in the future can only come from the host clock having
         // been ahead; keep it as "now" so it still counts for an hour.
         for t in self.state.recent_bans.iter_mut() {

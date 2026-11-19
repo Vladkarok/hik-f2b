@@ -1,6 +1,7 @@
 //! Configuration: a small INI file, validated strictly.
 
 use crate::action::BanTime;
+use crate::util::is_name;
 use regex_lite::Regex;
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -246,14 +247,6 @@ fn required<'a>(sec: &'a Section, key: &str, what: &str) -> Result<&'a str, Stri
         .map(|s| s.as_str())
         .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("{}: {} is required", what, key))
-}
-
-fn is_name(text: &str, max: usize) -> bool {
-    !text.is_empty()
-        && text.len() <= max
-        && text
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
 fn check_user(user: &str, what: &str) -> Result<String, String> {

@@ -523,9 +523,11 @@ login is whatever they typed). It is built accordingly:
   addresses are logged and not counted. User names are cut to 32 characters
   and reduced to printable ASCII before they reach a log line, the router or
   Telegram. Request bodies are built with escaping, Telegram messages are sent
-  without a parse mode, and control characters never reach the log. A log page
-  that is not valid UTF-8 or not well-formed XML is read entry by entry, and
-  entries that cannot be parsed are skipped with a warning.
+  without a parse mode, and control characters never reach the log. Invalid
+  UTF-8 and characters that XML forbids are replaced. Each log entry is parsed
+  on its own: one that cannot be parsed (not well-formed XML, or more markup
+  than any real entry has) is skipped with a warning, and the rest of the page
+  is still read.
 - **Markup in the user name.** Both tested firmware versions escape `<` in the
   logged login name, but hik-f2b does not rely on that: a firmware that does
   not would let an attacker type XML elements. Elements inside the user-name
@@ -633,7 +635,10 @@ Not yet tried:
 - A permanent ban (`bantime = permanent`) on a real router.
 - The Compose file and the systemd unit in `deploy/`. The Quadlet unit runs
   rootless on Debian 13 with Podman 5.4.
-- The CI workflow.
+- A health alert on real devices. The checks behind the alerts were run with
+  `--check` against both NVRs and the router, where the rule check found
+  enabled rules in `raw` and in `filter` and left a disabled one out; no real
+  outage was provoked.
 - Notify-only mode on real devices.
 - Running for days or weeks.
 

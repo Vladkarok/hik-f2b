@@ -72,12 +72,9 @@ fn utime(text: &str) -> Option<u64> {
     time(text).map(|t| t as u64)
 }
 
+/// An NVR name as the configuration allows it.
 fn name_ok(text: &str) -> bool {
-    !text.is_empty()
-        && text.len() <= 32
-        && text
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    crate::util::is_name(text, 32)
 }
 
 fn key_ok(text: &str) -> bool {

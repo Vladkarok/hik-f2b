@@ -9,3 +9,6 @@ state
 state.tmp
 
 /target/
+
+# Local agent worktrees and tool state.
+/.claude/

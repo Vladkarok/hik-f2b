@@ -36,6 +36,7 @@ macro_rules! debug {
 
 pub mod action;
 pub mod config;
+pub mod country;
 pub mod engine;
 pub mod health;
 pub mod http;

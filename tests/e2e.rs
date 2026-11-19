@@ -5,6 +5,9 @@
 //! NVR's clock is the host clock plus its own `skew`; by default a device
 //! shows local time two hours ahead of UTC, as an NVR set to UTC+2 does.
 
+#[path = "support/mmdb.rs"]
+mod mmdb;
+
 use hik_f2b::config::Config;
 use hik_f2b::engine::Engine;
 use hik_f2b::nvr::parse_kv;
@@ -2156,6 +2159,7 @@ fn check_command_reports_each_item_and_changes_nothing() {
             ("nvr nvr2".to_string(), Status::Failed),
             ("firewall".to_string(), Status::Ok),
             ("telegram".to_string(), Status::Ok),
+            ("country database".to_string(), Status::Off),
         ]
     );
     assert!(
@@ -2191,4 +2195,268 @@ fn check_command_reports_each_item_and_changes_nothing() {
     assert_eq!(lines[1].status, Status::Off);
     assert_eq!(lines[2].status, Status::Off);
     assert_eq!(h.fake.lock().unwrap().router_requests, 0);
+}
+
+// ------------------------------------------------------------- country_db
+
+const FLAG_MD: &str = "\u{1f1f2}\u{1f1e9}";
+
+/// Writes a synthetic country database (198.51.100.0/24 = MD) into the
+/// harness directory and points the engine at it.
+fn with_country_db(h: &mut Harness) -> PathBuf {
+    let path = h.dir.join("country.mmdb");
+    std::fs::write(&path, mmdb::simple(28, 6, "MD")).unwrap();
+    h.engine.cfg.country_db = Some(path.clone());
+    path
+}
+
+fn logged(lines: &[String], needle: &str) -> usize {
+    lines.iter().filter(|l| l.contains(needle)).count()
+}
+
+#[test]
+fn country_shows_in_comment_log_and_telegram() {
+    let mut h = Harness::new(true);
+    with_country_db(&mut h);
+    util::capture_log();
+    h.engine.startup_country();
+    h.burst("10:01", ATTACKER, 5);
+    h.cycle("10:02:00");
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    let body = h.fake.lock().unwrap().ban_bodies[0].clone();
+    assert!(
+        body.contains("\"comment\":\"hik-f2b nvr1 user=admin 2026-01-10T08:01:14Z country=MD\""),
+        "{}",
+        body
+    );
+    assert!(!body.contains(FLAG_MD), "{}", body);
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 1);
+    assert_eq!(
+        texts[0].lines().next().unwrap(),
+        format!(
+            "\u{26d4} hik-f2b: 198.51.100.7 ({} MD) banned for 1d00:00:00",
+            FLAG_MD
+        )
+    );
+    let log = util::captured_log();
+    assert_eq!(
+        logged(
+            &log,
+            "INFO country database: Test-Country, built 2026-11-01"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    assert_eq!(
+        logged(
+            &log,
+            "WARNING BAN 198.51.100.7 [MD] for 1d00:00:00 (hik-f2b nvr1 user=admin \
+             2026-01-10T08:01:14Z country=MD)"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    assert_eq!(logged(&log, FLAG_MD), 0, "no flag in the log");
+    assert_eq!(logged(&log, "country lookup"), 0, "{:?}", log);
+
+    // an address the database does not know: no country anywhere
+    h.burst("10:10", "203.0.113.50", 5);
+    h.cycle("10:11:00");
+    let body = h.fake.lock().unwrap().ban_bodies[1].clone();
+    assert!(
+        body.ends_with("\"comment\":\"hik-f2b nvr1 user=admin 2026-01-10T08:10:14Z\"}"),
+        "{}",
+        body
+    );
+    assert_eq!(
+        telegram_texts(&h)[1].lines().next().unwrap(),
+        "\u{26d4} hik-f2b: 203.0.113.50 banned for 1d00:00:00"
+    );
+    assert_eq!(
+        logged(&util::captured_log(), "WARNING BAN 203.0.113.50 for"),
+        1
+    );
+}
+
+#[test]
+fn country_in_dry_run_and_notify_only_lines() {
+    let mut h = Harness::new(false);
+    with_country_db(&mut h);
+    h.engine.cfg.dry_run = true;
+    util::capture_log();
+    h.burst("10:01", ATTACKER, 5);
+    h.cycle("10:02:00");
+    assert!(h.banned().is_empty());
+    let log = util::captured_log();
+    assert_eq!(
+        logged(
+            &log,
+            "WARNING DRY RUN: would ban 198.51.100.7 [MD] for 1d00:00:00 ("
+        ),
+        1,
+        "{:?}",
+        log
+    );
+
+    let mut h = Harness::with(Opts {
+        mikrotik: false,
+        ..Default::default()
+    });
+    with_country_db(&mut h);
+    util::capture_log();
+    h.burst("10:01", ATTACKER, 5);
+    h.cycle("10:02:00");
+    let log = util::captured_log();
+    assert_eq!(
+        logged(
+            &log,
+            "WARNING DETECTED 198.51.100.7 [MD] (no firewall configured, not banned) ("
+        ),
+        1,
+        "{:?}",
+        log
+    );
+}
+
+#[test]
+fn missing_country_db_never_holds_up_a_ban() {
+    let mut h = Harness::new(true);
+    let path = h.dir.join("missing.mmdb");
+    h.engine.cfg.country_db = Some(path.clone());
+    util::capture_log();
+    h.engine.startup_country();
+    let log = util::captured_log();
+    assert_eq!(
+        logged(
+            &log,
+            "WARNING country database cannot be read, bans go on without a country: cannot read "
+        ),
+        1,
+        "{:?}",
+        log
+    );
+
+    // The router is down for three cycles: the same lookup failure is not
+    // logged again on every retry.
+    h.fake.lock().unwrap().router_down = true;
+    h.burst("10:01", ATTACKER, 5);
+    h.cycle("10:02:00");
+    h.cycle("10:02:30");
+    h.cycle("10:03:00");
+    assert_eq!(h.engine.state.pending.len(), 1);
+    h.fake.lock().unwrap().router_down = false;
+    h.cycle("10:03:30");
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    let body = h.fake.lock().unwrap().ban_bodies[0].clone();
+    assert!(
+        body.ends_with("\"comment\":\"hik-f2b nvr1 user=admin 2026-01-10T08:01:14Z\"}"),
+        "{}",
+        body
+    );
+    assert_eq!(
+        telegram_texts(&h)[0].lines().next().unwrap(),
+        "\u{26d4} hik-f2b: 198.51.100.7 banned for 1d00:00:00"
+    );
+    let log = util::captured_log();
+    assert_eq!(logged(&log, "country"), 0, "already reported: {:?}", log);
+    assert_eq!(logged(&log, "WARNING BAN 198.51.100.7 for 1d00:00:00"), 1);
+
+    // a broken file is a new reason: logged once
+    std::fs::write(&path, b"not a database").unwrap();
+    h.burst("10:10", "198.51.100.8", 5);
+    h.cycle("10:11:00");
+    assert_eq!(h.banned().len(), 2);
+    let log = util::captured_log();
+    assert_eq!(
+        logged(
+            &log,
+            "WARNING country lookup failed, bans go on without a country: not a MaxMind DB"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+
+    // the file is replaced by a good one, without a restart
+    std::fs::write(&path, mmdb::simple(24, 4, "MD")).unwrap();
+    h.burst("10:20", "198.51.100.9", 5);
+    h.cycle("10:21:00");
+    let log = util::captured_log();
+    assert_eq!(
+        logged(&log, "INFO country lookups work again"),
+        1,
+        "{:?}",
+        log
+    );
+    assert_eq!(
+        logged(&log, "WARNING BAN 198.51.100.9 [MD] for"),
+        1,
+        "{:?}",
+        log
+    );
+    h.burst("10:30", "198.51.100.10", 5);
+    h.cycle("10:31:00");
+    assert_eq!(logged(&util::captured_log(), "work again"), 0);
+}
+
+#[test]
+fn without_country_db_nothing_changes() {
+    let mut h = Harness::new(true);
+    assert!(h.engine.cfg.country_db.is_none());
+    util::capture_log();
+    h.engine.startup_country();
+    h.burst("10:01", ATTACKER, 5);
+    h.cycle("10:02:00");
+    let body = h.fake.lock().unwrap().ban_bodies[0].clone();
+    assert_eq!(
+        body,
+        "{\"list\":\"cctv_ban\",\"address\":\"198.51.100.7\",\"timeout\":\"1d00:00:00\",\
+         \"comment\":\"hik-f2b nvr1 user=admin 2026-01-10T08:01:14Z\"}"
+    );
+    assert_eq!(
+        telegram_texts(&h),
+        vec![
+            "\u{26d4} hik-f2b: 198.51.100.7 banned for 1d00:00:00\nNVR: nvr1\n\
+              User tried: admin\nFailed logins: 5 within 3600 s"
+        ]
+    );
+    let log = util::captured_log();
+    assert_eq!(logged(&log, "country"), 0, "{:?}", log);
+    assert_eq!(
+        logged(
+            &log,
+            "WARNING BAN 198.51.100.7 for 1d00:00:00 (hik-f2b nvr1 user=admin 2026-01-10T08:01:14Z)"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+}
+
+#[test]
+fn check_reports_the_country_database() {
+    use hik_f2b::health::Status;
+    let mut h = Harness::new(false);
+    let line = |h: &mut Harness| h.engine.check_all().pop().unwrap();
+    let off = line(&mut h);
+    assert_eq!(off.to_string(), "off      country database: not configured");
+    let path = with_country_db(&mut h);
+    let ok = line(&mut h);
+    assert_eq!(ok.status, Status::Ok);
+    assert_eq!(
+        ok.to_string(),
+        "ok       country database: Test-Country, built 2026-11-01"
+    );
+    std::fs::write(&path, &mmdb::simple(24, 6, "MD")[..200]).unwrap();
+    let failed = line(&mut h);
+    assert_eq!(failed.status, Status::Failed);
+    assert!(failed.detail.contains("no metadata marker"), "{}", failed);
+    std::fs::remove_file(&path).unwrap();
+    let failed = line(&mut h);
+    assert_eq!(failed.status, Status::Failed);
+    assert!(failed.detail.starts_with("cannot read "), "{}", failed);
+    assert_eq!(h.fake.lock().unwrap().tg_attempts, 0);
 }

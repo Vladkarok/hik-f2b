@@ -32,6 +32,11 @@ services:
       - ./hik-f2b.ini:/etc/hik-f2b/hik-f2b.ini:ro,Z
       - ./router-ca.crt:/etc/hik-f2b/router-ca.crt:ro,Z
       - state:/var/lib/hik-f2b
+      # Optional country database (country_db, see the README). Mount a
+      # directory rather than the file itself: a file mount keeps showing
+      # the old file after it is replaced. Then set
+      # country_db = /etc/hik-f2b/country/country.mmdb
+      # - ./country:/etc/hik-f2b/country:ro,Z
     secrets:
       - hik-f2b-router
       - hik-f2b-nvr

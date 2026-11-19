@@ -99,6 +99,8 @@ pub trait Notifier {
 /// The values a notification template can refer to.
 pub struct BanInfo<'a> {
     pub ip: Ipv4Addr,
+    /// Empty, or ` (<flag> <code>)` when the country is known.
+    pub country: &'a str,
     /// What was done, e.g. `banned for 1d00:00:00`.
     pub action: &'a str,
     pub bantime: &'a str,
@@ -114,6 +116,7 @@ pub struct BanInfo<'a> {
 pub fn render(template: &str, ban: &BanInfo) -> String {
     template
         .replace("{ip}", &ban.ip.to_string())
+        .replace("{country}", ban.country)
         .replace("{action}", ban.action)
         .replace("{bantime}", ban.bantime)
         .replace("{nvr}", ban.nvr)
@@ -130,10 +133,11 @@ mod tests {
     fn template_placeholders() {
         let info = BanInfo {
             ip: "198.51.100.7".parse().unwrap(),
+            country: " (\u{1f1f2}\u{1f1e9} MD)",
             action: "banned for 1d00:00:00",
             bantime: "1d00:00:00",
             nvr: "nvr1",
-            user: "{ip}{action}",
+            user: "{ip}{action}{country}",
             count: 5,
             findtime: 3600,
         };
@@ -142,7 +146,19 @@ mod tests {
                 "{ip} {action}|{bantime}|{nvr}|{user}|{count}|{findtime}",
                 &info
             ),
-            "198.51.100.7 banned for 1d00:00:00|1d00:00:00|nvr1|{ip}{action}|5|3600"
+            "198.51.100.7 banned for 1d00:00:00|1d00:00:00|nvr1|{ip}{action}{country}|5|3600"
+        );
+        assert_eq!(
+            render("{ip}{country} {action}", &info),
+            "198.51.100.7 (\u{1f1f2}\u{1f1e9} MD) banned for 1d00:00:00"
+        );
+        let unknown = BanInfo {
+            country: "",
+            ..info
+        };
+        assert_eq!(
+            render("{ip}{country} {action}", &unknown),
+            "198.51.100.7 banned for 1d00:00:00"
         );
     }
 

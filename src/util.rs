@@ -1,6 +1,7 @@
 //! Small helpers: time, sanitising, encoding, logging.
 
 use md5::{Digest, Md5};
+use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,8 +31,38 @@ pub fn log(level: &str, msg: &str) {
         .chars()
         .map(|c| if c.is_control() { '?' } else { c })
         .collect();
+    CAPTURED.with(|captured| {
+        if let Some(lines) = captured.borrow_mut().as_mut() {
+            if lines.len() < MAX_CAPTURED {
+                lines.push(format!("{} {}", level, clean));
+            }
+        }
+    });
     let line = format!("{} {} {}\n", fmt_ts(unix_now() as i64), level, clean);
     let _ = std::io::stdout().lock().write_all(line.as_bytes());
+}
+
+const MAX_CAPTURED: usize = 10_000;
+
+thread_local! {
+    static CAPTURED: RefCell<Option<Vec<String>>> = const { RefCell::new(None) };
+}
+
+/// For tests: from now on also keep this thread's log lines (`LEVEL
+/// message`, without the time) until `captured_log` takes them.
+pub fn capture_log() {
+    CAPTURED.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
+}
+
+/// The lines kept since `capture_log` (which keeps going).
+pub fn captured_log() -> Vec<String> {
+    CAPTURED.with(|captured| {
+        captured
+            .borrow_mut()
+            .as_mut()
+            .map(std::mem::take)
+            .unwrap_or_default()
+    })
 }
 
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {

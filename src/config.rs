@@ -14,8 +14,10 @@ pub const DEFAULT_IGNORE: &str = "127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.16
 pub const DEFAULT_FILTER: &str = r"ill\w*(access|login)";
 /// `{action}` says what happened: banned, would be banned (dry run), or only
 /// detected (no firewall configured).
+/// `{country}` is empty unless `country_db` gave a code, so the default text
+/// is unchanged without one.
 pub const DEFAULT_MESSAGE: &str =
-    "\u{26d4} hik-f2b: {ip} {action}\\nNVR: {nvr}\\nUser tried: {user}\\nFailed logins: {count} within {findtime} s";
+    "\u{26d4} hik-f2b: {ip}{country} {action}\\nNVR: {nvr}\\nUser tried: {user}\\nFailed logins: {count} within {findtime} s";
 /// `ca_file = public` trusts the bundled public CA roots instead of a file.
 pub const PUBLIC_ROOTS: &str = "public";
 
@@ -68,6 +70,9 @@ pub struct Config {
     pub meta_id: String,
     pub log_filter: Regex,
     pub dry_run: bool,
+    /// An offline MaxMind DB file for the country of banned addresses
+    /// (display only). `None` = off.
+    pub country_db: Option<PathBuf>,
     /// True when a password or token is written in the config itself
     /// rather than read from a separate secret file.
     pub inline_secrets: bool,
@@ -440,6 +445,12 @@ impl Config {
             meta_id,
             log_filter,
             dry_run: boolean(g, "dry_run", false)?,
+            // Not opened here: a missing or broken file only costs the
+            // country, never the service (see `country`).
+            country_db: g
+                .get("country_db")
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from),
             inline_secrets: ini
                 .values()
                 .any(|sec| sec.contains_key("password") || sec.contains_key("bot_token")),
@@ -667,6 +678,7 @@ mod tests {
         assert!(cfg.telegram.is_none());
         assert!(cfg.inline_secrets, "this test variant has inline passwords");
         assert_eq!(cfg.alert_after, 600);
+        assert_eq!(cfg.country_db, None, "off unless set");
         let mikrotik = cfg.mikrotik.unwrap();
         assert_eq!(
             mikrotik.ca_file,
@@ -690,6 +702,23 @@ mod tests {
         assert_eq!(telegram.thread_id, Some(42));
         assert!(telegram.message.contains('\n'));
         assert!(telegram.health_alerts);
+        assert_eq!(
+            cfg.country_db,
+            Some(PathBuf::from("/etc/hik-f2b/country.mmdb"))
+        );
+    }
+
+    #[test]
+    fn country_db_setting() {
+        assert_eq!(Config::parse(BASE).unwrap().country_db, None);
+        assert_eq!(general("country_db =").unwrap().country_db, None);
+        // a missing file is not a config error
+        assert_eq!(
+            general("country_db = /nonexistent/country.mmdb")
+                .unwrap()
+                .country_db,
+            Some(PathBuf::from("/nonexistent/country.mmdb"))
+        );
     }
 
     #[test]

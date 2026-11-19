@@ -13,6 +13,7 @@
 
 use crate::action::{render, BanError, BanInfo, BanTime, Firewall, HealthError, Notifier};
 use crate::config::{Config, DEFAULT_MESSAGE};
+use crate::country::{self, Code};
 use crate::health::{Alerts, Check, CheckLine, Kind, Notice, Status};
 use crate::mikrotik::Mikrotik;
 use crate::nvr::{Event, Nvr, NvrError};
@@ -60,6 +61,9 @@ pub struct Engine {
     alerts: Alerts,
     /// Host time of the next firewall health check.
     next_check: u64,
+    /// The reason the last country lookup failed, if it did: a failure is
+    /// logged when its reason changes, a recovery once.
+    country_failure: Option<String>,
 }
 
 /// Addresses that can never be a remote attacker, whatever the log says.
@@ -390,6 +394,7 @@ impl Engine {
             template,
             notifications: Vec::new(),
             next_check: 0,
+            country_failure: None,
         })
     }
 
@@ -403,6 +408,48 @@ impl Engine {
                 "firewall check failed: {} (bans will keep being retried)",
                 e
             ),
+        }
+    }
+
+    /// Logs which country database is configured, or why it cannot be
+    /// read. Either way the service runs; without the file bans simply
+    /// carry no country.
+    pub fn startup_country(&mut self) {
+        let Some(path) = self.cfg.country_db.clone() else {
+            return;
+        };
+        match country::info(&path) {
+            Ok(info) => crate::info!("country database: {}", info.describe()),
+            Err(e) => {
+                crate::warn!(
+                    "country database cannot be read, bans go on without a country: {}",
+                    e
+                );
+                self.country_failure = Some(e);
+            }
+        }
+    }
+
+    /// The country of `ip`, if `country_db` is set and knows it. A failed
+    /// lookup never holds up a ban: it is logged when the reason changes
+    /// (not on every retry of the same ban), and once when lookups work
+    /// again. It is not a health alert.
+    fn country(&mut self, ip: Ipv4Addr) -> Option<Code> {
+        let path = self.cfg.country_db.as_ref()?;
+        match country::lookup(path, ip) {
+            Ok(code) => {
+                if self.country_failure.take().is_some() {
+                    crate::info!("country lookups work again");
+                }
+                code
+            }
+            Err(e) => {
+                if self.country_failure.as_deref() != Some(e.as_str()) {
+                    crate::warn!("country lookup failed, bans go on without a country: {}", e);
+                    self.country_failure = Some(e);
+                }
+                None
+            }
         }
     }
 
@@ -517,6 +564,22 @@ impl Engine {
         };
         out.push(CheckLine {
             item: "telegram".to_string(),
+            status,
+            detail,
+        });
+        // A lookup proves that the search tree can be walked, not only that
+        // the metadata can be read.
+        let (status, detail) = match &self.cfg.country_db {
+            None => (Status::Off, "not configured".to_string()),
+            Some(path) => match country::info(path)
+                .and_then(|info| country::lookup(path, Ipv4Addr::new(192, 0, 2, 1)).map(|_| info))
+            {
+                Ok(info) => (Status::Ok, info.describe()),
+                Err(e) => (Status::Failed, e),
+            },
+        };
+        out.push(CheckLine {
+            item: "country database".to_string(),
             status,
             detail,
         });
@@ -680,23 +743,39 @@ impl Engine {
                 limited = true;
                 break;
             }
+            // Display only, and looked up after every decision is made.
+            let code = self.country(ip);
+            // At the end: after the fixed-format time, where the user name
+            // (attacker-chosen, up to 32 characters) cannot reach. The whole
+            // comment stays within 110 characters.
             let comment = util::sanitize(
-                &format!("hik-f2b {} user={} {}", p.nvr, p.user, util::fmt_ts(p.ts)),
+                &format!(
+                    "hik-f2b {} user={} {}{}",
+                    p.nvr,
+                    p.user,
+                    util::fmt_ts(p.ts),
+                    code.map(|c| format!(" country={}", c)).unwrap_or_default()
+                ),
                 120,
             );
+            // `198.51.100.7 [MD]` in the log
+            let shown = match code {
+                Some(c) => format!("{} [{}]", ip, c),
+                None => ip.to_string(),
+            };
             let duration = bantime.phrase();
             // (what happened, uses rate-limit allowance, worth a notification)
             let (action, counted, notify) = match &self.firewall {
                 None => {
                     crate::warn!(
                         "DETECTED {} (no firewall configured, not banned) ({})",
-                        ip,
+                        shown,
                         comment
                     );
                     ("detected, no firewall configured".to_string(), true, true)
                 }
                 Some(_) if self.cfg.dry_run => {
-                    crate::warn!("DRY RUN: would ban {} {} ({})", ip, duration, comment);
+                    crate::warn!("DRY RUN: would ban {} {} ({})", shown, duration, comment);
                     (
                         format!("would be banned {} (dry run)", duration),
                         true,
@@ -724,7 +803,7 @@ impl Engine {
                     }
                     Ok(true) => {
                         self.alerts.pass(&Check::Firewall, now);
-                        crate::warn!("BAN {} {} ({})", ip, duration, comment);
+                        crate::warn!("BAN {} {} ({})", shown, duration, comment);
                         (format!("banned {}", duration), true, true)
                     }
                     Ok(false) => {
@@ -763,10 +842,15 @@ impl Engine {
                 && self.notifier.is_some()
                 && self.notifications.len() < MAX_QUEUED_NOTIFICATIONS
             {
+                // The flag only goes to the chat.
+                let country = code
+                    .map(|c| format!(" ({} {})", c.flag(), c))
+                    .unwrap_or_default();
                 let text = render(
                     &self.template,
                     &BanInfo {
                         ip,
+                        country: &country,
                         action: &action,
                         bantime: &bantime.label(),
                         nvr: &p.nvr,

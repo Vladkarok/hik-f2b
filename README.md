@@ -195,9 +195,10 @@ tested.
 Run these the same way you run the service. For the plain binary:
 
 ```bash
-# Every NVR (login, clock, log search), the router and its drop rule, and
-# whether Telegram is configured. One line per item; exits non-zero if
-# anything failed. Bans nothing, sends nothing, does not touch the state file.
+# Every NVR (login, clock, log search), the router and its drop rule,
+# whether Telegram is configured, and the country database if set. One line
+# per item; exits non-zero if anything failed. Bans nothing, sends nothing,
+# does not touch the state file.
 hik-f2b --config hik-f2b.ini --check
 
 # What the NVR returns. Failed logins must be flagged MATCH and carry ip=...
@@ -208,6 +209,9 @@ hik-f2b --config hik-f2b.ini --test-ban 203.0.113.1
 
 # Telegram, if configured.
 hik-f2b --config hik-f2b.ini --test-notify
+
+# The country of an address, if country_db is set. Reads only that file.
+hik-f2b --config hik-f2b.ini --country 203.0.113.1
 ```
 
 With rootless Podman, give the container the same config and secrets as the
@@ -228,6 +232,7 @@ A healthy setup prints `ok` on every line, for example:
 ok       nvr nvr1: login accepted, device time 2026-01-10T10:00:00Z, log search works
 ok       firewall: 1 enabled rule(s) in /ip/firewall/raw with src-address-list=cctv_ban
 off      telegram: not configured
+ok       country database: DBIP-Country-Lite, built 2026-11-01
 ```
 
 If failed logins are listed without `MATCH`, look at their `metaId` and adjust
@@ -248,7 +253,8 @@ journalctl --user -u hik-f2b -f
 At startup the log shows the mode (`mode: ban on MikroTik`, `mode: DRY RUN`
 or `mode: notify-only`) and, with a router, how many entries the address-list
 has and the result of the firewall check (`firewall check ok: ...` or
-`firewall check failed: ...`).
+`firewall check failed: ...`). With `country_db` set, it also names the
+country database or warns that it cannot be read.
 
 ## Configuration
 
@@ -269,6 +275,7 @@ See [hik-f2b.example.ini](hik-f2b.example.ini). The settings in `[general]`:
 | `meta_id` | `log.std-cgi.com/Exception` | | Log type requested from the NVR. |
 | `state_file` | `/var/lib/hik-f2b/state` | | Where progress, counters and the rate limit are kept. |
 | `dry_run` | false | | Log bans without applying them (also `--dry-run`). |
+| `country_db` | off | | An offline `.mmdb` file for the country of banned addresses, display only, see [Country of a banned address](#country-of-a-banned-address). |
 
 The time settings (`findtime`, `bantime`, `poll_interval`, `lookback`,
 `auth_backoff`, `alert_after`) are in seconds, or a whole number with one suffix: `s`, `m`,
@@ -347,14 +354,18 @@ it out for ordinary chats. `silent = true` delivers without sound, and
 [health alerts](#health-alerts) out of the chat; they still go to the log.
 
 The message text is set with `message`. `\n` starts a new line. Placeholders:
-`{ip}`, `{action}`, `{bantime}`, `{nvr}`, `{user}`, `{count}`, `{findtime}`.
-`{action}` is one of `banned for 1d00:00:00`, `banned permanently`,
-`would be banned for 1d00:00:00 (dry run)`,
+`{ip}`, `{country}`, `{action}`, `{bantime}`, `{nvr}`, `{user}`, `{count}`,
+`{findtime}`. `{action}` is one of `banned for 1d00:00:00`,
+`banned permanently`, `would be banned for 1d00:00:00 (dry run)`,
 `would be banned permanently (dry run)` or
-`detected, no firewall configured`. The default message is:
+`detected, no firewall configured`. `{country}` is empty when there is no
+country (no `country_db`, or none found for the address), and otherwise a
+space followed by the flag and the code in brackets, ` (🇲🇩 MD)`, so write it
+right after `{ip}`. A `message` of your own shows the country only if it
+contains `{country}`. The default message is:
 
 ```
-⛔ hik-f2b: {ip} {action}
+⛔ hik-f2b: {ip}{country} {action}
 NVR: {nvr}
 User tried: {user}
 Failed logins: {count} within {findtime} s
@@ -366,6 +377,74 @@ A ban is applied before any notification is attempted. Notifications that
 fail are retried on later cycles, at most 5 attempts each; at most 100 wait at
 a time, and they are kept in memory only, so a restart loses them. An
 unreachable Telegram costs at most one 10-second timeout per cycle.
+
+### Country of a banned address
+
+Optional, like GoAccess's `geoip-database`: point `country_db` in `[general]`
+at an offline MaxMind DB (`.mmdb`) file, and hik-f2b adds the two-letter
+country code of each banned (or detected) address:
+
+- at the end of the router comment:
+  `hik-f2b nvr1 user=admin 2026-01-10T08:01:14Z country=MD`;
+- next to the address in the `BAN`, `DRY RUN` and `DETECTED` log lines:
+  `BAN 198.51.100.7 [MD] for 1d00:00:00 (...)`;
+- in the Telegram message, with the flag:
+  `⛔ hik-f2b: 198.51.100.7 (🇲🇩 MD) banned for 1d00:00:00`.
+
+The country is for display only. It never decides whether or when an address
+is banned; it is looked up after that has been decided. hik-f2b never
+downloads anything: you provide the file and keep it up to date.
+
+Files that work:
+
+- DB-IP IP to Country Lite (`dbip-country-lite-YYYY-MM.mmdb`): free, no
+  account needed. Tried.
+- MaxMind GeoLite2 Country or City: the same layout (`country` → `iso_code`).
+  Not tried.
+- IPinfo Lite: a top-level `country_code`. Supported by its schema, not tried.
+
+Only a code of exactly two capital letters is used. An address that is not in
+the file, or whose record holds anything else, simply has no country.
+
+The file is opened at every ban and read with a few small reads, never loaded
+into memory, so replacing it needs no restart. If it is missing or cannot be
+read, the ban goes ahead without a country and a WARNING says why. That
+warning is repeated only when the reason changes, and an INFO line
+`country lookups work again` follows once the file can be read again. A broken
+file is not a [health alert](#health-alerts). At startup the log shows
+`country database: DBIP-Country-Lite, built 2026-11-01`, or a warning that the
+file cannot be read; the service starts either way. `--check` shows the same
+as its last line and exits non-zero when `country_db` is set but the file
+cannot be read. `--country 203.0.113.1` prints one address and its code (or
+`unknown`); it reads only the file and contacts nothing.
+
+To get the DB-IP Lite file, download the current month's file (the URL pattern
+is `https://download.db-ip.com/free/dbip-country-lite-YYYY-MM.mmdb.gz`) and
+unpack it into the config directory, which the Quadlet unit mounts read-only
+at `/etc/hik-f2b` (the systemd unit reads `/etc/hik-f2b` itself; Compose mounts
+single files, see the comment in [deploy/compose.yaml](deploy/compose.yaml)):
+
+```bash
+cd ~/.config/hik-f2b
+month=$(date -u +%Y-%m)
+curl -fsS "https://download.db-ip.com/free/dbip-country-lite-$month.mmdb.gz" \
+  | gunzip > country.mmdb.new \
+  && chmod 644 country.mmdb.new \
+  && mv country.mmdb.new country.mmdb
+```
+
+Then set `country_db = /etc/hik-f2b/country.mmdb`. The file is world-readable
+(`644`) for the same reason as the config (see [Host](#3-host)). DB-IP
+publishes a new file every month; to update, run the same commands again, for
+example from cron a few days into each month (`0 6 3 * *`). The new file is
+written under a temporary name in the same directory and then renamed over
+the old one, so a ban never reads a half-written file, and a failed download
+leaves the old file in place.
+
+The DB-IP Lite data is licensed under CC BY 4.0, which asks for this
+attribution:
+
+IP geolocation by [DB-IP](https://db-ip.com)
 
 ### Notify-only mode (no router)
 
@@ -560,6 +639,11 @@ login is whatever they typed). It is built accordingly:
   logged when a config with inline secrets is readable by other users. Secrets
   are never logged, and the Telegram token is removed from error messages.
   Health alerts quote error messages without the URLs in them.
+- **Country database.** The `.mmdb` file is untrusted input too. The reader
+  (`src/country.rs`) checks every offset, bounds the search-tree walk, the
+  nesting, the pointers followed and the number of fields decoded, never
+  allocates much, and lets nothing out of the file but a code of two capital
+  letters. A broken file costs the country, never a ban.
 - **Self-restraint.** If an NVR rejects hik-f2b's own login, it makes at most
   two refused login attempts (the second only when the NVR's reply shows its
   nonce has changed), then leaves that NVR alone for `auth_backoff` seconds.
@@ -628,6 +712,11 @@ The container image was run with a read-only filesystem, no capabilities,
 Podman secrets and a memory limit. A 25-minute unattended dry run against both
 NVRs had no rejected logins and no failed polls.
 
+The country reader was tried with the DB-IP Country Lite file of November
+2026 (an IPv6 tree with 24-bit records): `--country` gave the expected
+countries for well-known public DNS resolvers, and `--check` showed the
+database.
+
 Not yet tried:
 
 - A ban notification through the real Telegram service. Only `--test-notify`
@@ -640,6 +729,9 @@ Not yet tried:
   enabled rules in `raw` and in `filter` and left a disabled one out; no real
   outage was provoked.
 - Notify-only mode on real devices.
+- A ban with a country on real devices: only `--country` and `--check` were
+  run against a real database file.
+- MaxMind GeoLite2 and IPinfo Lite database files.
 - Running for days or weeks.
 
 What real devices showed:
@@ -670,7 +762,9 @@ cargo clippy --all-targets -- -D warnings
 
 The tests run the real client code against an in-process fake NVR (which
 verifies the Digest response), a fake RouterOS REST API and a fake Telegram
-Bot API.
+Bot API. The country reader is tested against small databases made by a
+test-only writer (`tests/support/mmdb.rs`), including thousands of corrupted
+ones.
 
 The decision logic (`src/engine.rs`) talks to the router and to Telegram only
 through the `Firewall` and `Notifier` traits in `src/action.rs`, so another

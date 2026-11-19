@@ -2,6 +2,7 @@
 
 use hik_f2b::action::{BanTime, Firewall, Notifier};
 use hik_f2b::config::{self, Config};
+use hik_f2b::country;
 use hik_f2b::engine::Engine;
 use hik_f2b::health::Status;
 use hik_f2b::mikrotik::Mikrotik;
@@ -28,8 +29,11 @@ usage: hik-f2b [options]
       --raw           with --dump: also print the raw XML
       --test-ban IP   add IP to the address-list for 60 s and exit
       --test-notify   send a test Telegram message and exit
-      --check         check every NVR, the firewall and its drop rule once,
-                      print the results and exit (non-zero if any failed)
+      --country IP    print the country of IP from country_db and exit
+                      (contacts nothing; non-zero if the file cannot be read)
+      --check         check every NVR, the firewall and its drop rule and
+                      the country database once, print the results and
+                      exit (non-zero if any failed)
   -v, --verbose       more logging
       --version       print the version and exit
   -h, --help          this text
@@ -45,6 +49,7 @@ struct Args {
     raw: bool,
     test_ban: Option<Ipv4Addr>,
     test_notify: bool,
+    country: Option<Ipv4Addr>,
     check: bool,
     verbose: bool,
 }
@@ -77,6 +82,13 @@ fn parse_args() -> Result<Option<Args>, String> {
                 )
             }
             "--test-notify" => args.test_notify = true,
+            "--country" => {
+                args.country = Some(
+                    value("--country")?
+                        .parse::<Ipv4Addr>()
+                        .map_err(|_| "--country needs an IPv4 address".to_string())?,
+                )
+            }
             "--check" => args.check = true,
             "-v" | "--verbose" => args.verbose = true,
             "--version" => {
@@ -168,6 +180,21 @@ fn run() -> Result<(), String> {
             "{} holds passwords and is readable by all users; move them to files with password_file",
             path.display()
         );
+    }
+    if let Some(ip) = args.country {
+        // Only the local file: no NVR, router or Telegram is contacted.
+        let path = cfg
+            .country_db
+            .as_ref()
+            .ok_or_else(|| "--country needs country_db in the [general] section".to_string())?;
+        let code = country::lookup(path, ip)?;
+        println!(
+            "{} {}",
+            ip,
+            code.map(|c| c.to_string())
+                .unwrap_or_else(|| "unknown".to_string())
+        );
+        return Ok(());
     }
     let state_file = cfg.state_file.clone();
     let poll_interval = cfg.poll_interval;
@@ -277,6 +304,7 @@ fn run() -> Result<(), String> {
             .map_err(|e| format!("cannot install signal handler: {}", e))?;
     }
 
+    engine.startup_country();
     // Also in a dry run: that is when the setup is being checked.
     engine.startup_check(util::unix_now());
 

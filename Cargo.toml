@@ -11,11 +11,11 @@ categories = ["command-line-utilities", "network-programming"]
 [dependencies]
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-webpki-roots = "0.26"
-md-5 = "0.10"
-roxmltree = "0.20"
+webpki-roots = "1.0"
+md-5 = "0.11"
+roxmltree = "0.21"
 regex-lite = "0.1"
-signal-hook = { version = "0.3", default-features = false }
+signal-hook = { version = "0.4", default-features = false }
 
 [profile.release]
 opt-level = "s"

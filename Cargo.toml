@@ -11,7 +11,7 @@ categories = ["command-line-utilities", "network-programming"]
 [dependencies]
 ureq = { version = "2.12", default-features = false, features = ["tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-webpki-roots = "0.26"
+webpki-roots = "1.0"
 md-5 = "0.10"
 roxmltree = "0.20"
 regex-lite = "0.1"

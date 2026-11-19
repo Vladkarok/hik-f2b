@@ -37,6 +37,7 @@ macro_rules! debug {
 pub mod action;
 pub mod config;
 pub mod engine;
+pub mod health;
 pub mod http;
 pub mod mikrotik;
 pub mod nvr;

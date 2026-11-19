@@ -6,9 +6,14 @@
 //! (failure times, `findtime`, bans, the rate limit) is in host time; each
 //! poll converts an NVR's entries with that NVR's current offset. The host
 //! time is passed in (`cycle_at`), so tests can drive both clocks.
+//!
+//! Along the way the engine tells `health::Alerts` whether each NVR could be
+//! read, whether the firewall could be used and whether bans are held back;
+//! that module decides when this is worth an alert.
 
-use crate::action::{render, BanError, BanInfo, BanTime, Firewall, Notifier};
+use crate::action::{render, BanError, BanInfo, BanTime, Firewall, HealthError, Notifier};
 use crate::config::{Config, DEFAULT_MESSAGE};
+use crate::health::{Alerts, Check, CheckLine, Kind, Notice, Status};
 use crate::mikrotik::Mikrotik;
 use crate::nvr::{Event, Nvr, NvrError};
 use crate::state::{Pending, State, MAX_PENDING, MAX_SEEN, MAX_TRACKED};
@@ -33,6 +38,8 @@ const CLOCK_JUMP: i64 = 900;
 /// that cannot be applied keeps waiting, and how long a reported address is
 /// not reported again.
 const PERMANENT_MEMORY: u64 = 86400;
+/// Time between two health checks of the firewall.
+pub const HEALTH_CHECK_INTERVAL: u64 = 300;
 
 /// How long the engine remembers a ban (see `PERMANENT_MEMORY`).
 fn memory(bantime: BanTime) -> u64 {
@@ -50,6 +57,9 @@ pub struct Engine {
     pub notifier: Option<Box<dyn Notifier>>,
     template: String,
     notifications: Vec<(String, u32)>,
+    alerts: Alerts,
+    /// Host time of the next firewall health check.
+    next_check: u64,
 }
 
 /// Addresses that can never be a remote attacker, whatever the log says.
@@ -383,6 +393,7 @@ impl Engine {
             .map(|t| t.message.clone())
             .unwrap_or_else(|| DEFAULT_MESSAGE.replace("\\n", "\n"));
         Ok(Engine {
+            alerts: Alerts::new(cfg.alert_after),
             cfg,
             state,
             nvrs,
@@ -390,7 +401,138 @@ impl Engine {
             notifier,
             template,
             notifications: Vec::new(),
+            next_check: 0,
         })
+    }
+
+    /// Runs the firewall health check once at startup and logs the result;
+    /// the first periodic check follows `HEALTH_CHECK_INTERVAL` later.
+    pub fn startup_check(&mut self, host_now: u64) {
+        match self.check_firewall(host_now) {
+            None => {}
+            Some(Ok(found)) => crate::info!("firewall check ok: {}", found),
+            Some(Err(e)) => crate::error!(
+                "firewall check failed: {} (bans will keep being retried)",
+                e
+            ),
+        }
+    }
+
+    /// One health check of the firewall; the outcome goes to the alerts.
+    fn check_firewall(&mut self, host_now: u64) -> Option<Result<String, HealthError>> {
+        let result = self.firewall.as_ref()?.check();
+        self.next_check = host_now.saturating_add(HEALTH_CHECK_INTERVAL);
+        match &result {
+            Ok(_) => {
+                self.alerts.pass(&Check::Firewall, host_now);
+                self.alerts.pass(&Check::Rule, host_now);
+            }
+            Err(HealthError::Unusable(e)) => self.alerts.fail(Check::Firewall, e, host_now),
+            Err(HealthError::NotEnforced(e)) => {
+                self.alerts.pass(&Check::Firewall, host_now);
+                self.alerts.fail(Check::Rule, e, host_now);
+            }
+        }
+        Some(result)
+    }
+
+    /// The periodic firewall check, at most once per cycle. Skipped when a
+    /// ban attempt in this cycle already found the firewall unreachable:
+    /// that is known, and a second timeout would only delay the next poll.
+    fn periodic_check(&mut self, host_now: u64, unreachable: bool) {
+        // A next check further away than the interval can only come from
+        // the host clock having gone back.
+        let due = host_now >= self.next_check || self.next_check - host_now > HEALTH_CHECK_INTERVAL;
+        if !due || unreachable {
+            return;
+        }
+        match self.check_firewall(host_now) {
+            Some(Err(e)) => crate::warn!("firewall check failed: {}", e),
+            Some(Ok(found)) => crate::debug!("firewall check ok: {}", found),
+            None => {}
+        }
+    }
+
+    /// Logs the health notices that are due and queues them for the chat.
+    fn report_health(&mut self, host_now: u64) {
+        let to_chat =
+            self.notifier.is_some() && self.cfg.telegram.as_ref().is_none_or(|t| t.health_alerts);
+        for notice in self.alerts.due(host_now) {
+            log_notice(&notice);
+            if to_chat && self.notifications.len() < MAX_QUEUED_NOTIFICATIONS {
+                self.notifications.push((notice.text(), 0));
+            }
+        }
+    }
+
+    /// Problems that have been alerted and still persist, by key (for
+    /// tests and diagnostics).
+    pub fn alerted_problems(&self) -> Vec<String> {
+        self.alerts.alerted()
+    }
+
+    /// `--check`: every health check once. Only reads: the state, the
+    /// alerts and the firewall are left as they are, and nothing is sent.
+    pub fn check_all(&mut self) -> Vec<CheckLine> {
+        let mut out = Vec::new();
+        let meta_id = self.cfg.meta_id.clone();
+        for nvr in self.nvrs.iter_mut() {
+            // The device time proves that the NVR answers and accepts the
+            // login; a short search, that the user may search the log.
+            let result = nvr.now().and_then(|now| {
+                nvr.search(
+                    now.saturating_sub(60),
+                    now.saturating_add(60),
+                    &meta_id,
+                    None,
+                )
+                .map(|_| now)
+            });
+            let (status, detail) = match result {
+                Ok(now) => (
+                    Status::Ok,
+                    format!(
+                        "login accepted, device time {}, log search works",
+                        util::fmt_ts(now)
+                    ),
+                ),
+                Err(NvrError::Auth(e)) => (Status::Failed, format!("login rejected ({})", e)),
+                Err(NvrError::Other(e)) => (Status::Failed, e),
+            };
+            out.push(CheckLine {
+                item: format!("nvr {}", nvr.name),
+                status,
+                detail,
+            });
+        }
+        let (status, detail) = match &self.firewall {
+            None => (Status::Off, "not configured (notify-only mode)".to_string()),
+            Some(fw) => match fw.check() {
+                Ok(found) => (Status::Ok, found),
+                Err(e) => (Status::Failed, e.to_string()),
+            },
+        };
+        out.push(CheckLine {
+            item: "firewall".to_string(),
+            status,
+            detail,
+        });
+        let (status, detail) = match &self.cfg.telegram {
+            None => (Status::Off, "not configured".to_string()),
+            Some(t) => (
+                Status::Ok,
+                format!(
+                    "configured, health alerts {}; nothing sent (see --test-notify)",
+                    if t.health_alerts { "on" } else { "off" }
+                ),
+            ),
+        };
+        out.push(CheckLine {
+            item: "telegram".to_string(),
+            status,
+            detail,
+        });
+        out
     }
 
     /// One full pass at the current host time.
@@ -413,6 +555,7 @@ impl Engine {
                 }
                 self.nvrs[i].retry_after = 0;
             }
+            let check = Check::Nvr(self.nvrs[i].name.clone());
             match poll_nvr(&mut self.nvrs[i], &self.cfg, &mut self.state, now) {
                 Err(NvrError::Auth(e)) => {
                     self.nvrs[i].retry_after = host_now.saturating_add(self.cfg.auth_backoff);
@@ -423,11 +566,17 @@ impl Engine {
                         e,
                         self.cfg.auth_backoff
                     );
+                    // The NVR is not polled while backing off, so the
+                    // problem stays open until the next attempt.
+                    let reason = format!("login rejected ({})", e);
+                    self.alerts.fail(check, &reason, host_now);
                 }
                 Err(NvrError::Other(e)) => {
-                    crate::warn!("{}: poll failed: {}", self.nvrs[i].name, e)
+                    crate::warn!("{}: poll failed: {}", self.nvrs[i].name, e);
+                    self.alerts.fail(check, &e, host_now);
                 }
                 Ok(polled) => {
+                    self.alerts.pass(&check, host_now);
                     for ev in &polled.fresh {
                         let Some(ts) = ev.ts else { continue };
                         let host_ts = ts.saturating_sub(polled.offset);
@@ -451,7 +600,9 @@ impl Engine {
                 }
             }
         }
-        self.flush_pending(host_now);
+        let unreachable = self.flush_pending(host_now);
+        self.periodic_check(host_now, unreachable);
+        self.report_health(host_now);
         self.flush_notifications();
         self.cleanup(host_now);
     }
@@ -476,7 +627,9 @@ impl Engine {
         self.state.pending.insert(ip, pending);
     }
 
-    fn flush_pending(&mut self, host_now: u64) {
+    /// Applies waiting bans. Returns true when the firewall turned out to be
+    /// unreachable.
+    fn flush_pending(&mut self, host_now: u64) -> bool {
         let now = host_now;
         // A ban time in the future can only come from the host clock having
         // been ahead; keep it as "now" so it still counts for an hour.
@@ -518,6 +671,8 @@ impl Engine {
             .map(|(ip, p)| (p.ts, *ip))
             .collect();
         order.sort_unstable();
+        let mut limited = false;
+        let mut unreachable = false;
         for (_, ip) in order {
             let Some(p) = self.state.pending.get(&ip).cloned() else {
                 continue;
@@ -530,6 +685,7 @@ impl Engine {
                     self.cfg.max_bans_per_hour,
                     self.state.pending.len()
                 );
+                limited = true;
                 break;
             }
             let comment = util::sanitize(
@@ -565,6 +721,9 @@ impl Engine {
                             fw.describe(),
                             e
                         );
+                        let reason = BanError::Transport(e).to_string();
+                        self.alerts.fail(Check::Firewall, &reason, now);
+                        unreachable = true;
                         break;
                     }
                     Err(BanError::Refused(e)) => {
@@ -572,10 +731,12 @@ impl Engine {
                         continue;
                     }
                     Ok(true) => {
+                        self.alerts.pass(&Check::Firewall, now);
                         crate::warn!("BAN {} {} ({})", ip, duration, comment);
                         (format!("banned {}", duration), true, true)
                     }
                     Ok(false) => {
+                        self.alerts.pass(&Check::Firewall, now);
                         // The router is the source of truth for bans. A
                         // listed address should not reach the NVR, unless
                         // these failures were logged just before our ban.
@@ -625,6 +786,17 @@ impl Engine {
                 self.notifications.push((text, 0));
             }
         }
+        if limited {
+            let reason = format!(
+                "{} address(es) waiting, limit {} per hour",
+                self.state.pending.len(),
+                self.cfg.max_bans_per_hour
+            );
+            self.alerts.fail(Check::RateLimit, &reason, now);
+        } else if !unreachable {
+            self.alerts.pass(&Check::RateLimit, now);
+        }
+        unreachable
     }
 
     /// Notifications never hold up a ban: they are sent afterwards and
@@ -679,5 +851,19 @@ impl Engine {
     /// Notifications waiting to be sent (for tests and diagnostics).
     pub fn queued_notifications(&self) -> usize {
         self.notifications.len()
+    }
+}
+
+/// One log line per health notice: ERROR for an alert or a reminder, INFO
+/// for a recovery.
+fn log_notice(notice: &Notice) {
+    let text = notice.text();
+    // The log does without the symbol that starts the chat message.
+    let text = text.split_once(' ').map_or(text.as_str(), |(_, rest)| rest);
+    let key = notice.check.key();
+    match notice.kind {
+        Kind::Alert => crate::error!("health alert [{}]: {}", key, text),
+        Kind::Reminder => crate::error!("health reminder [{}]: {}", key, text),
+        Kind::Recovered => crate::info!("health recovered [{}]: {}", key, text),
     }
 }

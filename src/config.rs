@@ -27,6 +27,8 @@ pub struct MikrotikCfg {
     pub address_list: String,
     /// `None` = the bundled public roots (`ca_file = public`).
     pub ca_file: Option<PathBuf>,
+    /// Whether the health check looks for a rule that uses the list.
+    pub check_rule: bool,
 }
 
 #[derive(Clone)]
@@ -46,6 +48,8 @@ pub struct TelegramCfg {
     pub thread_id: Option<u64>,
     pub silent: bool,
     pub message: String,
+    /// Whether health alerts go to the chat (they are always logged).
+    pub health_alerts: bool,
 }
 
 pub struct Config {
@@ -55,6 +59,8 @@ pub struct Config {
     pub bantime: BanTime,
     pub lookback: i64,
     pub auth_backoff: u64,
+    /// How long a problem must last before it is alerted.
+    pub alert_after: u64,
     pub max_bans_per_hour: usize,
     pub state_file: PathBuf,
     pub ignore: Vec<Net>,
@@ -329,6 +335,7 @@ fn mikrotik(m: &Section) -> Result<MikrotikCfg, String> {
         password: secret(m, "password", "mikrotik")?,
         address_list,
         ca_file: ca_file(m),
+        check_rule: boolean(m, "check_rule", true)?,
     })
 }
 
@@ -429,6 +436,7 @@ impl Config {
             // small clock corrections; 0 would lose them.
             lookback: duration(g, "lookback", 120, 10, 2 * 86400)? as i64,
             auth_backoff: duration(g, "auth_backoff", 900, 60, 86400)?,
+            alert_after: duration(g, "alert_after", 600, 60, 7 * 86400)?,
             max_bans_per_hour: number(g, "max_bans_per_hour", 20, 1, 10000)? as usize,
             state_file: PathBuf::from(
                 g.get("state_file")
@@ -504,6 +512,7 @@ impl Config {
             chat_id,
             thread_id,
             silent: boolean(t, "silent", false)?,
+            health_alerts: boolean(t, "health_alerts", true)?,
             message: message.replace("\\n", "\n"),
         })
     }
@@ -664,10 +673,13 @@ mod tests {
         assert_eq!(cfg.nvrs.len(), 1);
         assert!(cfg.telegram.is_none());
         assert!(cfg.inline_secrets, "this test variant has inline passwords");
+        assert_eq!(cfg.alert_after, 600);
+        let mikrotik = cfg.mikrotik.unwrap();
         assert_eq!(
-            cfg.mikrotik.unwrap().ca_file,
+            mikrotik.ca_file,
             Some(PathBuf::from("/etc/hik-f2b/router-ca.crt"))
         );
+        assert!(mikrotik.check_rule);
 
         // the commented-out optional parts must be valid too
         let full: String = example
@@ -684,6 +696,40 @@ mod tests {
         let telegram = cfg.telegram.unwrap();
         assert_eq!(telegram.thread_id, Some(42));
         assert!(telegram.message.contains('\n'));
+        assert!(telegram.health_alerts);
+    }
+
+    #[test]
+    fn health_settings() {
+        let cfg = Config::parse(&format!(
+            "{}[telegram]\nbot_token = 1:a\nchat_id = 5\n",
+            BASE
+        ))
+        .unwrap();
+        assert_eq!(cfg.alert_after, 600);
+        assert!(cfg.mikrotik.unwrap().check_rule);
+        assert!(cfg.telegram.unwrap().health_alerts);
+
+        let cfg = Config::parse(&format!(
+            "{}[telegram]\nbot_token = 1:a\nchat_id = 5\nhealth_alerts = no\n\
+             [general]\nalert_after = 30m\n",
+            BASE.replace("ca_file = public\n", "ca_file = public\ncheck_rule = off\n")
+        ))
+        .unwrap();
+        assert_eq!(cfg.alert_after, 1800);
+        assert!(!cfg.mikrotik.unwrap().check_rule);
+        assert!(!cfg.telegram.unwrap().health_alerts);
+
+        assert!(general("alert_after = 1m").is_ok());
+        assert!(general("alert_after = 59s").is_err());
+        assert!(general("alert_after = 7d").is_ok());
+        assert!(general("alert_after = 8d").is_err());
+        assert!(general("alert_after = soon").is_err());
+        let bad = Config::parse(&BASE.replace(
+            "ca_file = public\n",
+            "ca_file = public\ncheck_rule = maybe\n",
+        ));
+        assert!(bad.is_err());
     }
 
     fn general(lines: &str) -> Result<Config, String> {

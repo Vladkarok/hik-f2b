@@ -9,7 +9,8 @@ hik-f2b polls the NVR's own log for failed logins and counts them per source
 IPv4 address. When an address reaches `maxretry` failures within `findtime`
 seconds, hik-f2b adds it to a firewall address-list on the router, with a
 timeout (`bantime`) or permanently. The router drops that address from then
-on. Optionally it reports every ban to a Telegram chat. Without a router it
+on. Optionally it reports every ban to a Telegram chat, and tells you when it
+cannot do its job (see [Health alerts](#health-alerts)). Without a router it
 can run in [notify-only mode](#notify-only-mode-no-router): it reports such
 addresses and bans nothing.
 
@@ -96,6 +97,9 @@ A dedicated account that can only be used from that host:
 /user add name=f2b group=f2b address=HOST_IP/32 password=CHANGE_ME
 ```
 
+`write` is needed to add bans. `read` lets hik-f2b read the firewall rules,
+which it does to check that the rule below exists.
+
 The rule that actually blocks:
 
 ```
@@ -105,7 +109,9 @@ The rule that actually blocks:
 The rule lives in `raw`, ahead of connection tracking and fasttrack, so it also
 cuts connections the banned address already has open. It drops packets by
 source address on the WAN side, so it also drops replies from a banned address
-to connections that your own LAN opened.
+to connections that your own LAN opened. hik-f2b checks at startup and every 5
+minutes that such a rule exists and is enabled, and alerts you if it is gone
+(see [Health alerts](#health-alerts)).
 
 Export the CA certificate:
 
@@ -189,6 +195,11 @@ tested.
 Run these the same way you run the service. For the plain binary:
 
 ```bash
+# Every NVR (login, clock, log search), the router and its drop rule, and
+# whether Telegram is configured. One line per item; exits non-zero if
+# anything failed. Bans nothing, sends nothing, does not touch the state file.
+hik-f2b --config hik-f2b.ini --check
+
 # What the NVR returns. Failed logins must be flagged MATCH and carry ip=...
 hik-f2b --config hik-f2b.ini --dump --hours 72
 
@@ -210,6 +221,15 @@ podman run --rm --network host \
   localhost/hik-f2b:latest --dump --hours 72
 ```
 
+`--check` works the same way: put `--check` in place of `--dump --hours 72`.
+A healthy setup prints `ok` on every line, for example:
+
+```
+ok       nvr nvr1: login accepted, device time 2026-01-10T10:00:00Z, log search works
+ok       firewall: 1 enabled rule(s) in /ip/firewall/raw with src-address-list=cctv_ban
+off      telegram: not configured
+```
+
 If failed logins are listed without `MATCH`, look at their `metaId` and adjust
 `log_filter`. If nothing is listed or the NVR answers `badXmlFormat`, rerun
 with `--raw` and open an issue with the output (remove addresses first).
@@ -226,8 +246,9 @@ journalctl --user -u hik-f2b -f
 ```
 
 At startup the log shows the mode (`mode: ban on MikroTik`, `mode: DRY RUN`
-or `mode: notify-only`) and, in ban mode, how many entries the address-list
-has.
+or `mode: notify-only`) and, with a router, how many entries the address-list
+has and the result of the firewall check (`firewall check ok: ...` or
+`firewall check failed: ...`).
 
 ## Configuration
 
@@ -243,13 +264,14 @@ See [hik-f2b.example.ini](hik-f2b.example.ini). The settings in `[general]`:
 | `poll_interval` | 30 | 5–3600 | Time between log polls. |
 | `lookback` | 120 | 10–172800 | Overlap between consecutive log queries. |
 | `auth_backoff` | 900 | 60–86400 | Pause after an NVR rejects hik-f2b's own login. |
+| `alert_after` | 600 | 60–604800 | How long a problem must last before it is alerted, see [Health alerts](#health-alerts). |
 | `log_filter` | `ill\w*(access\|login)` | | Regex on the log entry type that marks a failed login. |
 | `meta_id` | `log.std-cgi.com/Exception` | | Log type requested from the NVR. |
 | `state_file` | `/var/lib/hik-f2b/state` | | Where progress, counters and the rate limit are kept. |
 | `dry_run` | false | | Log bans without applying them (also `--dry-run`). |
 
 The time settings (`findtime`, `bantime`, `poll_interval`, `lookback`,
-`auth_backoff`) are in seconds, or a whole number with one suffix: `s`, `m`,
+`auth_backoff`, `alert_after`) are in seconds, or a whole number with one suffix: `s`, `m`,
 `h`, `d` or `w` (seconds, minutes, hours, days, weeks), for example `10m`,
 `12h` or `7d`. A plain number is seconds. The limits in the table are in
 seconds and are checked after the conversion, so `365d` is the longest timed
@@ -273,6 +295,11 @@ host (`localhost`, `127.0.0.1`, `::1`). An NVR URL may be http or https; for
 https, `ca_file` in the `[nvr:...]` section is the path of its CA certificate,
 and without it (or with `public`) the public roots are used.
 
+`check_rule` in the `[mikrotik]` section (default `true`) turns the check for
+the drop rule on or off, see [Health alerts](#health-alerts). Set it to
+`false` if the address-list is blocked some other way, for example by a rule
+that uses it as `dst-address-list` or on another device.
+
 A state file written by an older version (format 1) is ignored: the daemon
 starts fresh, watches each NVR log from the current time on, and the hourly
 ban counter starts at zero.
@@ -294,7 +321,9 @@ always adds a 60-second entry.
 
 If the address is already in the list, the router refuses a second entry and
 hik-f2b counts the address as already banned; it does not change the existing
-entry. An address that is still listed with a timeout when you switch to
+entry. Whenever the router refuses an entry and the error is not the known
+duplicate message, hik-f2b asks the router whether the address is listed, so
+this does not depend on the wording of RouterOS error messages. An address that is still listed with a timeout when you switch to
 `permanent` therefore gets a permanent entry only the next time it is banned,
 after the timed entry has expired. Remove the timed entry by hand if you want
 that sooner.
@@ -314,7 +343,8 @@ message_thread_id = 42
 `chat_id` is a user, group or supergroup id (supergroups look like `-100…`) or
 `@channelname`. `message_thread_id` is the topic of a forum supergroup; leave
 it out for ordinary chats. `silent = true` delivers without sound, and
-`enabled = false` turns the section off.
+`enabled = false` turns the section off. `health_alerts = false` keeps
+[health alerts](#health-alerts) out of the chat; they still go to the log.
 
 The message text is set with `message`. `\n` starts a new line. Placeholders:
 `{ip}`, `{action}`, `{bantime}`, `{nvr}`, `{user}`, `{count}`, `{findtime}`.
@@ -370,6 +400,61 @@ log, and hik-f2b warns about it at startup. A dry run (`dry_run = true`) also
 reports an address only once per `bantime` (or 24 hours).
 
 Notify-only mode is covered by tests but has not been tried on real devices.
+
+## Health alerts
+
+hik-f2b watches its own ability to protect you and reports trouble through
+Telegram (if `[telegram]` is configured and `health_alerts` is not `false`)
+and always in its log. It watches:
+
+- **Each NVR:** it cannot be read, because it does not answer or rejects
+  hik-f2b's login (for example after a password change). While hik-f2b waits
+  `auth_backoff` after a rejected login, the problem counts as ongoing.
+- **The router:** it cannot be reached, refuses the login, or answers with an
+  error. This is seen when a ban fails to reach the router and by a check at
+  startup and every 5 minutes.
+- **The drop rule:** no enabled rule in `/ip/firewall/raw` or
+  `/ip/firewall/filter` has `src-address-list` set to `address_list`. Without
+  such a rule the list fills up and nothing is blocked. hik-f2b asks each table
+  for the rules with that `src-address-list`
+  (`GET /rest/ip/firewall/raw?src-address-list=cctv_ban&.proplist=.id,disabled`,
+  then the same for `filter`) and counts a rule as enabled unless the reply
+  says `"disabled":"true"`: RouterOS 7.18 leaves the `disabled` property out
+  of enabled `raw` rules altogether. The check does not look
+  at the rule's chain, interface or action, so a rule that matches the list
+  but accepts the traffic still passes. Turn the check off with
+  `check_rule = false` in `[mikrotik]`.
+- **The ban rate limit:** addresses are waiting because `max_bans_per_hour` has
+  been reached.
+
+The router checks also run in a dry run, where they help with the setup. In
+notify-only mode there is no router to check.
+
+A problem is reported once it has lasted `alert_after` (default 10 minutes),
+so a single failed poll is not news. While it lasts, it is reported again once
+every 24 hours. When an alerted problem is over, one more message says so; a
+problem that ends before `alert_after` produces no message at all. For
+example:
+
+```
+⚠️ hik-f2b: nvr2 cannot be read for 10 min: login rejected (HTTP 401)
+⚠️ hik-f2b: banned addresses are not blocked for 10 min: no enabled rule in /ip/firewall/raw or /ip/firewall/filter has src-address-list=cctv_ban
+✅ hik-f2b: banned addresses are blocked again (after 25 min)
+```
+
+These texts are fixed; `message` applies to ban messages only. Reasons are
+taken from error messages, cut short, and URLs are left out. Health messages go
+through the same queue as ban messages, so a Telegram outage costs no more
+than before and never holds up polling or banning. In the log each report is
+one ERROR line (`health alert [nvr:nvr2]: ...`, `health reminder [...]`) and
+each recovery one INFO line (`health recovered [...]`). What hik-f2b remembers
+about problems is kept in memory only: after a restart a problem that is still
+there is reported again once it has lasted `alert_after`.
+
+Health alerts cannot report that hik-f2b itself has stopped, crashed or hangs,
+or that its host is down or offline: then nothing is left to send a message.
+Watch the service from outside for that, for example with your monitoring
+system checking that the systemd unit or container is running.
 
 ## Time and clock changes
 
@@ -472,6 +557,7 @@ login is whatever they typed). It is built accordingly:
   can come from files (`*_file`) or be written in the config; a warning is
   logged when a config with inline secrets is readable by other users. Secrets
   are never logged, and the Telegram token is removed from error messages.
+  Health alerts quote error messages without the URLs in them.
 - **Self-restraint.** If an NVR rejects hik-f2b's own login, it makes at most
   two refused login attempts (the second only when the NVR's reply shows its
   nonce has changed), then leaves that NVR alone for `auth_backoff` seconds.
@@ -522,6 +608,11 @@ vulnerability, see [SECURITY.md](SECURITY.md).
   it are not counted.
 - Only MD5 Digest authentication is supported towards the NVR.
 - Only MikroTik RouterOS is supported as the firewall.
+- The drop-rule check only looks for an enabled `raw` or `filter` rule with
+  the address-list as `src-address-list`. A rule in the wrong chain, on the
+  wrong interface or with an action that does not drop still passes it.
+- Health alerts need hik-f2b to be running. A stopped service or a host that
+  is down sends nothing; watch the unit from outside for that.
 
 ## Tested hardware
 
@@ -578,7 +669,9 @@ Bot API.
 
 The decision logic (`src/engine.rs`) talks to the router and to Telegram only
 through the `Firewall` and `Notifier` traits in `src/action.rs`, so another
-firewall or messenger can be added by implementing one trait.
+firewall or messenger can be added by implementing one trait. When a problem
+is worth a health alert is decided in `src/health.rs`, which does no I/O and
+is tested on its own.
 
 ## License
 

@@ -3,6 +3,7 @@
 use hik_f2b::action::{BanTime, Firewall, Notifier};
 use hik_f2b::config::{self, Config};
 use hik_f2b::engine::Engine;
+use hik_f2b::health::Status;
 use hik_f2b::mikrotik::Mikrotik;
 use hik_f2b::state::State;
 use hik_f2b::telegram::Telegram;
@@ -27,6 +28,8 @@ usage: hik-f2b [options]
       --raw           with --dump: also print the raw XML
       --test-ban IP   add IP to the address-list for 60 s and exit
       --test-notify   send a test Telegram message and exit
+      --check         check every NVR, the firewall and its drop rule once,
+                      print the results and exit (non-zero if any failed)
   -v, --verbose       more logging
       --version       print the version and exit
   -h, --help          this text
@@ -42,6 +45,7 @@ struct Args {
     raw: bool,
     test_ban: Option<Ipv4Addr>,
     test_notify: bool,
+    check: bool,
     verbose: bool,
 }
 
@@ -73,6 +77,7 @@ fn parse_args() -> Result<Option<Args>, String> {
                 )
             }
             "--test-notify" => args.test_notify = true,
+            "--check" => args.check = true,
             "-v" | "--verbose" => args.verbose = true,
             "--version" => {
                 println!("hik-f2b {}", env!("CARGO_PKG_VERSION"));
@@ -166,7 +171,7 @@ fn run() -> Result<(), String> {
     }
     let state_file = cfg.state_file.clone();
     let poll_interval = cfg.poll_interval;
-    let daemon = !(args.dump || args.test_ban.is_some() || args.test_notify);
+    let daemon = !(args.dump || args.test_ban.is_some() || args.test_notify || args.check);
     let state = if daemon {
         State::load(&state_file)
     } else {
@@ -193,18 +198,7 @@ fn run() -> Result<(), String> {
             if cfg.dry_run { " DRY RUN" } else { "" }
         );
         match (&mikrotik, cfg.dry_run) {
-            (Some(m), false) => {
-                info!("mode: ban on MikroTik, address-list {}", m.list);
-                // MikroTik-specific self-check, done before the client is
-                // handed to the engine as a plain firewall.
-                match m.count() {
-                    Ok(n) => info!("MikroTik ok, address-list {} has {} entries", m.list, n),
-                    Err(e) => error!(
-                        "MikroTik check failed (bans will keep being retried): {}",
-                        e
-                    ),
-                }
-            }
+            (Some(m), false) => info!("mode: ban on MikroTik, address-list {}", m.list),
             (Some(m), true) => info!(
                 "mode: DRY RUN, bans on MikroTik address-list {} are only logged",
                 m.list
@@ -220,11 +214,33 @@ fn run() -> Result<(), String> {
                  to this log"
             );
         }
+        // MikroTik-specific, so done before the client is handed to the
+        // engine as a plain firewall. A failure is reported by the health
+        // check below.
+        if let Some(m) = &mikrotik {
+            if let Ok(n) = m.count() {
+                info!("MikroTik address-list {} has {} entries", m.list, n);
+            }
+        }
     }
     let firewall = mikrotik.map(|m| Box::new(m) as Box<dyn Firewall>);
     let notifier = telegram.map(|t| Box::new(t) as Box<dyn Notifier>);
     let mut engine = Engine::with_parts(cfg, state, firewall, notifier)?;
 
+    if args.check {
+        let lines = engine.check_all();
+        for line in &lines {
+            println!("{}", util::terminal_safe(&line.to_string()));
+        }
+        let failed = lines
+            .iter()
+            .filter(|line| line.status == Status::Failed)
+            .count();
+        if failed > 0 {
+            return Err(format!("{} check(s) failed", failed));
+        }
+        return Ok(());
+    }
     if args.dump {
         dump(&mut engine, args.hours.unwrap_or(24), args.raw);
         return Ok(());
@@ -260,6 +276,9 @@ fn run() -> Result<(), String> {
         signal_hook::flag::register(signal, Arc::clone(&stop))
             .map_err(|e| format!("cannot install signal handler: {}", e))?;
     }
+
+    // Also in a dry run: that is when the setup is being checked.
+    engine.startup_check(util::unix_now());
 
     let mut saved = engine.state.serialize();
     while !stop.load(Ordering::Relaxed) {

@@ -59,11 +59,24 @@ struct Fake {
     challenges: u32,
     search_requests: u32,
     refused_logins: u32,
+    /// Drop ISAPI connections without an answer.
+    nvr_down: bool,
     // --- router
     bans: Vec<String>,
     ban_bodies: Vec<String>,
     router_down: bool,
+    /// Drop REST connections without an answer.
+    router_unreachable: bool,
     router_requests: u32,
+    /// Error detail for a duplicate entry; `None` = today's RouterOS text.
+    duplicate_text: Option<String>,
+    /// Firewall rules as (table, src-address-list, disabled).
+    rules: Vec<(&'static str, String, bool)>,
+    /// `path?query` of every rule lookup.
+    rule_queries: Vec<String>,
+    /// `query` of every address-list lookup by address.
+    lookups: Vec<String>,
+    identity_requests: u32,
     // --- Telegram
     tg_sent: Vec<String>,
     tg_attempts: u32,
@@ -169,10 +182,93 @@ fn search_page(f: &mut Fake, body: &str) -> Vec<u8> {
     out
 }
 
-fn route(fake: &Mutex<Fake>, method: &str, path: &str, auth: &str, body: &str) -> Reply {
+/// The reply code that makes `serve` drop the connection without an answer.
+const DROP: u16 = 0;
+
+/// The value of `key` in a query string.
+fn param(query: &str, key: &str) -> Option<String> {
+    form(query)
+        .into_iter()
+        .find(|(k, _)| k == key)
+        .map(|(_, v)| v)
+}
+
+fn route(
+    fake: &Mutex<Fake>,
+    method: &str,
+    path: &str,
+    query: &str,
+    auth: &str,
+    body: &str,
+) -> Reply {
     let mut f = fake.lock().unwrap();
     let xml = "application/xml";
     let json = "application/json";
+    if path.starts_with("/ISAPI/") && f.nvr_down {
+        return (DROP, String::new(), xml, Vec::new());
+    }
+    if path.starts_with("/rest/") {
+        if f.router_unreachable {
+            return (DROP, String::new(), json, Vec::new());
+        }
+        if auth != format!("Basic {}", util::b64(b"f2b:rpass")) {
+            return (
+                401,
+                String::new(),
+                json,
+                b"{\"error\":401,\"message\":\"Unauthorized\"}".to_vec(),
+            );
+        }
+    }
+    if method == "GET" && (path == "/rest/ip/firewall/raw" || path == "/rest/ip/firewall/filter") {
+        f.rule_queries.push(format!("{}?{}", path, query));
+        let table = path.trim_start_matches("/rest/ip/firewall/");
+        let list = param(query, "src-address-list");
+        let wanted = param(query, "disabled");
+        let proplist = param(query, ".proplist").unwrap_or_default();
+        // As on RouterOS 7.18.1: enabled `raw` rules have no `disabled`
+        // member at all (so a `disabled=false` filter misses them); `filter`
+        // rules always have one.
+        let shown = |t: &str, d: bool| -> Option<&'static str> {
+            match (d, t) {
+                (true, _) => Some("true"),
+                (false, "filter") => Some("false"),
+                (false, _) => None,
+            }
+        };
+        let ids: Vec<String> = f
+            .rules
+            .iter()
+            .enumerate()
+            .filter(|(_, (t, l, d))| {
+                *t == table
+                    && list.as_ref().is_none_or(|want| want == l)
+                    && wanted
+                        .as_ref()
+                        .is_none_or(|want| shown(t, *d) == Some(want.as_str()))
+            })
+            .map(|(n, (t, _, d))| {
+                let mut member = format!("{{\".id\":\"*{:X}\"", n + 1);
+                if let Some(v) = shown(t, *d) {
+                    if proplist.split(',').any(|p| p == "disabled") {
+                        member.push_str(&format!(",\"disabled\":\"{}\"", v));
+                    }
+                }
+                member.push('}');
+                member
+            })
+            .collect();
+        return (
+            200,
+            String::new(),
+            json,
+            format!("[{}]", ids.join(",")).into_bytes(),
+        );
+    }
+    if method == "GET" && path == "/rest/system/identity" {
+        f.identity_requests += 1;
+        return (200, String::new(), json, b"{\"name\":\"fake\"}".to_vec());
+    }
     if path.starts_with("/ISAPI/") {
         f.isapi_requests += 1;
         if let Some(n) = f.rotate_every {
@@ -218,13 +314,13 @@ fn route(fake: &Mutex<Fake>, method: &str, path: &str, auth: &str, body: &str) -
     }
     if path.starts_with("/rest/ip/firewall/address-list") {
         f.router_requests += 1;
-        if auth != format!("Basic {}", util::b64(b"f2b:rpass")) {
-            return (
-                401,
-                String::new(),
-                json,
-                b"{\"error\":401,\"message\":\"Unauthorized\"}".to_vec(),
-            );
+        if method == "GET" && param(query, "address").is_some() {
+            f.lookups.push(query.to_string());
+            let list = param(query, "list").unwrap_or_default();
+            let address = param(query, "address").unwrap_or_default();
+            let found = list == "cctv_ban" && f.bans.contains(&address);
+            let out = if found { "[{\".id\":\"*1\"}]" } else { "[]" };
+            return (200, String::new(), json, out.as_bytes().to_vec());
         }
         if method == "GET" {
             let list: Vec<String> = f
@@ -250,8 +346,15 @@ fn route(fake: &Mutex<Fake>, method: &str, path: &str, auth: &str, body: &str) -
             }
             let address = between(body, "\"address\":\"", "\"").to_string();
             if f.bans.contains(&address) {
-                let out = "{\"detail\":\"failure: already have such entry\",\"error\":400,\"message\":\"Bad Request\"}";
-                return (400, String::new(), json, out.as_bytes().to_vec());
+                let detail = f
+                    .duplicate_text
+                    .clone()
+                    .unwrap_or_else(|| "failure: already have such entry".to_string());
+                let out = format!(
+                    "{{\"detail\":\"{}\",\"error\":400,\"message\":\"Bad Request\"}}",
+                    detail
+                );
+                return (400, String::new(), json, out.into_bytes());
             }
             f.bans.push(address);
             f.ban_bodies.push(body.to_string());
@@ -284,7 +387,8 @@ fn serve(stream: TcpStream, fake: Arc<Mutex<Fake>>) {
         let mut parts = line.split_whitespace();
         let method = parts.next().unwrap_or("").to_string();
         let target = parts.next().unwrap_or("").to_string();
-        let path = target.split('?').next().unwrap_or("").to_string();
+        let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+        let (path, query) = (path.to_string(), query.to_string());
         let (mut length, mut auth) = (0usize, String::new());
         loop {
             let mut header = String::new();
@@ -308,7 +412,10 @@ fn serve(stream: TcpStream, fake: Arc<Mutex<Fake>>) {
             return;
         }
         let body = String::from_utf8_lossy(&body).to_string();
-        let (code, headers, ctype, out) = route(&fake, &method, &path, &auth, &body);
+        let (code, headers, ctype, out) = route(&fake, &method, &path, &query, &auth, &body);
+        if code == DROP {
+            return;
+        }
         let head = format!(
             "HTTP/1.1 {} X\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}\r\n",
             code,
@@ -328,6 +435,8 @@ fn spawn_fake() -> (Arc<Mutex<Fake>>, u16) {
         skew: SKEW,
         nvr_auth_ok: true,
         nonce: NONCE.to_string(),
+        // the drop rule from the README
+        rules: vec![("raw", "cctv_ban".to_string(), false)],
         ..Default::default()
     }));
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -404,6 +513,9 @@ struct Opts {
     mikrotik: bool,
     second_nvr: bool,
     general: &'static str,
+    /// Extra lines for the [mikrotik] and [telegram] sections.
+    mikrotik_extra: &'static str,
+    telegram_extra: &'static str,
 }
 
 impl Default for Opts {
@@ -413,6 +525,8 @@ impl Default for Opts {
             mikrotik: true,
             second_nvr: false,
             general: "",
+            mikrotik_extra: "",
+            telegram_extra: "",
         }
     }
 }
@@ -452,8 +566,8 @@ impl Harness {
         );
         if opts.mikrotik {
             ini.push_str(&format!(
-                "[mikrotik]\nurl = http://127.0.0.1:{}\nuser = f2b\npassword = rpass\n",
-                port
+                "[mikrotik]\nurl = http://127.0.0.1:{}\nuser = f2b\npassword = rpass\n{}\n",
+                port, opts.mikrotik_extra
             ));
         }
         let fake2 = if opts.second_nvr {
@@ -469,8 +583,8 @@ impl Harness {
         if opts.telegram {
             ini.push_str(&format!(
                 "[telegram]\napi_url = http://127.0.0.1:{}\nbot_token = {}\n\
-                 chat_id = -1001234567890\nmessage_thread_id = 42\n",
-                port, TOKEN
+                 chat_id = -1001234567890\n{}\nmessage_thread_id = 42\n",
+                port, TOKEN, opts.telegram_extra
             ));
         }
         let engine = Engine::new(Config::parse(&ini).unwrap(), State::default()).unwrap();
@@ -1659,4 +1773,437 @@ fn permanent_pending_ban_expires_after_a_day() {
     h.tick();
     assert!(h.engine.state.pending.is_empty());
     assert!(h.banned().is_empty());
+}
+
+// ---------------------------------------------------------- health alerts
+
+const WARN: &str = "\u{26a0}\u{fe0f} hik-f2b: ";
+const OK: &str = "\u{2705} hik-f2b: ";
+
+/// Runs `n` cycles, `step` seconds apart.
+fn run(h: &mut Harness, n: usize, step: i64) {
+    for _ in 0..n {
+        h.advance(step);
+    }
+}
+
+#[test]
+fn nvr_outage_is_alerted_once_then_recovery() {
+    let mut h = Harness::new(true);
+    h.fake.lock().unwrap().nvr_down = true;
+    run(&mut h, 20, 30); // first failure at 10:00:30, now 10:10:00
+    assert!(telegram_texts(&h).is_empty(), "alerted before alert_after");
+    h.advance(30);
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 1, "{:?}", texts);
+    assert!(
+        texts[0].starts_with(&format!("{}nvr1 cannot be read for 10 min: ", WARN)),
+        "{}",
+        texts[0]
+    );
+    // the reason names neither the address nor the URL of the NVR
+    assert!(!texts[0].contains("127.0.0.1"), "{}", texts[0]);
+    assert!(!texts[0].contains("http"), "{}", texts[0]);
+    run(&mut h, 20, 30);
+    assert_eq!(telegram_texts(&h).len(), 1, "alerted more than once");
+    assert_eq!(h.engine.alerted_problems(), vec!["nvr:nvr1"]);
+
+    h.fake.lock().unwrap().nvr_down = false;
+    h.advance(30); // 10:21:00
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 2, "{:?}", texts);
+    assert_eq!(
+        texts[1],
+        format!("{}nvr1 is readable again (after 20 min)", OK)
+    );
+    assert!(h.engine.alerted_problems().is_empty());
+    run(&mut h, 4, 30);
+    assert_eq!(telegram_texts(&h).len(), 2);
+}
+
+#[test]
+fn short_nvr_outage_is_not_news() {
+    let mut h = Harness::new(true);
+    h.fake.lock().unwrap().nvr_down = true;
+    run(&mut h, 19, 30);
+    h.fake.lock().unwrap().nvr_down = false;
+    run(&mut h, 40, 30);
+    assert!(telegram_texts(&h).is_empty());
+}
+
+/// An NVR in auth backoff is not polled, but its problem is still alerted
+/// on time.
+#[test]
+fn rejected_login_is_alerted_during_the_backoff() {
+    let mut h = Harness::new(true);
+    h.fake.lock().unwrap().nvr_auth_ok = false;
+    h.advance(30); // 10:00:30: rejected, next try at 10:15:30
+    run(&mut h, 19, 30);
+    assert!(telegram_texts(&h).is_empty());
+    h.advance(30); // 10:10:30
+    assert_eq!(
+        telegram_texts(&h),
+        vec![format!(
+            "{}nvr1 cannot be read for 10 min: login rejected (HTTP 401)",
+            WARN
+        )]
+    );
+    assert_eq!(h.fake.lock().unwrap().refused_logins, 1, "no extra login");
+}
+
+#[test]
+fn router_outage_is_alerted_and_bans_still_reported() {
+    let mut h = Harness::new(true);
+    h.fake.lock().unwrap().router_unreachable = true;
+    h.burst("10:01", ATTACKER, 5);
+    h.cycle("10:02:00"); // the ban fails: the outage starts now
+    assert_eq!(h.engine.state.pending.len(), 1);
+    run(&mut h, 19, 30);
+    assert!(telegram_texts(&h).is_empty());
+    h.advance(30); // 10:12:00
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 1, "{:?}", texts);
+    assert!(
+        texts[0].starts_with(&format!(
+            "{}the firewall is not usable for 10 min: cannot reach the firewall: ",
+            WARN
+        )),
+        "{}",
+        texts[0]
+    );
+    assert!(!texts[0].contains("127.0.0.1"), "{}", texts[0]);
+    assert!(h.banned().is_empty());
+
+    // back: the waiting ban is applied and announced as before, then the
+    // recovery
+    h.fake.lock().unwrap().router_unreachable = false;
+    h.advance(30); // 10:12:30
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 3, "{:?}", texts);
+    assert!(
+        texts[1].starts_with("\u{26d4} hik-f2b: 198.51.100.7 banned for 1d00:00:00\n"),
+        "{}",
+        texts[1]
+    );
+    assert_eq!(
+        texts[2],
+        format!("{}the firewall is usable again (after 10 min)", OK)
+    );
+
+    // an outage with no ban waiting is found by the periodic check
+    // (10:17:30, 10:22:30, 10:27:30)
+    h.fake.lock().unwrap().router_unreachable = true;
+    run(&mut h, 40, 30);
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 4, "{:?}", texts);
+    assert!(
+        texts[3].starts_with(&format!("{}the firewall is not usable for 10 min: ", WARN)),
+        "{}",
+        texts[3]
+    );
+}
+
+#[test]
+fn missing_drop_rule_is_alerted_until_a_rule_is_back() {
+    let mut h = Harness::new(true); // checked at 10:00:00: the rule is there
+    {
+        let mut f = h.fake.lock().unwrap();
+        assert_eq!(f.rule_queries.len(), 1, "raw has the rule: one request");
+        f.rules.clear(); // a configuration rollback
+        f.rule_queries.clear();
+    }
+    run(&mut h, 29, 30); // checks at 10:05 and 10:10
+    assert!(telegram_texts(&h).is_empty());
+    h.advance(30); // 10:15:00
+    assert_eq!(
+        telegram_texts(&h),
+        vec![format!(
+            "{}banned addresses are not blocked for 10 min: no enabled rule in \
+             /ip/firewall/raw or /ip/firewall/filter has src-address-list=cctv_ban",
+            WARN
+        )]
+    );
+    let queries = h.fake.lock().unwrap().rule_queries.clone();
+    assert_eq!(queries.len(), 6, "two requests per check: {:?}", queries);
+    // `,` is percent-encoded by the HTTP client
+    assert_eq!(
+        queries[0],
+        "/rest/ip/firewall/raw?src-address-list=cctv_ban&.proplist=.id%2Cdisabled"
+    );
+    assert_eq!(
+        queries[1],
+        "/rest/ip/firewall/filter?src-address-list=cctv_ban&.proplist=.id%2Cdisabled"
+    );
+
+    // a disabled rule does not count
+    h.fake
+        .lock()
+        .unwrap()
+        .rules
+        .push(("filter", "cctv_ban".to_string(), true));
+    h.advance(300); // 10:20
+    assert_eq!(telegram_texts(&h).len(), 1);
+    // an enabled one in filter does
+    h.fake
+        .lock()
+        .unwrap()
+        .rules
+        .push(("filter", "cctv_ban".to_string(), false));
+    h.advance(300); // 10:25
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 2, "{:?}", texts);
+    assert_eq!(
+        texts[1],
+        format!("{}banned addresses are blocked again (after 20 min)", OK)
+    );
+}
+
+/// The rule check against replies shaped like RouterOS 7.18.1's: enabled
+/// `raw` rules have no `disabled` member, `filter` rules always have one.
+#[test]
+fn rule_check_reads_the_disabled_member_as_the_router_prints_it() {
+    use hik_f2b::action::HealthError;
+    let h = Harness::new(false);
+    let set = |rules: &[(&'static str, bool)]| {
+        h.fake.lock().unwrap().rules = rules
+            .iter()
+            .map(|(t, d)| (*t, "cctv_ban".to_string(), *d))
+            .collect();
+    };
+    let check = || h.engine.firewall.as_ref().unwrap().check();
+
+    // an enabled raw rule (no `disabled` member) is found with one request
+    set(&[("raw", false)]);
+    h.fake.lock().unwrap().rule_queries.clear();
+    assert_eq!(
+        check(),
+        Ok("1 enabled rule(s) in /ip/firewall/raw with src-address-list=cctv_ban".to_string())
+    );
+    assert_eq!(h.fake.lock().unwrap().rule_queries.len(), 1);
+
+    // a disabled raw rule ("disabled":"true") is not; filter is asked next
+    set(&[("raw", true), ("filter", false), ("filter", true)]);
+    assert_eq!(
+        check(),
+        Ok("1 enabled rule(s) in /ip/firewall/filter with src-address-list=cctv_ban".to_string())
+    );
+
+    // only disabled rules, in both tables
+    set(&[("raw", true), ("filter", true)]);
+    assert!(matches!(check(), Err(HealthError::NotEnforced(_))));
+    // a rule for another list does not count
+    h.fake.lock().unwrap().rules = vec![("raw", "other".to_string(), false)];
+    assert!(matches!(check(), Err(HealthError::NotEnforced(_))));
+}
+
+#[test]
+fn missing_drop_rule_is_reminded_daily() {
+    let mut h = Harness::new(true);
+    h.fake.lock().unwrap().rules.clear();
+    run(&mut h, 3, 300); // checks at 10:05, 10:10, 10:15: alert
+    assert_eq!(telegram_texts(&h).len(), 1);
+    run(&mut h, 23, 3600);
+    h.advance(3300); // one day after the alert, less 5 minutes
+    assert_eq!(telegram_texts(&h).len(), 1);
+    h.advance(300);
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 2, "{:?}", texts);
+    assert!(
+        texts[1].starts_with(&format!(
+            "{}banned addresses are not blocked for 24 h: ",
+            WARN
+        )),
+        "{}",
+        texts[1]
+    );
+}
+
+#[test]
+fn rule_check_switched_off_sends_no_rule_request() {
+    let mut h = Harness::with(Opts {
+        telegram: true,
+        mikrotik_extra: "check_rule = false",
+        ..Default::default()
+    });
+    h.fake.lock().unwrap().rules.clear();
+    run(&mut h, 6, 300);
+    let f = h.fake.lock().unwrap();
+    assert!(f.rule_queries.is_empty(), "{:?}", f.rule_queries);
+    // the router is still checked for being reachable
+    assert_eq!(f.identity_requests, 7);
+    assert!(f.tg_sent.is_empty());
+}
+
+#[test]
+fn health_alerts_switched_off_send_nothing_but_bans() {
+    let mut h = Harness::with(Opts {
+        telegram: true,
+        telegram_extra: "health_alerts = false",
+        ..Default::default()
+    });
+    h.fake.lock().unwrap().rules.clear();
+    h.burst("10:01", ATTACKER, 5);
+    run(&mut h, 40, 30);
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 1, "{:?}", texts);
+    assert!(
+        texts[0].starts_with("\u{26d4} hik-f2b: 198.51.100.7 banned"),
+        "{}",
+        texts[0]
+    );
+    // the problem is tracked (and logged) all the same
+    assert_eq!(h.engine.alerted_problems(), vec!["firewall-rule"]);
+}
+
+#[test]
+fn held_back_bans_are_alerted() {
+    let mut h = Harness::with(Opts {
+        telegram: true,
+        general: "max_bans_per_hour = 1",
+        ..Default::default()
+    });
+    h.burst("10:01", "198.51.100.1", 5);
+    h.burst("10:01", "198.51.100.2", 5);
+    h.cycle("10:02:00");
+    run(&mut h, 20, 30); // 10:12:00
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 2, "{:?}", texts);
+    assert_eq!(
+        texts[1],
+        format!(
+            "{}new bans are held back by max_bans_per_hour for 10 min: \
+             1 address(es) waiting, limit 1 per hour",
+            WARN
+        )
+    );
+    h.cycle("11:02:30"); // the allowance is back
+    assert_eq!(h.banned().len(), 2);
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 4, "{:?}", texts);
+    assert!(texts[2].contains("198.51.100.2 banned"), "{}", texts[2]);
+    assert_eq!(
+        texts[3],
+        format!("{}bans are no longer held back (after 60 min)", OK)
+    );
+}
+
+/// Without [telegram] the same events only reach the log.
+#[test]
+fn health_problems_without_telegram() {
+    let mut h = Harness::new(false);
+    h.fake.lock().unwrap().nvr_down = true;
+    run(&mut h, 25, 30);
+    assert_eq!(h.engine.alerted_problems(), vec!["nvr:nvr1"]);
+    assert_eq!(h.engine.queued_notifications(), 0);
+    assert!(h.fake.lock().unwrap().tg_sent.is_empty());
+}
+
+// ---------------------------------------------------- already-listed check
+
+#[test]
+fn already_listed_is_recognised_whatever_the_wording() {
+    let mut h = Harness::with(Opts {
+        general: "max_bans_per_hour = 1",
+        ..Default::default()
+    });
+    {
+        let mut f = h.fake.lock().unwrap();
+        f.duplicate_text = Some("failure: entry is a duplicate".to_string());
+        f.bans.push("198.51.100.4".to_string());
+    }
+    h.burst("10:01", "198.51.100.4", 5);
+    h.burst("10:02", "198.51.100.5", 5);
+    h.cycle("10:03:00");
+    assert_eq!(h.banned(), vec!["198.51.100.4", "198.51.100.5"]);
+    assert!(h.engine.state.pending.is_empty());
+    assert_eq!(
+        h.fake.lock().unwrap().lookups,
+        vec!["list=cctv_ban&address=198.51.100.4&.proplist=.id"]
+    );
+}
+
+#[test]
+fn refused_ban_of_an_unlisted_address_is_retried() {
+    let mut h = Harness::new(false);
+    h.fake.lock().unwrap().router_down = true; // every PUT gets HTTP 500
+    h.burst("10:01", ATTACKER, 5);
+    h.cycle("10:02:00");
+    assert!(h.banned().is_empty());
+    assert_eq!(h.engine.state.pending.len(), 1);
+    assert_eq!(h.fake.lock().unwrap().lookups.len(), 1);
+}
+
+#[test]
+fn todays_wording_needs_no_lookup() {
+    let mut h = Harness::new(false);
+    h.fake.lock().unwrap().bans.push(ATTACKER.to_string());
+    h.burst("10:01", ATTACKER, 5);
+    h.cycle("10:02:00");
+    assert!(h.engine.state.pending.is_empty());
+    assert!(h.fake.lock().unwrap().lookups.is_empty());
+}
+
+// ------------------------------------------------------------------ --check
+
+#[test]
+fn check_command_reports_each_item_and_changes_nothing() {
+    use hik_f2b::health::Status;
+    let mut h = Harness::with(Opts {
+        telegram: true,
+        second_nvr: true,
+        ..Default::default()
+    });
+    let slow = h.fake2.clone().unwrap();
+    slow.lock().unwrap().nvr_auth_ok = false;
+    h.burst("10:01", ATTACKER, 5); // not read by --check
+    let saved = h.engine.state.serialize();
+
+    let lines = h.engine.check_all();
+    let summary: Vec<(String, Status)> = lines
+        .iter()
+        .map(|l| (l.item.clone(), l.status.clone()))
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            ("nvr nvr1".to_string(), Status::Ok),
+            ("nvr nvr2".to_string(), Status::Failed),
+            ("firewall".to_string(), Status::Ok),
+            ("telegram".to_string(), Status::Ok),
+        ]
+    );
+    assert!(
+        lines[0].detail.contains("device time 2026-01-10T10:00:00Z"),
+        "{}",
+        lines[0]
+    );
+    assert_eq!(
+        lines[1].to_string(),
+        "FAILED   nvr nvr2: login rejected (HTTP 401)"
+    );
+    assert_eq!(
+        lines[2].detail,
+        "1 enabled rule(s) in /ip/firewall/raw with src-address-list=cctv_ban"
+    );
+
+    h.fake.lock().unwrap().rules.clear();
+    let lines = h.engine.check_all();
+    assert_eq!(lines[2].status, Status::Failed);
+
+    // nothing banned, sent or remembered
+    assert_eq!(h.engine.state.serialize(), saved);
+    assert!(h.banned().is_empty());
+    assert_eq!(h.fake.lock().unwrap().tg_attempts, 0);
+    assert!(h.engine.alerted_problems().is_empty());
+    assert_eq!(h.engine.nvrs[1].retry_after, 0, "no backoff from --check");
+
+    let mut h = Harness::with(Opts {
+        mikrotik: false,
+        ..Default::default()
+    });
+    let lines = h.engine.check_all();
+    assert_eq!(lines[1].status, Status::Off);
+    assert_eq!(lines[2].status, Status::Off);
+    assert_eq!(h.fake.lock().unwrap().router_requests, 0);
 }

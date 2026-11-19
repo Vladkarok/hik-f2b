@@ -62,10 +62,31 @@ impl std::fmt::Display for BanError {
     }
 }
 
+/// Why the firewall cannot be relied on.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HealthError {
+    /// It cannot be reached, refuses our login or answers with an error.
+    Unusable(String),
+    /// It answers, but nothing blocks the addresses it lists.
+    NotEnforced(String),
+}
+
+impl std::fmt::Display for HealthError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            HealthError::Unusable(m) | HealthError::NotEnforced(m) => f.write_str(m),
+        }
+    }
+}
+
 pub trait Firewall {
     /// Blocks `ip` for `bantime`. Returns `Ok(false)` when the firewall
     /// already lists the address; an existing entry is left as it is.
     fn ban(&self, ip: Ipv4Addr, bantime: BanTime, comment: &str) -> Result<bool, BanError>;
+    /// Checks that bans can be applied and that listed addresses are
+    /// actually blocked. `Ok` carries a short description of what was found.
+    /// Must change nothing on the firewall.
+    fn check(&self) -> Result<String, HealthError>;
     /// A short human-readable name for log lines, e.g. the address-list.
     fn describe(&self) -> String;
 }

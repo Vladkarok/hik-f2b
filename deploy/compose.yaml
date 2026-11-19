@@ -1,0 +1,46 @@
+# Docker Compose / podman-compose example. Not yet tested.
+#
+# No image is published yet. Build it from the repository first:
+#   docker build -t hik-f2b -f Containerfile .
+#   (or: podman build -t hik-f2b -f Containerfile .)
+# ghcr.io/OWNER/hik-f2b is a placeholder for a future published image
+# (OWNER = the GitHub owner).
+#
+# Put next to this file:
+#   hik-f2b.ini            (from hik-f2b.example.ini)
+#   router-ca.crt          (cert_export_f2b-ca.crt exported from the router)
+#   secrets/router         (router password, one line)
+#   secrets/nvr            (NVR password, one line)
+# The container runs as uid 65532, so the mounted files must be readable by
+# it. hik-f2b.ini and router-ca.crt hold no secrets when password_file is
+# used:  chmod 644 hik-f2b.ini router-ca.crt
+# The password files, with rootful Docker:
+#   chown 65532 secrets/* && chmod 400 secrets/*
+# Z relabels the files for SELinux; it has no effect where SELinux is off.
+
+services:
+  hik-f2b:
+    image: hik-f2b:latest
+    # image: ghcr.io/OWNER/hik-f2b:latest
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    mem_limit: 32m
+    pids_limit: 32
+    volumes:
+      - ./hik-f2b.ini:/etc/hik-f2b/hik-f2b.ini:ro,Z
+      - ./router-ca.crt:/etc/hik-f2b/router-ca.crt:ro,Z
+      - state:/var/lib/hik-f2b
+    secrets:
+      - hik-f2b-router
+      - hik-f2b-nvr
+
+secrets:
+  hik-f2b-router:
+    file: ./secrets/router
+  hik-f2b-nvr:
+    file: ./secrets/nvr
+
+volumes:
+  state: {}

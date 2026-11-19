@@ -1,0 +1,63 @@
+# systemd unit for running the static binary without a container.
+# This unit has not been run yet. Check it with `systemd-analyze verify` and
+# watch the first start with `journalctl -u hik-f2b`.
+#
+# Use a static (musl) binary, see "No container" in README.md.
+#   install -m 755 hik-f2b /usr/local/bin/hik-f2b
+#   install -D -m 644 hik-f2b.ini /etc/hik-f2b/hik-f2b.ini
+#   install -D -m 644 router-ca.crt /etc/hik-f2b/router-ca.crt
+#   install -D -m 600 router-password /etc/hik-f2b/secrets/router
+#   install -D -m 600 nvr-password    /etc/hik-f2b/secrets/nvr
+# and in hik-f2b.ini:
+#   password_file = /run/credentials/hik-f2b.service/router   (and .../nvr)
+# hik-f2b.ini and router-ca.crt are read by a dynamic user, so they must be
+# world-readable; they hold no secrets when password_file is used.
+# Notify-only mode (no [mikrotik] section): drop the router credential.
+
+[Unit]
+Description=hik-f2b: ban Hikvision NVR brute-forcers on MikroTik
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/hik-f2b --config /etc/hik-f2b/hik-f2b.ini
+Restart=always
+RestartSec=30
+
+# Runs as a throw-away unprivileged user; secrets are handed over by systemd.
+DynamicUser=yes
+StateDirectory=hik-f2b
+LoadCredential=router:/etc/hik-f2b/secrets/router
+LoadCredential=nvr:/etc/hik-f2b/secrets/nvr
+#LoadCredential=telegram:/etc/hik-f2b/secrets/telegram
+
+# Sandbox: no privileges, no devices, network sockets only.
+# AF_UNIX is allowed because name resolution may need it.
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+UMask=0077
+MemoryMax=32M
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target

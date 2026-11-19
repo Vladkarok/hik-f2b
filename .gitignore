@@ -1,0 +1,11 @@
+# Real configs and secrets never belong in the repository.
+*.ini
+!hik-f2b.example.ini
+*.crt
+*.pem
+*.key
+secrets/
+state
+state.tmp
+
+/target/

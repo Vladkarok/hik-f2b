@@ -1,0 +1,11 @@
+.git
+.github
+target
+deploy
+*.md
+*.ini
+!hik-f2b.example.ini
+*.crt
+*.pem
+*.key
+secrets

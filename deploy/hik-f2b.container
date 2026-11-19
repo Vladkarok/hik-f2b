@@ -1,0 +1,51 @@
+# Podman Quadlet unit, tried rootless on Debian 13 with Podman 5.4.
+# Rootless install:
+#   ~/.config/containers/systemd/hik-f2b.container
+#   systemctl --user daemon-reload && systemctl --user start hik-f2b
+#   loginctl enable-linger "$USER"      (so it runs without a login session)
+#
+# No image is published yet. Build it from the repository first:
+#   podman build -t hik-f2b -f Containerfile .
+# which Podman stores as localhost/hik-f2b:latest. ghcr.io/OWNER/hik-f2b is
+# a placeholder for a future published image (OWNER = the GitHub owner).
+#
+# ~/.config/hik-f2b holds hik-f2b.ini and router-ca.crt. hik-f2b runs as
+# uid 65532 in the container, which is not your user, so both files must be
+# world-readable (chmod 644, directory 755). They hold no secrets as long as
+# the passwords come from the secrets below (password_file).
+#
+# Secrets are created once with:
+#   printf '%s' 'ROUTER_PASSWORD' | podman secret create hik-f2b-router -
+#   printf '%s' 'NVR_PASSWORD'    | podman secret create hik-f2b-nvr -
+# Notify-only mode (no [mikrotik] section): drop the hik-f2b-router line and
+# enable the hik-f2b-telegram one.
+
+[Unit]
+Description=hik-f2b: ban Hikvision NVR brute-forcers on MikroTik
+After=network-online.target
+Wants=network-online.target
+
+[Container]
+Image=localhost/hik-f2b:latest
+#Image=ghcr.io/OWNER/hik-f2b:latest
+ContainerName=hik-f2b
+# The service only makes outgoing connections and listens on nothing.
+# Host networking avoids creating any extra interface on the host.
+Network=host
+# Z relabels the directory for SELinux; it has no effect where SELinux is off.
+Volume=%h/.config/hik-f2b:/etc/hik-f2b:ro,Z
+Volume=hik-f2b-state:/var/lib/hik-f2b
+Secret=hik-f2b-router,uid=65532,mode=0400
+Secret=hik-f2b-nvr,uid=65532,mode=0400
+#Secret=hik-f2b-telegram,uid=65532,mode=0400
+ReadOnly=true
+DropCapability=ALL
+NoNewPrivileges=true
+PodmanArgs=--memory=32m --pids-limit=32
+
+[Service]
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

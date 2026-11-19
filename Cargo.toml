@@ -1,0 +1,26 @@
+[package]
+name = "hik-f2b"
+version = "0.2.0"
+edition = "2021"
+description = "fail2ban-style banning of Hikvision NVR brute-forcers on a MikroTik router"
+license = "MIT"
+readme = "README.md"
+keywords = ["hikvision", "mikrotik", "routeros", "fail2ban", "nvr"]
+categories = ["command-line-utilities", "network-programming"]
+
+[dependencies]
+ureq = { version = "2.12", default-features = false, features = ["tls"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "0.26"
+md-5 = "0.10"
+roxmltree = "0.20"
+regex-lite = "0.1"
+signal-hook = { version = "0.3", default-features = false }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+overflow-checks = true

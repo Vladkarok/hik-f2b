@@ -1,0 +1,211 @@
+name: Release
+
+# Pushing a tag vX.Y.Z (final) or vX.Y.Z-rc.N (release candidate) checks the
+# repository, runs CI, builds the image natively for amd64 and arm64, pushes
+# it to ghcr.io as one multi-arch image and creates the GitHub Release.
+# See RELEASING.md.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
+      image_version: ${{ steps.check.outputs.image_version }}
+      prerelease: ${{ steps.check.outputs.prerelease }}
+      image: ${{ steps.check.outputs.image }}
+      tags: ${{ steps.check.outputs.tags }}
+      latest: ${{ steps.check.outputs.latest }}
+      description: ${{ steps.check.outputs.description }}
+      created: ${{ steps.check.outputs.created }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # All tags, to decide whether this release is the newest one.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check the tag against Cargo.toml, CHANGELOG.md and the docs
+        id: check
+        # GITHUB_REF_TYPE, GITHUB_REF_NAME and GITHUB_REPOSITORY are set by
+        # the runner; release-check.sh validates the tag before using it.
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF_TYPE" != tag ]; then
+            echo "::error::this workflow runs for tags only"
+            exit 1
+          fi
+          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          bash .github/scripts/release-check.sh "$GITHUB_REF_NAME" "$image" > release.env
+          cat release.env
+          cat release.env >> "$GITHUB_OUTPUT"
+          echo "created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+  ci:
+    needs: prepare
+    permissions:
+      contents: read
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: [prepare, ci]
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          # GitHub's standard arm64 runner; free for public repositories.
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      ARCH: ${{ matrix.arch }}
+      IMAGE: ${{ needs.prepare.outputs.image }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      IMAGE_VERSION: ${{ needs.prepare.outputs.image_version }}
+      DESCRIPTION: ${{ needs.prepare.outputs.description }}
+      CREATED: ${{ needs.prepare.outputs.created }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build
+        run: |
+          set -euo pipefail
+          ref="$IMAGE:$IMAGE_VERSION-$ARCH"
+          docker buildx build \
+            --platform "linux/$ARCH" \
+            --provenance=false \
+            --sbom=false \
+            --load \
+            --label "org.opencontainers.image.title=hik-f2b" \
+            --label "org.opencontainers.image.description=$DESCRIPTION" \
+            --label "org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --label "org.opencontainers.image.version=$IMAGE_VERSION" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --label "org.opencontainers.image.licenses=MIT" \
+            --label "org.opencontainers.image.created=$CREATED" \
+            --file Containerfile \
+            --tag "$ref" \
+            .
+          arch=$(docker image inspect --format '{{.Architecture}}' "$ref")
+          if [ "$arch" != "$ARCH" ]; then
+            echo "::error::built for $arch, expected $ARCH"
+            exit 1
+          fi
+          printed=$(docker run --rm "$ref" --version)
+          if [ "$printed" != "hik-f2b $VERSION" ]; then
+            echo "::error::the image prints '$printed', expected 'hik-f2b $VERSION'"
+            exit 1
+          fi
+      - name: Push
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:$IMAGE_VERSION-$ARCH"
+      - name: Log out
+        if: always()
+        run: docker logout ghcr.io || true
+
+  manifest:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ${{ needs.prepare.outputs.image }}
+      IMAGE_VERSION: ${{ needs.prepare.outputs.image_version }}
+      TAGS: ${{ needs.prepare.outputs.tags }}
+      DESCRIPTION: ${{ needs.prepare.outputs.description }}
+      CREATED: ${{ needs.prepare.outputs.created }}
+    steps:
+      - name: Join the two images into one multi-arch image
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          args=()
+          for tag in $TAGS; do
+            args+=(--tag "$IMAGE:$tag")
+          done
+          # The package page on GitHub shows the description of the index.
+          docker buildx imagetools create "${args[@]}" \
+            --annotation "index:org.opencontainers.image.description=$DESCRIPTION" \
+            --annotation "index:org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --annotation "index:org.opencontainers.image.version=$IMAGE_VERSION" \
+            --annotation "index:org.opencontainers.image.revision=$GITHUB_SHA" \
+            --annotation "index:org.opencontainers.image.licenses=MIT" \
+            --annotation "index:org.opencontainers.image.created=$CREATED" \
+            "$IMAGE:$IMAGE_VERSION-amd64" \
+            "$IMAGE:$IMAGE_VERSION-arm64"
+          docker buildx imagetools inspect "$IMAGE:$IMAGE_VERSION"
+      - name: Log out
+        if: always()
+        run: docker logout ghcr.io || true
+
+  release:
+    needs: [prepare, manifest]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+      VERSION: ${{ needs.prepare.outputs.version }}
+      IMAGE: ${{ needs.prepare.outputs.image }}
+      IMAGE_VERSION: ${{ needs.prepare.outputs.image_version }}
+      PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+      LATEST: ${{ needs.prepare.outputs.latest }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Create the GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          notes=$(mktemp)
+          {
+            bash .github/scripts/changelog-notes.sh "$VERSION"
+            echo
+            echo "Container image (linux/amd64, linux/arm64):"
+            echo
+            echo '```'
+            echo "podman pull $IMAGE:$IMAGE_VERSION"
+            echo '```'
+          } > "$notes"
+          flags=(--latest="$LATEST")
+          if [ "$PRERELEASE" = true ]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "hik-f2b $IMAGE_VERSION" \
+            --notes-file "$notes" \
+            "${flags[@]}"

@@ -2,8 +2,12 @@ name: CI
 
 on:
   push:
+    # Branches only: a release tag runs these checks through release.yml.
+    branches: ["**"]
   pull_request:
   workflow_dispatch:
+  # The release workflow runs these checks before it publishes anything.
+  workflow_call:
   schedule:
     # Re-check dependencies for newly published advisories every Monday.
     # GitHub disables scheduled workflows after 60 days without repository

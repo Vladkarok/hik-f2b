@@ -10,6 +10,11 @@ GitHub's "Report a vulnerability" button (Security tab → Advisories) on this
 repository. Include the hik-f2b version, RouterOS version, NVR model and
 firmware, and steps to reproduce.
 
+**Supported versions:** fixes go into a new release of the newest version
+line only (published as `ghcr.io/vladkarok/hik-f2b:X.Y.Z`, see
+[CHANGELOG.md](CHANGELOG.md)). Update to it rather than expecting a fix for
+an older line.
+
 Things that are in scope: anything that lets a remote party get an arbitrary
 address banned or un-banned, inject content into the router request, the log
 or a Telegram message, leak credentials from the config, the logs or error

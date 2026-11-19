@@ -769,6 +769,11 @@ The container image was run with a read-only filesystem, no capabilities,
 Podman secrets and a memory limit. A 25-minute unattended dry run against both
 NVRs had no rejected logins and no failed polls.
 
+The published `linux/amd64` image was pulled from ghcr.io (as release
+candidate 0.3.0-rc.1) and run against both NVRs and the router with `--check`,
+`--country` and `--dump`; the earlier tries above used an image built on the
+host from the Containerfile.
+
 The country reader was tried with the DB-IP Country Lite file of November
 2026 (an IPv6 tree with 24-bit records): for 3000 addresses `--country` gave
 exactly what a separately written reader of the format gave, and `--check`
@@ -781,9 +786,6 @@ Not yet tried:
 - A permanent ban (`bantime = permanent`) on a real router.
 - The Compose file and the systemd unit in `deploy/`. The Quadlet unit runs
   rootless on Debian 13 with Podman 5.4.
-- The published image `ghcr.io/vladkarok/hik-f2b`. The image tried above was
-  built on the host from the Containerfile; no image pulled from ghcr.io has
-  been run yet.
 - The `linux/arm64` image on any arm64 device. It is built natively on
   GitHub's arm64 runner and the build checks that it prints its version, but
   it has not been run on real hardware.

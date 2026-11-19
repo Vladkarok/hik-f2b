@@ -44,10 +44,10 @@ bash .github/scripts/release-check.sh vX.Y.Z ghcr.io/vladkarok/hik-f2b
    tried, if anything changed.
 8. Tag the release from the same commit as the last rc (or a later one with
    only doc changes): `git tag -a vX.Y.Z -m "hik-f2b X.Y.Z" && git push origin vX.Y.Z`.
-9. Check the GitHub Release and the package page. After the very first
-   release, make the package public once: the package's settings on GitHub →
-   "Change visibility" → Public. A package pushed for the first time is
-   private, whatever the repository's visibility.
+9. Check the GitHub Release and the package page, and that the image can be
+   pulled without logging in. The first image, pushed from the public
+   repository, was public straight away; if a package ever turns out private,
+   change it in the package's settings on GitHub → "Change visibility".
 
 A tag that failed the checks can be deleted (`git push origin :vX.Y.Z-rc.1`),
 fixed and pushed again. Do not move a final tag once its image is published;

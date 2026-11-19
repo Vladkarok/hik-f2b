@@ -456,8 +456,10 @@ Files that work:
 
 - DB-IP IP to Country Lite (`dbip-country-lite-YYYY-MM.mmdb`): free, no
   account needed. Tried.
-- MaxMind GeoLite2 Country or City: the same layout (`country` → `iso_code`).
-  Not tried.
+- MaxMind GeoLite2 Country (`GeoLite2-Country.mmdb`): free with a MaxMind
+  account. Tried. Its licence asks you to replace the file within 30 days of
+  each new release, so set up updates if you use it. GeoLite2 City has the
+  same layout (`country` → `iso_code`) and is not tried.
 - IPinfo Lite: a top-level `country_code`. Supported by its schema, not tried.
 
 Only a code of exactly two capital letters is used. An address that is not in
@@ -769,15 +771,17 @@ The container image was run with a read-only filesystem, no capabilities,
 Podman secrets and a memory limit. A 25-minute unattended dry run against both
 NVRs had no rejected logins and no failed polls.
 
-The published `linux/amd64` image was pulled from ghcr.io (as release
+The published `linux/amd64` image was pulled from ghcr.io (first as release
 candidate 0.3.0-rc.1) and run against both NVRs and the router with `--check`,
-`--country` and `--dump`; the earlier tries above used an image built on the
-host from the Containerfile.
+`--country` and `--dump`, and 0.3.0 runs as the service; the earlier tries
+above used an image built on the host from the Containerfile.
 
 The country reader was tried with the DB-IP Country Lite file of November
-2026 (an IPv6 tree with 24-bit records): for 3000 addresses `--country` gave
+2026 and the MaxMind GeoLite2 Country file of 17 November 2026 (both an IPv6
+tree with 24-bit records): for 3000 addresses in each, `--country` gave
 exactly what a separately written reader of the format gave, and `--check`
-showed the database.
+showed the database. The two files gave a different answer for about 4 % of
+those addresses.
 
 A real ban by the running service was reported in a Telegram forum topic.
 
@@ -796,7 +800,7 @@ Not yet tried:
 - Notify-only mode on real devices.
 - A ban with a country on real devices: only `--country` and `--check` were
   run against a real database file.
-- MaxMind GeoLite2 and IPinfo Lite database files.
+- MaxMind GeoLite2 City and IPinfo Lite database files.
 - Running for days or weeks.
 
 What real devices showed:

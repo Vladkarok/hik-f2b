@@ -1,10 +1,11 @@
 # Docker Compose / podman-compose example. Not yet tested.
 #
-# No image is published yet. Build it from the repository first:
+# The image is the published one, pinned to an exact version. To update,
+# change the tag, then: docker compose pull && docker compose up -d
+# (see "Versions and updates" in README.md). To build the image yourself:
 #   docker build -t hik-f2b -f Containerfile .
 #   (or: podman build -t hik-f2b -f Containerfile .)
-# ghcr.io/OWNER/hik-f2b is a placeholder for a future published image
-# (OWNER = the GitHub owner).
+# and use the commented image: line below.
 #
 # Put next to this file:
 #   hik-f2b.ini            (from hik-f2b.example.ini)
@@ -20,8 +21,8 @@
 
 services:
   hik-f2b:
-    image: hik-f2b:latest
-    # image: ghcr.io/OWNER/hik-f2b:latest
+    image: ghcr.io/vladkarok/hik-f2b:0.3.0
+    # image: hik-f2b:latest
     restart: unless-stopped
     read_only: true
     cap_drop: [ALL]

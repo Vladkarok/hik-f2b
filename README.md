@@ -135,16 +135,28 @@ Copy [hik-f2b.example.ini](hik-f2b.example.ini) to `hik-f2b.ini` and edit it.
 Addresses and thresholds go in the config. Passwords should go in separate
 secret files that the config only points to (`password_file = ...`).
 
-No image is published yet. Build it from the repository with the
-[Containerfile](Containerfile):
+The container image is published on GitHub's container registry as
+`ghcr.io/vladkarok/hik-f2b`, for `linux/amd64` and `linux/arm64` (the arm64
+image is built natively but has not been tried on real hardware). The deploy
+files use an exact version; fetch it with:
+
+```bash
+podman pull ghcr.io/vladkarok/hik-f2b:0.3.0
+```
+
+How versions are tagged and how to update: see
+[Versions and updates](#versions-and-updates).
+
+**Building the image yourself** instead of pulling it: build it from the
+repository with the [Containerfile](Containerfile):
 
 ```bash
 podman build -t hik-f2b -f Containerfile .
 ```
 
-Podman then knows it as `localhost/hik-f2b:latest`. The deploy files use that
-name; `ghcr.io/OWNER/hik-f2b` in their comments is a placeholder for a future
-published image.
+Podman then knows it as `localhost/hik-f2b:latest`. Put that name in the
+`Image=` line of the unit (or `image:` in the Compose file) and in the
+commands below; the deploy files have it as a commented-out line.
 
 **Podman (rootless), recommended.** Use
 [deploy/hik-f2b.container](deploy/hik-f2b.container), a Quadlet unit (a file
@@ -168,18 +180,21 @@ are world-readable. That is why they are `644` here. They hold no secrets as
 long as the passwords come from Podman secrets (`password_file`). Do not put
 passwords inline in a world-readable config.
 
-**Docker Compose:** see [deploy/compose.yaml](deploy/compose.yaml). Build the
-image first with `docker build -t hik-f2b -f Containerfile .`.
+**Docker Compose:** see [deploy/compose.yaml](deploy/compose.yaml).
+`docker compose pull` fetches the image it names. To build the image yourself,
+run `docker build -t hik-f2b -f Containerfile .` and use the commented-out
+`image: hik-f2b:latest` line.
 
 **No container:** the systemd unit
 [deploy/hik-f2b.service](deploy/hik-f2b.service) runs the binary in a sandbox
 and passes the secrets as systemd credentials. A plain `cargo build --release`
 on a glibc system gives a dynamically linked binary. To get the same static
-binary as in the image, either copy it out of the image:
+binary as in the image, either copy it out of the image (Podman pulls the
+image for the host's architecture; use `localhost/hik-f2b:latest` for one you
+built yourself):
 
 ```bash
-podman build -t hik-f2b -f Containerfile .
-podman create --name hik-f2b-copy localhost/hik-f2b:latest
+podman create --name hik-f2b-copy ghcr.io/vladkarok/hik-f2b:0.3.0
 podman cp hik-f2b-copy:/hik-f2b ./hik-f2b
 podman rm hik-f2b-copy
 ```
@@ -218,7 +233,7 @@ podman run --rm --network host \
   -v ~/.config/hik-f2b:/etc/hik-f2b:ro,Z \
   --secret hik-f2b-router,uid=65532,mode=0400 \
   --secret hik-f2b-nvr,uid=65532,mode=0400 \
-  localhost/hik-f2b:latest --dump --hours 72
+  ghcr.io/vladkarok/hik-f2b:0.3.0 --dump --hours 72
 ```
 
 `--check` works the same way: put `--check` in place of `--dump --hours 72`.
@@ -249,6 +264,48 @@ At startup the log shows the mode (`mode: ban on MikroTik`, `mode: DRY RUN`
 or `mode: notify-only`) and, with a router, how many entries the address-list
 has and the result of the firewall check (`firewall check ok: ...` or
 `firewall check failed: ...`).
+
+## Versions and updates
+
+hik-f2b uses [Semantic Versioning](https://semver.org/). Every release is
+described in [CHANGELOG.md](CHANGELOG.md), published as a GitHub Release and
+as these image tags:
+
+| Tag | Meaning |
+| --- | --- |
+| `0.3.0` | Exactly this release. It never changes. Use this one. |
+| `0.3` | The newest `0.3.x` release; moves with every bug-fix release. |
+| `latest` | The newest release; moves with every release, including ones that need config changes. |
+| `0.3.0-rc.1` | A release candidate, for trying out before `0.3.0`. Never `latest`, never `0.3`. |
+
+Pin an exact version, as the deploy files do. Before 1.0, a new second number
+(`0.3` to `0.4`) may need changes to your config; the changelog says so.
+
+**Update:** read the changelog from your version up to the new one, try the
+new image with `--check` (put it in the `podman run` command from
+[Verify before enabling](#4-verify-before-enabling)), then change the tag in
+the `Image=` line of `~/.config/containers/systemd/hik-f2b.container`, pull
+and restart:
+
+```bash
+podman pull ghcr.io/vladkarok/hik-f2b:<new version>
+systemctl --user daemon-reload
+systemctl --user restart hik-f2b
+journalctl --user -u hik-f2b -f
+```
+
+With Compose: change `image:`, then `docker compose pull` and
+`docker compose up -d`.
+
+**Roll back:** the same steps with the previous tag. Old tags stay published.
+
+Podman can also update a container by itself (`AutoUpdate=registry` in the
+unit with `podman-auto-update.timer`), and there are similar tools for Docker.
+We recommend against unattended updates here: hik-f2b changes your firewall,
+so an update should be a step you take and then watch. If you use it anyway,
+it needs a moving tag such as `0.3`, since an exact version never changes.
+
+How a release is made: [RELEASING.md](RELEASING.md).
 
 ## Configuration
 
@@ -635,6 +692,12 @@ Not yet tried:
 - A permanent ban (`bantime = permanent`) on a real router.
 - The Compose file and the systemd unit in `deploy/`. The Quadlet unit runs
   rootless on Debian 13 with Podman 5.4.
+- The published image `ghcr.io/vladkarok/hik-f2b`. The image tried above was
+  built on the host from the Containerfile; no image pulled from ghcr.io has
+  been run yet.
+- The `linux/arm64` image on any arm64 device. It is built natively on
+  GitHub's arm64 runner and the build checks that it prints its version, but
+  it has not been run on real hardware.
 - A health alert on real devices. The checks behind the alerts were run with
   `--check` against both NVRs and the router, where the rule check found
   enabled rules in `raw` and in `filter` and left a disabled one out; no real

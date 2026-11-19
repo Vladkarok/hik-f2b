@@ -4,10 +4,12 @@
 #   systemctl --user daemon-reload && systemctl --user start hik-f2b
 #   loginctl enable-linger "$USER"      (so it runs without a login session)
 #
-# No image is published yet. Build it from the repository first:
-#   podman build -t hik-f2b -f Containerfile .
-# which Podman stores as localhost/hik-f2b:latest. ghcr.io/OWNER/hik-f2b is
-# a placeholder for a future published image (OWNER = the GitHub owner).
+# Image: the published one, pinned to an exact version. To update, change
+# the tag, then: podman pull <image> && systemctl --user restart hik-f2b
+# (see "Versions and updates" in README.md). To build the image yourself
+# instead:  podman build -t hik-f2b -f Containerfile .
+# which Podman stores as localhost/hik-f2b:latest; use the commented Image=
+# line below.
 #
 # ~/.config/hik-f2b holds hik-f2b.ini and router-ca.crt. hik-f2b runs as
 # uid 65532 in the container, which is not your user, so both files must be
@@ -26,8 +28,12 @@ After=network-online.target
 Wants=network-online.target
 
 [Container]
-Image=localhost/hik-f2b:latest
-#Image=ghcr.io/OWNER/hik-f2b:latest
+Image=ghcr.io/vladkarok/hik-f2b:0.3.0
+#Image=localhost/hik-f2b:latest
+# Unattended updates through podman-auto-update.timer are possible but not
+# recommended for a tool that edits the firewall; they also need a moving
+# tag such as 0.3 instead of an exact version.
+#AutoUpdate=registry
 ContainerName=hik-f2b
 # The service only makes outgoing connections and listens on nothing.
 # Host networking avoids creating any extra interface on the host.

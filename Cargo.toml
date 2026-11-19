@@ -15,7 +15,7 @@ webpki-roots = "0.26"
 md-5 = "0.10"
 roxmltree = "0.20"
 regex-lite = "0.1"
-signal-hook = { version = "0.3", default-features = false }
+signal-hook = { version = "0.4", default-features = false }
 
 [profile.release]
 opt-level = "s"

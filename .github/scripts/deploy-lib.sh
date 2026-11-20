@@ -75,7 +75,7 @@ STATE_EMPTY='hik-f2b-state 2'
 # could not be read.
 check_log() {
     local log=$1 version=$2 telegram=$3
-    grep -F "INFO hik-f2b $version started: 1 NVR(s), maxretry=5 findtime=3600s bantime=86400 telegram=$telegram" "$log" \
+    grep -F "INFO hik-f2b $version started: 1 NVR(s), maxretry=5 findtime=3600s bantime=86400s telegram=$telegram" "$log" \
         || fail "no startup line with telegram=$telegram"
     grep -F "INFO mode: ban on MikroTik, address-list cctv_ban" "$log" \
         || fail "no mode line"

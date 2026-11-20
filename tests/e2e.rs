@@ -896,7 +896,9 @@ fn waiting_ban_of_an_address_now_in_ignoreip_is_dropped() {
     assert_eq!(h.fails(NEIGHBOUR), 1);
 
     // OWNER and NEIGHBOUR are in 203.0.113.16/29
-    h.ini = h.ini.replace("[general]\n", "[general]\nignoreip = 203.0.113.16/29\n");
+    h.ini = h
+        .ini
+        .replace("[general]\n", "[general]\nignoreip = 203.0.113.16/29\n");
     util::capture_log();
     h.restart();
     let log = util::captured_log();
@@ -911,7 +913,10 @@ fn waiting_ban_of_an_address_now_in_ignoreip_is_dropped() {
         log
     );
     assert_eq!(
-        logged(&log, "INFO 203.0.113.21: 1 counted failed login(s) forgotten: "),
+        logged(
+            &log,
+            "INFO 203.0.113.21: 1 counted failed login(s) forgotten: "
+        ),
         1,
         "{:?}",
         log
@@ -2420,7 +2425,10 @@ fn refused_bans_that_expire_end_the_alert_without_a_recovery() {
     assert!(h.engine.alerted_problems().is_empty());
     let log = util::captured_log();
     assert_eq!(
-        logged(&log, "INFO health unknown [ban-refused]: hik-f2b: no refused ban is waiting"),
+        logged(
+            &log,
+            "INFO health unknown [ban-refused]: hik-f2b: no refused ban is waiting"
+        ),
         1,
         "{:?}",
         log

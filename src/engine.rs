@@ -177,9 +177,10 @@ fn read_window(nvr: &mut Nvr, start: i64, end: i64, meta_id: &str) -> Result<Win
             oldest.saturating_sub(1)
         } else if newest_first {
             // the second the search stopped in is left to the next search
-            window
-                .events
-                .extend(kept.into_iter().filter(|ev| ev.ts.is_some_and(|ts| ts > oldest)));
+            window.events.extend(
+                kept.into_iter()
+                    .filter(|ev| ev.ts.is_some_and(|ts| ts > oldest)),
+            );
             end = oldest.saturating_add(1);
             oldest
         } else if n == 0 {
@@ -229,11 +230,14 @@ fn poll_nvr(
     let now = nvr.now()?;
     let offset = now.saturating_sub(host_now);
     let first = !state.nvr.contains_key(&nvr.name);
-    let st = state.nvr.entry(nvr.name.clone()).or_insert_with(|| NvrState {
-        since: now,
-        offset: Some(offset),
-        ..Default::default()
-    });
+    let st = state
+        .nvr
+        .entry(nvr.name.clone())
+        .or_insert_with(|| NvrState {
+            since: now,
+            offset: Some(offset),
+            ..Default::default()
+        });
     let result = read_log(nvr, cfg, st, now, offset, first);
     if first && result.is_err() {
         state.nvr.remove(&nvr.name);

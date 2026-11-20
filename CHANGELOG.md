@@ -6,7 +6,7 @@ numbers follow [Semantic Versioning](https://semver.org/). Each version is
 published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 (from 0.3.0 on); see "Versions and updates" in the [README](README.md).
 
-## [Unreleased]
+## [0.3.1] - YYYY-MM-DD
 
 ### Added
 
@@ -17,6 +17,31 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   config, checks `deploy/hik-f2b.container` with Quadlet's dry run, and runs
   the test suite on arm64 as well. The release workflow runs these checks
   too.
+
+### Fixed
+
+- A ban that waited for the router was applied even if its address had been
+  added to `ignoreip` in the meantime (with a restart). Waiting bans and
+  counted failed logins of an address that is now in `ignoreip`, or in a
+  range that is never banned, are dropped at startup and before bans are
+  applied, with one INFO line per address.
+- The first poll of an NVR did not record what the `lookback` overlap before
+  the start held, so the second poll counted failed logins from before the
+  start. The first poll now reads that overlap and records it as already
+  seen. If that read fails, the next poll tries again.
+- If a search stopped at its cap (50 pages or 5000 entries) and the NVR
+  lists the newest entries first, the older entries were skipped without a
+  word. hik-f2b now tells the order from the entries it got, reads the older
+  part in the same poll (at most 4 searches per NVR and poll), counts each
+  entry once, and logs an ERROR with the time range for entries it cannot
+  reach. Both tested NVRs list the oldest entries first, so they were not
+  affected.
+- A router that answers but refuses every ban (for example a user without
+  the `write` policy) raised no health alert. Refused bans now have their
+  own health alert, `ban-refused`, which only a ban the router accepts ends.
+  If every refused ban expires or is dropped while it is alerted, one notice
+  says that the outcome is unknown and the reminders stop. The README says
+  that `--check` cannot see this and `--test-ban` can.
 
 ## [0.3.0] - 2026-11-20
 
@@ -98,6 +123,7 @@ be built from source.
   a sandboxed systemd unit, unit and end-to-end tests, CI, and documentation
   in English and Ukrainian.
 
-[Unreleased]: https://github.com/Vladkarok/hik-f2b/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/Vladkarok/hik-f2b/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/Vladkarok/hik-f2b/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Vladkarok/hik-f2b/compare/1e9edea...v0.3.0
 [0.2.0]: https://github.com/Vladkarok/hik-f2b/commit/1e9edea

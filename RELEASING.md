@@ -72,5 +72,6 @@ If a tag failed the checks:
 2. Fix the problem.
 3. Push the tag again.
 
-Do not move a final tag once its image is published. Make the next patch
-release instead.
+Do not move a final tag once its image is published. Hosts that pinned it
+would get a different image under the same name. Make the next patch release
+instead.

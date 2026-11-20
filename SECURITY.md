@@ -5,7 +5,8 @@ firewall, so bugs here can matter. How it is built to limit that, and what it
 does not protect against, is described in the README under
 [Security design](README.md#security-design).
 
-**Reporting a vulnerability:** please do not open a public issue.
+**Reporting a vulnerability:** please do not open a public issue. Its details
+would be public before a fix exists.
 
 1. Use GitHub's "Report a vulnerability" button (Security tab → Advisories)
    on this repository.
@@ -32,4 +33,6 @@ between the host and an NVR) are known. A report that shows they are worse
 than described is welcome.
 
 Never attach your real config, router export or `--dump --raw` output to an
-issue unchanged. First remove passwords, public addresses and serial numbers.
+issue unchanged. They hold passwords, public addresses and serial numbers, and
+an issue is public. First remove passwords, public addresses and serial
+numbers.

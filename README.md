@@ -185,7 +185,8 @@ Inside the container hik-f2b runs as uid 65532. In a rootless container that
 user is not you. So it can read the config and the CA certificate only if they
 are world-readable. That is why the commands below make them `644`. They hold
 no secrets as long as the passwords come from Podman secrets (`password_file`).
-Do not put passwords inline in a world-readable config.
+Do not put passwords inline in a world-readable config. Any local user of the
+host could read them.
 
 Run these commands:
 
@@ -201,15 +202,20 @@ cp deploy/hik-f2b.container ~/.config/containers/systemd/
 systemctl --user daemon-reload
 ```
 
-**Docker Compose:** see [deploy/compose.yaml](deploy/compose.yaml).
-`docker compose pull` fetches the image it names. To build the image yourself:
+**Docker Compose:** see [deploy/compose.yaml](deploy/compose.yaml). Its header
+lists the files to put next to it and the owner and mode they need. If uid
+65532 cannot read a secret file, hik-f2b stops at startup with
+`cannot read /run/secrets/...`. `docker compose pull` fetches the image it
+names. To build the image yourself:
 
 1. Run `docker build -t hik-f2b -f Containerfile .`.
 2. Use the commented-out `image: hik-f2b:latest` line.
 
 **No container:** the systemd unit
 [deploy/hik-f2b.service](deploy/hik-f2b.service) runs the binary in a sandbox.
-It passes the secrets as systemd credentials. A plain `cargo build --release`
+It passes the secrets as systemd credentials. Its header lists the commands
+that install the binary, the config, the secret files and the unit. A plain
+`cargo build --release`
 on a glibc system gives a dynamically linked binary. To get the same static
 binary as in the image, use one of these two ways.
 
@@ -482,12 +488,32 @@ printf '%s' 'BOT_TOKEN' | podman secret create hik-f2b-telegram -
 hik-f2b then prints `ok: test message sent`, and the test message appears in
 the chat.
 
-With Compose: `deploy/compose.yaml` has no entry for the bot token.
+With Compose, give the container the bot token as a Compose secret. The
+`[telegram]` example above already reads it from
+`/run/secrets/hik-f2b-telegram`.
 
-Without a container: enable the
-`LoadCredential=telegram:/etc/hik-f2b/secrets/telegram` line in
-`deploy/hik-f2b.service`. Then set
-`bot_token_file = /run/credentials/hik-f2b.service/telegram`.
+1. Put the bot token in `secrets/telegram`, next to `compose.yaml`.
+2. With rootful Docker, run
+   `sudo chown 65532 secrets/telegram && sudo chmod 400 secrets/telegram`.
+3. In `compose.yaml`, enable the `- hik-f2b-telegram` line under the service's
+   `secrets:`.
+4. Enable the two `hik-f2b-telegram` lines under the top-level `secrets:`.
+5. Run `docker compose up -d`.
+
+The startup line in `docker compose logs hik-f2b` then ends with
+`telegram=on`.
+
+Without a container, systemd hands the bot token over as a credential:
+
+1. Run `sudo install -D -m 600 telegram-token /etc/hik-f2b/secrets/telegram`.
+2. Enable the `LoadCredential=telegram:/etc/hik-f2b/secrets/telegram` line in
+   `/etc/systemd/system/hik-f2b.service`.
+3. In the config, set
+   `bot_token_file = /run/credentials/hik-f2b.service/telegram`.
+4. Run `sudo systemctl daemon-reload`.
+5. Run `sudo systemctl restart hik-f2b`.
+
+The startup line in `journalctl -u hik-f2b` then ends with `telegram=on`.
 
 The message text is set with `message`. `\n` starts a new line. Placeholders:
 `{ip}`, `{country}`, `{action}`, `{bantime}`, `{nvr}`, `{user}`, `{count}`,
@@ -828,7 +854,8 @@ What it does not protect against:
 - A ban is per address, so it also affects anyone sharing that address.
 
 Never attach your real config, router export or `--dump --raw` output to an
-issue unchanged. First remove passwords and public addresses. To report a
+issue unchanged. They hold passwords, public addresses and serial numbers, and
+an issue is public. First remove passwords and public addresses. To report a
 vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Limitations
@@ -879,18 +906,49 @@ those addresses.
 
 A real ban by the running service was reported in a Telegram forum topic.
 
+A permanent ban was tried on the RB5009 (RouterOS 7.18.1) with the request
+that hik-f2b sends for `bantime = permanent`: a PUT to the address-list
+without a timeout. It created a static entry (`dynamic` false, no timeout).
+The same request sent again was refused with "already have such entry", and
+`--test-ban` for that address reported it as already in the address-list. The
+entry was removed afterwards.
+
+Health alerts were tried with a second hik-f2b instance in dry run, with
+`alert_after = 1m`, one NVR made unreachable and an address-list that no drop
+rule uses. One minute after the start it sent both health alerts (an NVR that
+cannot be read, banned addresses that are not blocked) to a Telegram forum
+topic. When the NVR was reachable again, it sent the recovery notice. The
+checks behind the alerts were also run with `--check` against both NVRs and
+the router: the drop-rule check found enabled rules in `raw` and in `filter`
+and left a disabled one out.
+
+CI (GitHub Actions) tries the deploy files on every push, with a dummy config
+only: the router and the NVR are addresses that nothing answers, the secrets
+are dummy values.
+
+- The image built in CI is started with `deploy/compose.yaml` on Docker
+  Compose, and its binary with `deploy/hik-f2b.service` on systemd 255
+  (Ubuntu 24.04). Each runs once as it is and once with the Telegram secret
+  enabled. The checks: hik-f2b reads the config, the CA file and every secret
+  file, runs as the unprivileged user without capabilities on a read-only
+  root filesystem, writes its state file and stops cleanly.
+- Quadlet (Podman 4.9) accepts `deploy/hik-f2b.container` in a dry run.
+- The test suite (fake NVR, fake router, fake Telegram, the country reader)
+  runs on GitHub's arm64 runner as well as on amd64.
+
 Not yet tried:
 
-- A permanent ban (`bantime = permanent`) on a real router.
-- The Compose file and the systemd unit in `deploy/`. The Quadlet unit runs
-  rootless on Debian 13 with Podman 5.4.
+- A permanent ban made by the running service after real failed logins, and
+  whether a permanent entry is still there after a router reboot.
+- The Compose file and the systemd unit with real devices: CI starts them
+  with a dummy config only. The Quadlet unit runs rootless on Debian 13 with
+  Podman 5.4.
+- Compose with podman-compose or rootless Docker.
 - The `linux/arm64` image on any arm64 device. It is built natively on
-  GitHub's arm64 runner and the build checks that it prints its version, but
-  it has not been run on real hardware.
-- A health alert on real devices. The checks behind the alerts were run with
-  `--check` against both NVRs and the router, where the drop-rule check found
-  enabled rules in `raw` and in `filter` and left a disabled one out; no real
-  outage was provoked.
+  GitHub's arm64 runner, the build checks that it prints its version, and the
+  test suite runs on that runner, but the image has not been run with real
+  devices.
+- The daily health reminder, and a health alert for a real unplanned outage.
 - Notify-only mode on real devices.
 - A ban with a country on real devices: only `--country` and `--check` were
   run against a real database file.

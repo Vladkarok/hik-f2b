@@ -6,6 +6,18 @@ numbers follow [Semantic Versioning](https://semver.org/). Each version is
 published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 (from 0.3.0 on); see "Versions and updates" in the [README](README.md).
 
+## [Unreleased]
+
+### Added
+
+- `deploy/compose.yaml`: an optional, commented-out secret for the Telegram
+  bot token, and the steps in the READMEs.
+- CI starts the image it builds with `deploy/compose.yaml` and with
+  `deploy/hik-f2b.service` (each also with the Telegram secret), with a dummy
+  config, checks `deploy/hik-f2b.container` with Quadlet's dry run, and runs
+  the test suite on arm64 as well. The release workflow runs these checks
+  too.
+
 ## [0.3.0] - 2026-11-20
 
 ### Added
@@ -86,5 +98,6 @@ be built from source.
   a sandboxed systemd unit, unit and end-to-end tests, CI, and documentation
   in English and Ukrainian.
 
+[Unreleased]: https://github.com/Vladkarok/hik-f2b/compare/v0.3.0...HEAD
 [0.3.0]: https://github.com/Vladkarok/hik-f2b/compare/1e9edea...v0.3.0
 [0.2.0]: https://github.com/Vladkarok/hik-f2b/commit/1e9edea

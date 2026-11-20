@@ -490,12 +490,11 @@ fn small_backward_correction_is_not_recounted() {
 }
 
 /// Found by `tests/sim.rs` (Clock class). A backward correction smaller than
-/// `lookback` is not a jump, but it moves the read cursor back to the new
-/// device time, so the next window starts before the previous one: entries
-/// in between are no longer in `seen` and are counted a second time.
+/// `lookback` used to move the read cursor back to the new device time
+/// without a resync, so the next window started before the previous one:
+/// entries in between were no longer in `seen` and were counted a second
+/// time. A device clock behind the cursor now always resyncs.
 #[test]
-#[ignore = "a small backward device clock correction moves the read window back and counts \
-            entries again"]
 fn small_backward_correction_below_lookback_is_not_recounted() {
     let mut h = Harness::new(false); // first poll at 10:00:00 (device)
     h.add("10:01:00", OWNER);
@@ -511,20 +510,24 @@ fn small_backward_correction_below_lookback_is_not_recounted() {
     h.set_host(host_of("10:04:30"));
     assert_eq!(h.fake.lock().unwrap().now, format!("{}10:02:50", DAY));
     h.tick();
+    assert_eq!(h.since("nvr1"), format!("{}10:02:50", DAY), "resynced");
     h.advance(30);
     h.advance(30);
     assert_eq!(h.fails(OWNER), 2, "the typo at 10:01:00 was counted twice");
+    // failed logins after the correction are counted
+    h.burst("10:04", ATTACKER, 5);
+    h.advance(60);
+    assert_eq!(h.banned(), vec![ATTACKER]);
 }
 
 /// Found by `tests/sim.rs` (Clock class). DST ends while the NVR's log
 /// cannot be read. The jump is noticed, but the polls fail, and after ten
-/// of them the unreadable window is skipped: the cursor and the offset are
-/// set to the new clock without a resync. The next read sees no jump, and
-/// entries from about an hour before the change, whose device times are
-/// those of the repeated hour, are counted again.
+/// of them the unreadable window is skipped. The skip used to set the
+/// cursor and the offset to the new clock without a resync, so the next
+/// read saw no jump and counted entries from about an hour before the
+/// change (device times of the repeated hour) again. Now the skip clears
+/// the offset, and the next read resyncs.
 #[test]
-#[ignore = "a clock change while the log is unreadable for ten polls is not resynced: entries \
-            are counted again"]
 fn clock_change_while_the_log_is_unreadable_is_not_recounted() {
     let mut h = Harness::new(false); // first poll at 10:00:00 (device)
     h.add("10:05:10", OWNER);
@@ -547,9 +550,20 @@ fn clock_change_while_the_log_is_unreadable_is_not_recounted() {
     h.tick();
     run(&mut h, 9, 30); // the 10th failure skips the window
     assert_eq!(h.since("nvr1"), format!("{}10:04:30", DAY));
+    assert_eq!(
+        h.engine.state.nvr["nvr1"].offset, None,
+        "a resync is still due"
+    );
+    // the resync that is due survives a restart (`-` in the state file)
+    h.restart();
     h.fake.lock().unwrap().garbage = false;
     h.advance(30);
     assert_eq!(h.fails(OWNER), 2, "the typos at 10:05 were counted twice");
+    assert_eq!(h.engine.state.nvr["nvr1"].offset, Some(SKEW - 3600));
+    // failed logins after the resync are counted
+    h.burst("10:06", ATTACKER, 5);
+    h.cycle("11:07:00");
+    assert_eq!(h.banned(), vec![ATTACKER]);
 }
 
 /// C2: the RTC is reset to 2000-01-01 (power cut) and later corrected.
@@ -696,6 +710,8 @@ fn unreadable_log_window_is_skipped_after_ten_polls() {
     }
     h.advance(30); // the 10th failure
     assert_eq!(h.since("nvr1"), format!("{}10:05:00", DAY));
+    // the clock did not change: no resync, so what follows is counted
+    assert_eq!(h.engine.state.nvr["nvr1"].offset, Some(SKEW));
     assert_eq!(h.engine.nvrs[0].failed_polls, 0);
     assert_eq!(h.engine.nvrs[0].retry_after, 0, "not an auth problem");
 

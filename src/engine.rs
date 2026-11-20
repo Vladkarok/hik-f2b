@@ -246,6 +246,23 @@ fn poll_nvr(
 }
 
 /// `poll_nvr` once the NVR's state exists (`first`: it was just made).
+///
+/// What keeps an entry from being counted twice: `seen` holds every entry
+/// of the last window read, which started at `since - lookback`. So a
+/// window may start there or later, but never earlier: what lies before
+/// that start is not in `seen`. Every write of `since` keeps to this:
+///
+/// - A read without a baseline moves `since` to the newest entry read, or
+///   on, but never back: the device clock is at or after `since`.
+/// - When the device clock is behind `since` (it went back, by any amount)
+///   or jumped forward, a baseline resyncs: the window starts at the new
+///   time, and what it holds is recorded as seen, not counted.
+/// - A skipped window (`MAX_FAILED_POLLS`) moves `since` without a read.
+///   If a baseline was due, the offset is cleared (`None`), so the next read
+///   that works is a baseline.
+///
+/// `since` is never ahead of the device clock, so that the clock going back
+/// is noticed at the next poll.
 fn read_log(
     nvr: &mut Nvr,
     cfg: &Config,
@@ -261,9 +278,14 @@ fn read_log(
     // counting it, so old entries are never counted (again).
     let jump = if first {
         None
-    } else if now < st.since.saturating_sub(lookback) {
+    } else if st.offset.is_none() {
         Some(format!(
-            "went back from {} to {}",
+            "no device clock offset is known (the read position was moved to {} without a read)",
+            util::fmt_ts(st.since)
+        ))
+    } else if now < st.since {
+        Some(format!(
+            "device clock went back from {} to {}",
             util::fmt_ts(st.since),
             util::fmt_ts(now)
         ))
@@ -271,14 +293,20 @@ fn read_log(
         st.offset
             .map(|previous| offset.saturating_sub(previous))
             .filter(|jump| *jump > CLOCK_JUMP)
-            .map(|jump| format!("jumped forward by {} s (to {})", jump, util::fmt_ts(now)))
+            .map(|jump| {
+                format!(
+                    "device clock jumped forward by {} s (to {})",
+                    jump,
+                    util::fmt_ts(now)
+                )
+            })
     };
     let baseline = first || jump.is_some();
+    let previous = st.since;
     let mut since = st.since;
-    if let Some(jump) = jump {
+    if let Some(jump) = &jump {
         crate::warn!(
-            "{}: device clock {}; reading on from the new time, entries already in the log \
-             are not counted",
+            "{}: {}; reading on from the new time, entries already in the log are not counted",
             nvr.name,
             jump
         );
@@ -314,14 +342,22 @@ fn read_log(
                 // stop the daemon from ever reading on.
                 crate::error!(
                     "{}: the log could not be read {} times in a row; SKIPPING the log window \
-                     {} .. {} (device time), failed logins in it are not counted",
+                     {} .. {} (device time), failed logins in it are not counted{}",
                     nvr.name,
                     nvr.failed_polls,
                     util::fmt_ts(since.saturating_sub(lookback)),
-                    util::fmt_ts(now)
+                    util::fmt_ts(now),
+                    if baseline {
+                        "; the device clock changed, so the next read records the log as \
+                         already seen"
+                    } else {
+                        ""
+                    }
                 );
                 st.since = now;
-                st.offset = Some(offset);
+                // The cursor moved without a read: if a resync was due, it
+                // stays due (see above).
+                st.offset = if baseline { None } else { Some(offset) };
                 nvr.failed_polls = 0;
             }
             return Err(NvrError::Other(e));
@@ -395,6 +431,9 @@ fn read_log(
     }
     // Never ahead of the device clock, or a backward jump would go unseen.
     st.since = next.min(now);
+    // Without a baseline the device clock is at or after `previous`, so the
+    // next window never starts before this one (see above).
+    debug_assert!(baseline || st.since >= previous);
     st.offset = Some(offset);
     Ok(Polled { fresh, offset })
 }

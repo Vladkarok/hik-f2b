@@ -33,7 +33,9 @@ pub struct NvrState {
     /// Device time up to which the log has been read.
     pub since: i64,
     /// Device clock minus host clock at the last successful read, used to
-    /// notice the device clock jumping.
+    /// notice the device clock jumping. `None` (`-` in the file): not known,
+    /// because a log window was skipped while a resync was due; the next read
+    /// resyncs.
     pub offset: Option<i64>,
     /// Entries seen in the last (overlapping) query window, by key hash.
     pub seen: HashMap<String, u32>,

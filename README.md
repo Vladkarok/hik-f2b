@@ -1039,6 +1039,12 @@ firewall or messenger can be added by implementing one trait. When a problem
 is worth a health alert is decided in `src/health.rs`, which does no I/O and
 is tested on its own.
 
+CI also runs `.github/scripts/repo-guard.sh`, which keeps addresses of real
+devices and other private data out of the repository, and
+`.github/scripts/docs-check.sh`, which keeps the two READMEs in step and
+checks links and terms. How to run them and enable the git hooks:
+[AGENTS.md](AGENTS.md).
+
 ## License
 
 MIT, see [LICENSE](LICENSE). Not affiliated with Hikvision or MikroTik.

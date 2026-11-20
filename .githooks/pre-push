@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # Runs the repository guard on every commit about to be pushed, so that a
 # secret that was committed and removed again in a later commit is still
-# caught. Enable the hooks with: git config core.hooksPath .githooks
+# caught. Then, if the push changes Rust code (src/, tests/, Cargo.*) and
+# cargo is installed, checks the formatting of the working tree with
+# `cargo fmt --check`, the most frequent cause of failed CI runs. The tests
+# are left to CI. Enable the hooks with: git config core.hooksPath .githooks
 set -euo pipefail
 remote=$1
 root=$(git rev-parse --show-toplevel)
@@ -9,6 +12,7 @@ guard=$root/.github/scripts/repo-guard.sh
 # The all-zero object name, as long as this repository's object names.
 zero=$(git hash-object --stdin </dev/null | tr '0-9a-f' '0')
 status=0
+rust=false
 while read -r local_ref local_sha remote_ref remote_sha; do
     [ "$local_sha" = "$zero" ] && continue   # deleting a ref pushes no content
     if [ "$remote_sha" != "$zero" ] && git cat-file -e "$remote_sha^{commit}" 2>/dev/null; then
@@ -20,5 +24,17 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     fi
     echo "pre-push: $local_ref -> $remote_ref"
     bash "$guard" --range "${range[@]}" </dev/null || status=1
+    # Not piped into grep -q: with pipefail, git log killed by SIGPIPE
+    # would make the test false.
+    changed=$(git log --format= --name-only "${range[@]}" </dev/null)
+    if grep -Eq '^(src/|tests/|Cargo\.)' <<<"$changed"; then
+        rust=true
+    fi
 done
+if [ "$rust" = true ] && command -v cargo >/dev/null; then
+    if ! (cd "$root" && cargo fmt --check) >&2; then
+        echo "pre-push: the Rust code is not formatted (working tree): run cargo fmt" >&2
+        status=1
+    fi
+fi
 exit "$status"

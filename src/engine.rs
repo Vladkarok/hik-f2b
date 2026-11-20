@@ -16,7 +16,7 @@ use crate::config::{Config, DEFAULT_MESSAGE};
 use crate::country::{self, Code};
 use crate::health::{Alerts, Check, CheckLine, Kind, Notice, Status};
 use crate::mikrotik::Mikrotik;
-use crate::nvr::{Event, Nvr, NvrError};
+use crate::nvr::{Event, Nvr, NvrError, Search};
 use crate::state::{NvrState, Pending, State, MAX_PENDING, MAX_SEEN, MAX_TRACKED};
 use crate::telegram::Telegram;
 use crate::util;
@@ -46,6 +46,50 @@ pub const HEALTH_CHECK_INTERVAL: u64 = 300;
 /// the caps in `nvr.rs` one poll reads at most this many times 50 pages or
 /// 5000 entries.
 const MAX_SEARCHES: usize = 4;
+
+/// `--check` searches the log of the last day before the device time...
+const CHECK_WINDOW: i64 = 86400;
+/// ...and reads at most this many pages of it, so it stays quick on a busy
+/// NVR. Two pages tell the page size and, mostly, the order.
+const CHECK_PAGES: usize = 2;
+
+/// The device clock against the host clock, for `--check`: what the engine
+/// subtracts from device times.
+fn describe_offset(offset: i64) -> String {
+    let abs = offset.unsigned_abs();
+    let hms = format!("{}:{:02}:{:02}", abs / 3600, abs / 60 % 60, abs % 60);
+    match offset {
+        0 => "same as the host clock".to_string(),
+        o if o > 0 => format!("{} ahead of the host clock", hms),
+        _ => format!("{} behind the host clock", hms),
+    }
+}
+
+/// What a `--check` search showed about the NVR's log: the order of the
+/// entries (the engine reads both, see `read_window`) and the page size.
+fn describe_log(search: &Search) -> String {
+    let times: Vec<i64> = search.events.iter().filter_map(|ev| ev.ts).collect();
+    let up = times.windows(2).any(|w| w[0] < w[1]);
+    let down = times.windows(2).any(|w| w[0] > w[1]);
+    let order = match (up, down) {
+        (true, false) => "oldest first",
+        (false, true) => "newest first",
+        (false, false) => "order not known",
+        (true, true) => "neither oldest nor newest first",
+    };
+    let page = match search.page_size {
+        Some(n) => format!("{} entries per page", n),
+        None => "page size not known".to_string(),
+    };
+    let mut out = format!("{}, {}", order, page);
+    if !(up || down) || search.page_size.is_none() {
+        out.push_str(&format!(
+            " ({} entries read from the last 24 h)",
+            search.events.len()
+        ));
+    }
+    out
+}
 
 /// How long the engine remembers a ban (see `PERMANENT_MEMORY`).
 fn memory(bantime: BanTime) -> u64 {
@@ -246,6 +290,23 @@ fn poll_nvr(
 }
 
 /// `poll_nvr` once the NVR's state exists (`first`: it was just made).
+///
+/// What keeps an entry from being counted twice: `seen` holds every entry
+/// of the last window read, which started at `since - lookback`. So a
+/// window may start there or later, but never earlier: what lies before
+/// that start is not in `seen`. Every write of `since` keeps to this:
+///
+/// - A read without a baseline moves `since` to the newest entry read, or
+///   on, but never back: the device clock is at or after `since`.
+/// - When the device clock is behind `since` (it went back, by any amount)
+///   or jumped forward, a baseline resyncs: the window starts at the new
+///   time, and what it holds is recorded as seen, not counted.
+/// - A skipped window (`MAX_FAILED_POLLS`) moves `since` without a read.
+///   If a baseline was due, the offset is cleared (`None`), so the next read
+///   that works is a baseline.
+///
+/// `since` is never ahead of the device clock, so that the clock going back
+/// is noticed at the next poll.
 fn read_log(
     nvr: &mut Nvr,
     cfg: &Config,
@@ -261,9 +322,14 @@ fn read_log(
     // counting it, so old entries are never counted (again).
     let jump = if first {
         None
-    } else if now < st.since.saturating_sub(lookback) {
+    } else if st.offset.is_none() {
         Some(format!(
-            "went back from {} to {}",
+            "no device clock offset is known (the read position was moved to {} without a read)",
+            util::fmt_ts(st.since)
+        ))
+    } else if now < st.since {
+        Some(format!(
+            "device clock went back from {} to {}",
             util::fmt_ts(st.since),
             util::fmt_ts(now)
         ))
@@ -271,14 +337,20 @@ fn read_log(
         st.offset
             .map(|previous| offset.saturating_sub(previous))
             .filter(|jump| *jump > CLOCK_JUMP)
-            .map(|jump| format!("jumped forward by {} s (to {})", jump, util::fmt_ts(now)))
+            .map(|jump| {
+                format!(
+                    "device clock jumped forward by {} s (to {})",
+                    jump,
+                    util::fmt_ts(now)
+                )
+            })
     };
     let baseline = first || jump.is_some();
+    let previous = st.since;
     let mut since = st.since;
-    if let Some(jump) = jump {
+    if let Some(jump) = &jump {
         crate::warn!(
-            "{}: device clock {}; reading on from the new time, entries already in the log \
-             are not counted",
+            "{}: {}; reading on from the new time, entries already in the log are not counted",
             nvr.name,
             jump
         );
@@ -314,14 +386,22 @@ fn read_log(
                 // stop the daemon from ever reading on.
                 crate::error!(
                     "{}: the log could not be read {} times in a row; SKIPPING the log window \
-                     {} .. {} (device time), failed logins in it are not counted",
+                     {} .. {} (device time), failed logins in it are not counted{}",
                     nvr.name,
                     nvr.failed_polls,
                     util::fmt_ts(since.saturating_sub(lookback)),
-                    util::fmt_ts(now)
+                    util::fmt_ts(now),
+                    if baseline {
+                        "; the device clock changed, so the next read records the log as \
+                         already seen"
+                    } else {
+                        ""
+                    }
                 );
                 st.since = now;
-                st.offset = Some(offset);
+                // The cursor moved without a read: if a resync was due, it
+                // stays due (see above).
+                st.offset = if baseline { None } else { Some(offset) };
                 nvr.failed_polls = 0;
             }
             return Err(NvrError::Other(e));
@@ -395,6 +475,9 @@ fn read_log(
     }
     // Never ahead of the device clock, or a backward jump would go unseen.
     st.since = next.min(now);
+    // Without a baseline the device clock is at or after `previous`, so the
+    // next window never starts before this one (see above).
+    debug_assert!(baseline || st.since >= previous);
     st.offset = Some(offset);
     Ok(Polled { fresh, offset })
 }
@@ -689,39 +772,55 @@ impl Engine {
         self.alerts.alerted()
     }
 
+    /// `--check` at the current host time.
+    pub fn check_all(&mut self) -> Vec<CheckLine> {
+        self.check_all_at(util::unix_now())
+    }
+
     /// `--check`: every health check once. Only reads: the state, the
     /// alerts and the firewall are left as they are, and nothing is sent.
-    pub fn check_all(&mut self) -> Vec<CheckLine> {
+    /// `host_now` is the host's Unix time.
+    pub fn check_all_at(&mut self, host_now: u64) -> Vec<CheckLine> {
         let mut out = Vec::new();
         let meta_id = self.cfg.meta_id.clone();
         for nvr in self.nvrs.iter_mut() {
             // The device time proves that the NVR answers and accepts the
-            // login; a short search, that the user may search the log.
+            // login; a search, that the user may search the log. The search
+            // also shows what the engine relies on (see `describe_log`).
             let result = nvr.now().and_then(|now| {
-                nvr.search(
-                    now.saturating_sub(60),
+                nvr.sample(
+                    now.saturating_sub(CHECK_WINDOW),
                     now.saturating_add(60),
                     &meta_id,
-                    None,
+                    CHECK_PAGES,
                 )
-                .map(|_| now)
+                .map(|search| (now, search))
             });
-            let (status, detail) = match result {
-                Ok(now) => (
+            let (status, detail, log) = match result {
+                Ok((now, search)) => (
                     Status::Ok,
                     format!(
-                        "login accepted, device time {}, log search works",
-                        util::fmt_ts(now)
+                        "login accepted, device time {} ({}), log search works",
+                        util::fmt_ts(now),
+                        describe_offset(now.saturating_sub(host_i64(host_now)))
                     ),
+                    Some(describe_log(&search)),
                 ),
-                Err(NvrError::Auth(e)) => (Status::Failed, format!("login rejected ({})", e)),
-                Err(NvrError::Other(e)) => (Status::Failed, e),
+                Err(NvrError::Auth(e)) => (Status::Failed, format!("login rejected ({})", e), None),
+                Err(NvrError::Other(e)) => (Status::Failed, e, None),
             };
             out.push(CheckLine {
                 item: format!("nvr {}", nvr.name),
                 status,
                 detail,
             });
+            if let Some(detail) = log {
+                out.push(CheckLine {
+                    item: format!("nvr {} log", nvr.name),
+                    status: Status::Ok,
+                    detail,
+                });
+            }
         }
         let (status, detail) = match &self.firewall {
             None => (Status::Off, "not configured (notify-only mode)".to_string()),

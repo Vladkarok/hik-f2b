@@ -2,8 +2,8 @@ name: Release
 
 # Pushing a tag vX.Y.Z (final) or vX.Y.Z-rc.N (release candidate) checks the
 # repository, runs CI, builds the image natively for amd64 and arm64, pushes
-# it to ghcr.io as one multi-arch image and creates the GitHub Release.
-# See RELEASING.md.
+# it to ghcr.io as one multi-arch image, checks what the registry then holds
+# and creates the GitHub Release. See RELEASING.md.
 
 on:
   push:
@@ -163,8 +163,44 @@ jobs:
         if: always()
         run: docker logout ghcr.io || true
 
-  release:
+  verify:
+    # What the registry now holds, read anonymously as a user pulls it, and
+    # each architecture's image run on its own runner (no emulation). Exit
+    # codes of the steps above are not evidence: a tool on the runner once
+    # dropped part of what it was asked for without failing.
     needs: [prepare, manifest]
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      IMAGE: ${{ needs.prepare.outputs.image }}
+      IMAGE_VERSION: ${{ needs.prepare.outputs.image_version }}
+      TAGS: ${{ needs.prepare.outputs.tags }}
+      EXPECT_DESCRIPTION: ${{ needs.prepare.outputs.description }}
+      EXPECT_CREATED: ${{ needs.prepare.outputs.created }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check the published image
+        # GITHUB_SHA, GITHUB_SERVER_URL and GITHUB_REPOSITORY are set by the
+        # runner; release-verify.sh validates its arguments.
+        run: |
+          set -euo pipefail
+          export EXPECT_SOURCE="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY"
+          read -r -a tags <<<"$TAGS"
+          bash .github/scripts/release-verify.sh --run "$IMAGE" "$IMAGE_VERSION" "$GITHUB_SHA" "${tags[@]}"
+
+  release:
+    needs: [prepare, verify]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:

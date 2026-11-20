@@ -1,6 +1,6 @@
 [package]
 name = "hik-f2b"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = "fail2ban-style banning of Hikvision NVR brute-forcers on a MikroTik router"
 license = "MIT"

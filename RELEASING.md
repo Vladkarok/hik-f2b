@@ -14,6 +14,20 @@ creates the GitHub Release with the changelog section as its notes.
 line or overall. Each build also leaves a per-architecture tag
 (`X.Y.Z-amd64`, `X.Y.Z-arm64`) from which the multi-arch image is joined.
 
+Before the GitHub Release is created, the `verify` job reads the registry
+without logging in and runs
+[release-verify.sh](.github/scripts/release-verify.sh) on each architecture's
+runner. It fails unless the image has exactly `linux/amd64` and
+`linux/arm64`, each with the labels of this version and commit, every image
+tag of the release points to it, and each architecture's image prints its
+version. To check a published release by hand (without `--run` if there is
+no Docker), run:
+
+```bash
+bash .github/scripts/release-verify.sh --run ghcr.io/vladkarok/hik-f2b X.Y.Z \
+  "$(git rev-parse 'vX.Y.Z^{commit}')" X.Y.Z X.Y latest
+```
+
 The workflow refuses a tag unless `version` in `Cargo.toml` is `X.Y.Z` and
 `CHANGELOG.md` has a `## [X.Y.Z]` section; for a final tag the deploy files
 and both READMEs must also reference `ghcr.io/vladkarok/hik-f2b:X.Y.Z` and no

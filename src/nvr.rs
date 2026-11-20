@@ -58,6 +58,9 @@ pub struct Search {
     pub skipped: usize,
     /// The ambiguous ones (up to `MAX_AMBIGUOUS`), for `--dump` only.
     pub ambiguous: Vec<Event>,
+    /// Items on the first page that said more were to come: how many
+    /// entries the NVR puts in one page. `None` if no page said so.
+    pub page_size: Option<usize>,
 }
 
 /// Ambiguous items kept per search for `--dump`.
@@ -498,6 +501,29 @@ impl Nvr {
         start: i64,
         end: i64,
         meta_id: &str,
+        raw_sink: Option<&mut Vec<String>>,
+    ) -> Result<Search, NvrError> {
+        self.search_pages(start, end, meta_id, MAX_PAGES, raw_sink)
+    }
+
+    /// As `search`, but at most `pages` pages (at most `MAX_PAGES`), for a
+    /// quick look such as `--check`. Stopping early is not worth a warning.
+    pub fn sample(
+        &mut self,
+        start: i64,
+        end: i64,
+        meta_id: &str,
+        pages: usize,
+    ) -> Result<Search, NvrError> {
+        self.search_pages(start, end, meta_id, pages.clamp(1, MAX_PAGES), None)
+    }
+
+    fn search_pages(
+        &mut self,
+        start: i64,
+        end: i64,
+        meta_id: &str,
+        max_pages: usize,
         mut raw_sink: Option<&mut Vec<String>>,
     ) -> Result<Search, NvrError> {
         let mut out = Search {
@@ -509,7 +535,7 @@ impl Nvr {
         let mut ambiguous = 0usize;
         let id = util::random_hex();
         let search_id = format!("{}-0000-4000-8000-{}0000", &id[..8], &id[8..16]);
-        for _ in 0..MAX_PAGES {
+        for _ in 0..max_pages {
             let body = format!(
                 "<?xml version=\"1.0\" encoding=\"utf-8\"?><CMSearchDescription>\
                  <searchID>{}</searchID><metaId>{}</metaId><timeSpanList><timeSpan>\
@@ -549,6 +575,9 @@ impl Nvr {
                 out.truncated = false;
                 break;
             }
+            if out.page_size.is_none() {
+                out.page_size = Some(page.items);
+            }
             if out.events.len() >= MAX_EVENTS {
                 // a device that ignores maxResults could otherwise fill
                 // memory with 50 huge pages
@@ -558,7 +587,7 @@ impl Nvr {
             position += page.items;
             previous = Some(raw);
         }
-        if out.truncated {
+        if out.truncated && max_pages == MAX_PAGES {
             crate::warn!(
                 "{}: more than {} log entries in the search window, this search stops there",
                 self.name,

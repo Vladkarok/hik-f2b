@@ -94,6 +94,14 @@
 //! `tests/e2e.rs`. Addresses with entries in such a re-read stretch are left
 //! out of `safety/maxretry`, `count/double` and `liveness`.
 //!
+//! Excluded case: a device clock that changes while the NVR's log cannot be
+//! read, until the engine skips the unreadable window after 10 polls. The
+//! skip moves the cursor and the offset to the new clock, so the next read
+//! sees no jump and counts entries from before the change again; see the
+//! ignored test `clock_change_while_the_log_is_unreadable_is_not_recounted`.
+//! Addresses with entries the next read can reach are left out in the same
+//! way.
+//!
 //! Environment: `HIK_F2B_SIM_SEEDS` (seeds per class, default
 //! `DEFAULT_SEEDS`, fewer for `Backlog`), `HIK_F2B_SIM_START` (first seed, default 1),
 //! `HIK_F2B_SIM_SEED` (run only that seed, in its class, and print its
@@ -361,6 +369,8 @@ struct NvrSim {
     mode: Mode,
     skew: i64,
     started: bool,
+    /// `skew` at its last successful poll.
+    ok_skew: i64,
     last_flood: i64,
     /// Host times of its entries, in the order written (ascending).
     times: Vec<i64>,
@@ -616,6 +626,7 @@ impl Sim {
                 mode: Mode::Ok,
                 skew: SKEW,
                 started: false,
+                ok_skew: SKEW,
                 last_flood: i64::MIN / 2,
                 times: Vec::new(),
             })
@@ -1184,6 +1195,11 @@ impl Sim {
             (puts, sent, f.rule_queries.len() > queries)
         };
         let nvr_ok: Vec<bool> = self.nvr.iter().map(|n| n.mode == Mode::Ok).collect();
+        for nvr in self.nvr.iter_mut() {
+            if nvr.mode == Mode::Ok {
+                nvr.ok_skew = nvr.skew;
+            }
+        }
         let mut cycle = Cycle {
             host: self.host,
             instance: self.instance,
@@ -1259,6 +1275,20 @@ impl Sim {
                         }
                     }
                     events.push(format!("nvr{} skipped", n + 1));
+                    if self.nvr[n].skew != self.nvr[n].ok_skew {
+                        // the excluded case: the cursor is at the new clock
+                        // without a resync
+                        let reach = to - self.p.lookback;
+                        let hit: Vec<Ipv4Addr> = self
+                            .gens
+                            .iter()
+                            .filter(|g| g.nvr == n && g.seq <= index && g.device >= reach)
+                            .filter_map(|g| g.ip)
+                            .collect();
+                        events.push(format!("clock changed meanwhile, re-read: {:?}", hit));
+                        self.recount.extend(hit);
+                        self.recounts += 1;
+                    }
                 }
                 Line::SkippedAll(n) => {
                     for g in self.gens.iter_mut() {

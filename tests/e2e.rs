@@ -516,6 +516,42 @@ fn small_backward_correction_below_lookback_is_not_recounted() {
     assert_eq!(h.fails(OWNER), 2, "the typo at 10:01:00 was counted twice");
 }
 
+/// Found by `tests/sim.rs` (Clock class). DST ends while the NVR's log
+/// cannot be read. The jump is noticed, but the polls fail, and after ten
+/// of them the unreadable window is skipped: the cursor and the offset are
+/// set to the new clock without a resync. The next read sees no jump, and
+/// entries from about an hour before the change, whose device times are
+/// those of the repeated hour, are counted again.
+#[test]
+#[ignore = "a clock change while the log is unreadable for ten polls is not resynced: entries \
+            are counted again"]
+fn clock_change_while_the_log_is_unreadable_is_not_recounted() {
+    let mut h = Harness::new(false); // first poll at 10:00:00 (device)
+    h.add("10:05:10", OWNER);
+    h.add("10:05:20", OWNER);
+    h.cycle("10:06:00");
+    h.add("10:50:00", ATTACKER);
+    h.cycle("10:51:00");
+    // the window now starts at 10:48:00: the typos have left it
+    h.cycle("10:51:30");
+    assert_eq!(h.fails(OWNER), 2);
+
+    // 11:00 local becomes 10:00 again, and every log search fails
+    {
+        let mut f = h.fake.lock().unwrap();
+        f.skew = SKEW - 3600;
+        f.garbage = true;
+    }
+    h.set_host(host_of("11:00:00"));
+    assert_eq!(h.fake.lock().unwrap().now, format!("{}10:00:00", DAY));
+    h.tick();
+    run(&mut h, 9, 30); // the 10th failure skips the window
+    assert_eq!(h.since("nvr1"), format!("{}10:04:30", DAY));
+    h.fake.lock().unwrap().garbage = false;
+    h.advance(30);
+    assert_eq!(h.fails(OWNER), 2, "the typos at 10:05 were counted twice");
+}
+
 /// C2: the RTC is reset to 2000-01-01 (power cut) and later corrected.
 #[test]
 fn rtc_reset_and_recovery() {

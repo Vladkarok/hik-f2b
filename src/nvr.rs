@@ -560,7 +560,7 @@ impl Nvr {
         }
         if out.truncated {
             crate::warn!(
-                "{}: more than {} log entries in the window, the rest is read on the next poll",
+                "{}: more than {} log entries in the search window, this search stops there",
                 self.name,
                 out.events.len()
             );

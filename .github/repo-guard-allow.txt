@@ -21,3 +21,5 @@
 192.168.1.5     # src/config.rs: a private address that the default ignoreip covers
 192.168.1.50    # tests/e2e.rs: a private address that ignoreip covers
 198.51.101.1    # src/country.rs: just outside the documentation range 198.51.100.0/24
+10.0.0.7        # tests/sim.rs: a private address that the default ignoreip covers
+172.16.0.9      # tests/sim.rs: a private address that the default ignoreip covers

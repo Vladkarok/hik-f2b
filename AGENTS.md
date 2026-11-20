@@ -21,12 +21,17 @@ bash .github/scripts/release-check.sh vX.Y.Z ghcr.io/vladkarok/hik-f2b
   the terms from `GLOSSARY.md`, the length of sentences in steps and
   `hik-f2b.example.ini`. Its exception lists are in `docs-check.py`.
 - To run the guard on every commit and push, enable the hooks once:
-  `git config core.hooksPath .githooks`.
+  `git config core.hooksPath .githooks`. If the push changes Rust code and
+  cargo is installed, the pre-push hook also runs `cargo fmt --check`.
+- `release-verify.sh` checks a published release in the registry; the
+  release workflow runs it, and its header shows how to run it by hand.
 - To add your own private strings, name a file outside the repository:
   `git config hikf2b.denylist /path/to/denylist`. The guard header gives the
   format. Never commit that file.
 - CI runs all of this, plus `cargo fmt --check`, `cargo clippy` and
-  `cargo test`, on every push and pull request.
+  `cargo test`, on every push and pull request. Run those three locally
+  too: a Rust toolchain is all they need. `tests/sim.rs` takes more seeds
+  from `HIK_F2B_SIM_SEEDS` (its module comment has the rest).
 
 ## Rules
 

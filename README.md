@@ -156,7 +156,7 @@ image is built natively but has not been tried on real hardware. The deploy
 files use an exact version. To get it, run:
 
 ```bash
-podman pull ghcr.io/vladkarok/hik-f2b:0.3.1
+podman pull ghcr.io/vladkarok/hik-f2b:0.3.2
 ```
 
 For how versions are tagged and how to update, see
@@ -224,7 +224,7 @@ host's architecture. For an image that you built yourself, use
 `localhost/hik-f2b:latest`. Run:
 
 ```bash
-podman create --name hik-f2b-copy ghcr.io/vladkarok/hik-f2b:0.3.1
+podman create --name hik-f2b-copy ghcr.io/vladkarok/hik-f2b:0.3.2
 podman cp hik-f2b-copy:/hik-f2b ./hik-f2b
 podman rm hik-f2b-copy
 ```
@@ -269,7 +269,7 @@ podman run --rm --network host \
   -v ~/.config/hik-f2b:/etc/hik-f2b:ro,Z \
   --secret hik-f2b-router,uid=65532,mode=0400 \
   --secret hik-f2b-nvr,uid=65532,mode=0400 \
-  ghcr.io/vladkarok/hik-f2b:0.3.1 --dump --hours 72
+  ghcr.io/vladkarok/hik-f2b:0.3.2 --dump --hours 72
 ```
 
 To run `--check` in the container, put `--check` in place of
@@ -279,11 +279,22 @@ Telegram, the country database, or the router in notify-only mode. `FAILED`
 marks a problem, and then `--check` exits non-zero. For example:
 
 ```
-ok       nvr nvr1: login accepted, device time 2026-01-10T10:00:00Z, log search works
+ok       nvr nvr1: login accepted, device time 2026-01-10T10:00:00Z (2:00:00 ahead of the host clock), log search works
+ok       nvr nvr1 log: oldest first, 64 entries per page
 ok       firewall: 1 enabled rule(s) in /ip/firewall/raw with src-address-list=cctv_ban
 off      telegram: not configured
 ok       country database: DBIP-Country-Lite, built 2026-11-01
 ```
+
+The first line of an NVR also shows how far its clock is from the host's
+clock. hik-f2b converts the NVR's times with this difference, so a difference
+of hours is normal (see [Time and clock changes](#time-and-clock-changes)).
+For an NVR that can be read, a second line shows what one search of the last
+24 hours returned, at most two pages: whether the NVR lists log entries oldest
+first or newest first, and how many entries one page holds. hik-f2b reads
+both orders. If the search returned too few entries to tell, the line says
+`not known`. These lines never make `--check` fail. Include them when you
+report a problem.
 
 `--check` only reads from the router, so it cannot show whether the router
 accepts a ban. A router user whose group has no `write` policy passes
@@ -333,10 +344,10 @@ as these image tags:
 
 | Tag | Meaning |
 | --- | --- |
-| `0.3.1` | Exactly this release. It never changes. Use this one. |
+| `0.3.2` | Exactly this release. It never changes. Use this one. |
 | `0.3` | The newest `0.3.x` release; moves with every bug-fix release. |
 | `latest` | The newest release; moves with every release, including ones that need config changes. |
-| `0.3.1-rc.1` | A release candidate, for trying out before `0.3.1`. Never `latest`, never `0.3`. |
+| `0.3.2-rc.1` | A release candidate, for trying out before `0.3.2`. Never `latest`, never `0.3`. |
 
 Pin an exact version, as the deploy files do. Before 1.0, a new second number
 (`0.3` to `0.4`) may need changes to your config; the changelog says so.
@@ -741,12 +752,21 @@ and records those entries as already seen, without counting them. So failed
 logins from before the start are never counted. If this first read fails,
 the next poll tries again from its own time.
 
-If an NVR's clock goes back further than the `lookback` overlap (a DST change,
-a reset real-time clock), or jumps forward by more than 15 minutes, hik-f2b
-logs a warning, records the entries the log holds at that moment as already
-seen without counting them, and reads on from the new time. Failed logins in
-the short window around the jump are not counted. Smaller corrections are covered
-by the overlap.
+If an NVR's clock goes back to before the newest log entry that hik-f2b has
+read (a DST change, a reset real-time clock, or a correction of a few
+minutes), or jumps forward by more than 15 minutes, hik-f2b logs a warning,
+records the entries the log holds at that moment as already seen without
+counting them, and reads on from the new time. Failed logins in the short
+window around the change are not counted. A smaller forward correction, or a
+backward one that does not reach the newest entry read, needs nothing of this:
+the entries read before stay known, so none is counted again.
+
+If the clock changes while the NVR's log cannot be read, and hik-f2b skips
+the unreadable stretch after 10 polls (see [Limitations](#limitations)), the
+next read that works does the same: it records the entries the log holds as
+already seen and reads on from there. Failed logins logged while the log
+could not be read are then not counted. If the clock did not change, only
+the skipped stretch is lost.
 
 Entries older than `findtime` are never counted, and neither are entries more
 than 5 minutes in the future (host time).
@@ -993,6 +1013,12 @@ Not yet tried:
   permissions"; the exact answer of RouterOS was not checked.
 - An NVR that lists log entries newest first: no such NVR is known, so only
   the fake NVR of the tests does this.
+- The second `--check` line (the order of a log search, the page size) and
+  the clock difference on the first line, with real NVRs: only the fake NVR
+  of the tests was checked.
+- The handling of clock changes from 0.3.2 (a small correction backward, a
+  change while the log cannot be read) on real NVRs: only the tests and the
+  simulation make these happen.
 - Notify-only mode on real devices.
 - A ban with a country on real devices: only `--country` and `--check` were
   run against a real database file.
@@ -1017,8 +1043,10 @@ What real devices showed:
 - An unknown log type in `meta_id` gives HTTP 400 on one firmware and an empty
   result on the other, so narrow `meta_id` only after `--dump` confirms it.
 
+`--check` shows the order and the page size of the NVR it talks to.
+
 If you run hik-f2b on other hardware, please open an issue or PR. Include your
-NVR model, firmware version and RouterOS version.
+NVR model, firmware version, RouterOS version and the output of `--check`.
 
 ## Development
 
@@ -1031,7 +1059,13 @@ The tests run the real client code against an in-process fake NVR (which
 verifies the Digest response), a fake RouterOS REST API and a fake Telegram
 Bot API. The country reader is tested against small databases made by a
 test-only writer (`tests/support/mmdb.rs`), including thousands of corrupted
-ones.
+ones. A Rust toolchain is all that `cargo test` needs.
+
+`tests/sim.rs` runs the real engine through generated scenarios against the
+fakes and checks invariants after every poll; its module comment lists them.
+Each scenario comes from a seed. To run more seeds, set `HIK_F2B_SIM_SEEDS`
+(seeds per class) and `HIK_F2B_SIM_START` (the first seed). To replay one
+seed and print its trace, set `HIK_F2B_SIM_SEED`.
 
 The decision logic (`src/engine.rs`) talks to the router and to Telegram only
 through the `Firewall` and `Notifier` traits in `src/action.rs`, so another

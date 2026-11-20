@@ -139,8 +139,6 @@ jobs:
       IMAGE: ${{ needs.prepare.outputs.image }}
       IMAGE_VERSION: ${{ needs.prepare.outputs.image_version }}
       TAGS: ${{ needs.prepare.outputs.tags }}
-      DESCRIPTION: ${{ needs.prepare.outputs.description }}
-      CREATED: ${{ needs.prepare.outputs.created }}
     steps:
       - name: Join the two images into one multi-arch image
         env:
@@ -152,14 +150,12 @@ jobs:
           for tag in $TAGS; do
             args+=(--tag "$IMAGE:$tag")
           done
-          # The package page on GitHub shows the description of the index.
+          # No --annotation: the two images are pushed by `docker push` as
+          # Docker manifests, so this is a Docker manifest list, which cannot
+          # carry annotations. Older buildx versions dropped them silently
+          # (0.3.0 was published without any); newer ones refuse the command.
+          # The version, revision and source are in each image's labels.
           docker buildx imagetools create "${args[@]}" \
-            --annotation "index:org.opencontainers.image.description=$DESCRIPTION" \
-            --annotation "index:org.opencontainers.image.source=$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
-            --annotation "index:org.opencontainers.image.version=$IMAGE_VERSION" \
-            --annotation "index:org.opencontainers.image.revision=$GITHUB_SHA" \
-            --annotation "index:org.opencontainers.image.licenses=MIT" \
-            --annotation "index:org.opencontainers.image.created=$CREATED" \
             "$IMAGE:$IMAGE_VERSION-amd64" \
             "$IMAGE:$IMAGE_VERSION-arm64"
           docker buildx imagetools inspect "$IMAGE:$IMAGE_VERSION"

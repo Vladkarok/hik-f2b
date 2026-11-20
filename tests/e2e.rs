@@ -1879,38 +1879,46 @@ fn check_command_reports_each_item_and_changes_nothing() {
     h.burst("10:01", ATTACKER, 5); // not read by --check
     let saved = h.engine.state.serialize();
 
-    let lines = h.engine.check_all();
+    let lines = h.engine.check_all_at(h.host as u64);
     let summary: Vec<(String, Status)> = lines
         .iter()
         .map(|l| (l.item.clone(), l.status.clone()))
         .collect();
+    // an NVR that cannot be read has no line about its log
     assert_eq!(
         summary,
         vec![
             ("nvr nvr1".to_string(), Status::Ok),
+            ("nvr nvr1 log".to_string(), Status::Ok),
             ("nvr nvr2".to_string(), Status::Failed),
             ("firewall".to_string(), Status::Ok),
             ("telegram".to_string(), Status::Ok),
             ("country database".to_string(), Status::Off),
         ]
     );
-    assert!(
-        lines[0].detail.contains("device time 2026-01-10T10:00:00Z"),
-        "{}",
-        lines[0]
+    assert_eq!(
+        lines[0].to_string(),
+        "ok       nvr nvr1: login accepted, device time 2026-01-10T10:00:00Z (2:00:00 ahead of \
+         the host clock), log search works"
     );
+    // the burst is after the device time: nothing in the window
     assert_eq!(
         lines[1].to_string(),
+        "ok       nvr nvr1 log: order not known, page size not known (0 entries read from the \
+         last 24 h)"
+    );
+    assert_eq!(
+        lines[2].to_string(),
         "FAILED   nvr nvr2: login rejected (HTTP 401)"
     );
     assert_eq!(
-        lines[2].detail,
+        lines[3].detail,
         "1 enabled rule(s) in /ip/firewall/raw with src-address-list=cctv_ban"
     );
 
     h.fake.lock().unwrap().rules.clear();
-    let lines = h.engine.check_all();
-    assert_eq!(lines[2].status, Status::Failed);
+    let lines = h.engine.check_all_at(h.host as u64);
+    assert_eq!(lines[3].status, Status::Failed);
 
     // nothing banned, sent or remembered
     assert_eq!(h.engine.state.serialize(), saved);
@@ -1923,10 +1931,118 @@ fn check_command_reports_each_item_and_changes_nothing() {
         mikrotik: false,
         ..Default::default()
     });
-    let lines = h.engine.check_all();
-    assert_eq!(lines[1].status, Status::Off);
+    let lines = h.engine.check_all_at(h.host as u64);
+    assert_eq!(lines[2].item, "firewall");
     assert_eq!(lines[2].status, Status::Off);
+    assert_eq!(lines[3].status, Status::Off);
     assert_eq!(h.fake.lock().unwrap().router_requests, 0);
+}
+
+/// The log line of `--check` for one NVR, after a few entries.
+fn check_log_line(newest_first: bool, entries: &[&str]) -> (String, u32) {
+    let mut h = Harness::raw(false);
+    h.fake.lock().unwrap().newest_first = newest_first;
+    for clock in entries {
+        h.add(clock, ATTACKER);
+    }
+    let lines = h.engine.check_all_at(h.host as u64);
+    assert_eq!(lines[1].item, "nvr nvr1 log");
+    let searches = h.fake.lock().unwrap().search_requests;
+    (lines[1].to_string(), searches)
+}
+
+/// `--check` tells the order of a log search from the entries it gets.
+#[test]
+fn check_shows_the_order_of_the_log() {
+    let entries = ["09:10:00", "09:20:00", "09:30:00"];
+    for (newest_first, order) in [(false, "oldest first"), (true, "newest first")] {
+        let (line, _) = check_log_line(newest_first, &entries);
+        assert_eq!(
+            line,
+            format!(
+                "ok       nvr nvr1 log: {}, page size not known (3 entries read from the last \
+                 24 h)",
+                order
+            )
+        );
+    }
+}
+
+/// With fewer than two entries with different times, the order is not
+/// known; it is not a failure.
+#[test]
+fn check_with_too_few_entries_does_not_guess_the_order() {
+    for entries in [&[][..], &["09:10:00"], &["09:10:00", "09:10:00"]] {
+        let (line, _) = check_log_line(false, entries);
+        assert_eq!(
+            line,
+            format!(
+                "ok       nvr nvr1 log: order not known, page size not known ({} entries read \
+                 from the last 24 h)",
+                entries.len()
+            )
+        );
+    }
+    // entries older than a day are not looked at
+    let mut h = Harness::raw(false);
+    Harness::add_at(&h.fake, "2026-01-09T09:00:00", ATTACKER);
+    Harness::add_at(&h.fake, "2026-01-09T09:30:00", ATTACKER);
+    let lines = h.engine.check_all_at(h.host as u64);
+    assert!(
+        lines[1].detail.starts_with("order not known"),
+        "{}",
+        lines[1]
+    );
+}
+
+/// A window with more entries than one page tells the page size the NVR
+/// returns (the fake, as the tested NVRs, gives 64 whatever is asked), and
+/// the search stops after two pages however busy the log is.
+#[test]
+fn check_shows_the_page_size_and_reads_two_pages_at_most() {
+    let clocks: Vec<String> = (0..1000)
+        .map(|i| format!("09:{:02}:{:02}", 10 + i / 60 % 50, i % 60))
+        .collect();
+    let entries: Vec<&str> = clocks.iter().map(String::as_str).collect();
+    for (newest_first, order) in [(false, "oldest first"), (true, "newest first")] {
+        let (line, searches) = check_log_line(newest_first, &entries);
+        assert_eq!(
+            line,
+            format!("ok       nvr nvr1 log: {}, 64 entries per page", order)
+        );
+        assert_eq!(searches, 2);
+    }
+    // all in one second: the page size is known, the order is not
+    let same = vec!["09:10:00"; 70];
+    let (line, searches) = check_log_line(false, &same);
+    assert_eq!(
+        line,
+        "ok       nvr nvr1 log: order not known, 64 entries per page (70 entries read from the \
+         last 24 h)"
+    );
+    assert_eq!(searches, 2);
+}
+
+/// The clock difference is reported, whatever its size.
+#[test]
+fn check_shows_the_clock_difference() {
+    for (skew, shown) in [
+        (SKEW, "2:00:00 ahead of the host clock"),
+        (0, "same as the host clock"),
+        (-3 * 3600 - 7, "3:00:07 behind the host clock"),
+    ] {
+        let mut h = Harness::raw(false);
+        h.fake.lock().unwrap().skew = skew;
+        let host = h.host;
+        h.set_host(host);
+        let lines = h.engine.check_all_at(h.host as u64);
+        assert_eq!(lines[0].status, hik_f2b::health::Status::Ok);
+        assert!(
+            lines[0].detail.contains(&format!("({})", shown)),
+            "{}",
+            lines[0]
+        );
+    }
 }
 
 // ------------------------------------------------------------- country_db

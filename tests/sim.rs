@@ -123,7 +123,7 @@ use std::time::Instant;
 /// Seeds per class when `HIK_F2B_SIM_SEEDS` is not set (`Backlog`: a third).
 const DEFAULT_SEEDS: u64 = 30;
 /// Whether a violation fails the test (otherwise it is only printed).
-const STRICT: bool = false;
+const STRICT: bool = true;
 /// Trace lines shown with a violation.
 const TRACE_LINES: usize = 150;
 /// New entries an oldest-first poll reads at least: 3200 a search (50 pages

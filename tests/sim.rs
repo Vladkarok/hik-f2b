@@ -95,7 +95,7 @@
 //! out of `safety/maxretry`, `count/double` and `liveness`.
 //!
 //! Environment: `HIK_F2B_SIM_SEEDS` (seeds per class, default
-//! `DEFAULT_SEEDS`), `HIK_F2B_SIM_START` (first seed, default 1),
+//! `DEFAULT_SEEDS`, fewer for `Backlog`), `HIK_F2B_SIM_START` (first seed, default 1),
 //! `HIK_F2B_SIM_SEED` (run only that seed, in its class, and print its
 //! trace). A violation prints the seed, the class, the parameters and the
 //! last steps of the trace.
@@ -112,8 +112,8 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-/// Seeds per class when `HIK_F2B_SIM_SEEDS` is not set.
-const DEFAULT_SEEDS: u64 = 10;
+/// Seeds per class when `HIK_F2B_SIM_SEEDS` is not set (`Backlog`: a third).
+const DEFAULT_SEEDS: u64 = 30;
 /// Whether a violation fails the test (otherwise it is only printed).
 const STRICT: bool = false;
 /// Trace lines shown with a violation.
@@ -815,7 +815,7 @@ impl Sim {
             table.push((5, Kind::Flood));
         }
         if class == Class::Clock {
-            table.push((6, Kind::Clock));
+            table.push((10, Kind::Clock));
         }
         let total: u64 = table.iter().map(|(weight, _)| weight).sum();
         let mut roll = self.rng.below(total);
@@ -1067,11 +1067,12 @@ impl Sim {
             SKEW - skew
         } else if r < 25 {
             self.rng.range(30, 600)
-        } else if r < 40 {
+        } else if r < 35 {
             self.rng.pick(&[1200, 3600])
-        } else if r < 70 {
-            -self.rng.range(10, lookback)
-        } else if r < 85 {
+        } else if r < 75 {
+            // mostly more than the time since the last poll: behind the cursor
+            -self.rng.range(lookback / 3, lookback)
+        } else if r < 87 {
             -3600
         } else {
             // the real-time clock is reset to 2000-01-01
@@ -1702,7 +1703,12 @@ fn seeds(class: Class) -> Vec<u64> {
             Vec::new()
         };
     }
-    let n = env("HIK_F2B_SIM_SEEDS").unwrap_or(DEFAULT_SEEDS);
+    let default = if class == Class::Backlog {
+        DEFAULT_SEEDS / 3
+    } else {
+        DEFAULT_SEEDS
+    };
+    let n = env("HIK_F2B_SIM_SEEDS").unwrap_or(default);
     let start = env("HIK_F2B_SIM_START").unwrap_or(1);
     let first = start + (index + count - start % count) % count;
     (0..n).map(|i| first + i * count).collect()

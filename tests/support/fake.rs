@@ -392,6 +392,7 @@ fn route(
 }
 
 fn serve(stream: TcpStream, fake: Arc<Mutex<Fake>>) {
+    let _ = stream.set_nodelay(true);
     let mut reader = BufReader::new(stream.try_clone().unwrap());
     let mut stream = stream;
     loop {
@@ -438,7 +439,11 @@ fn serve(stream: TcpStream, fake: Arc<Mutex<Fake>>) {
             out.len(),
             headers
         );
-        if stream.write_all(head.as_bytes()).is_err() || stream.write_all(&out).is_err() {
+        // One write: a second small one would wait for the client's
+        // delayed ACK (Nagle), some 40 ms per request.
+        let mut reply = head.into_bytes();
+        reply.extend_from_slice(&out);
+        if stream.write_all(&reply).is_err() {
             return;
         }
     }

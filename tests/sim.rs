@@ -459,7 +459,10 @@ enum Line {
 }
 
 fn nvr_index(name: &str) -> Option<usize> {
-    name.strip_prefix("nvr")?.parse::<usize>().ok()?.checked_sub(1)
+    name.strip_prefix("nvr")?
+        .parse::<usize>()
+        .ok()?
+        .checked_sub(1)
 }
 
 fn address_after(text: &str, prefix: &str) -> Option<Ipv4Addr> {
@@ -474,7 +477,11 @@ fn counted(text: &str) -> Option<(usize, Ipv4Addr, i64)> {
     }
     let (ip, _) = rest.split_once(' ')?;
     let at = rest.rfind(") at ")?;
-    Some((nvr_index(nvr)?, ip.parse().ok()?, util::parse_ts(&rest[at..])?))
+    Some((
+        nvr_index(nvr)?,
+        ip.parse().ok()?,
+        util::parse_ts(&rest[at..])?,
+    ))
 }
 
 fn skipped(rest: &str, marker: &str) -> Option<(i64, i64)> {
@@ -579,6 +586,10 @@ struct Sim {
     dropped: HashSet<Ipv4Addr>,
     health: Health,
     slack: i64,
+    /// Addresses the liveness check had a due ban or report for.
+    musts: usize,
+    /// Times the excluded case occurred.
+    recounts: usize,
     trace: Vec<String>,
 }
 
@@ -635,6 +646,8 @@ impl Sim {
             dropped: HashSet::new(),
             health: Health::default(),
             slack: 0,
+            musts: 0,
+            recounts: 0,
             trace: Vec::new(),
         }
     }
@@ -653,7 +666,13 @@ impl Sim {
     }
 
     fn listed(&self, address: &str) -> bool {
-        self.h.fake.lock().unwrap().bans.iter().any(|b| b == address)
+        self.h
+            .fake
+            .lock()
+            .unwrap()
+            .bans
+            .iter()
+            .any(|b| b == address)
     }
 
     /// Writes one entry into NVR `n`'s log at host time `host`. `counts`:
@@ -702,7 +721,7 @@ impl Sim {
             self.check_stretches("ban-refused", Router::Refusing)?;
         }
         if self.p.class != Class::Clock {
-            self.check_liveness()?;
+            self.musts = self.check_liveness()?;
         }
         Ok(())
     }
@@ -713,7 +732,11 @@ impl Sim {
         let text = ignore_line(&self.nets);
         self.note(text);
         for n in 0..self.p.nvrs {
-            let percent = if self.p.class == Class::Backlog { 60 } else { 25 };
+            let percent = if self.p.class == Class::Backlog {
+                60
+            } else {
+                25
+            };
             if self.rng.chance(percent) {
                 self.fake(n).lock().unwrap().newest_first = true;
                 let text = format!("{} lists newest first", self.nvr[n].name);
@@ -905,10 +928,18 @@ impl Sim {
         let m = self.p.maxretry as i64;
         let r = self.rng.below(100);
         let (pool, count, gap) = match r {
-            0..=39 => (&PERSISTENT[..], self.rng.range(1, m + 3), self.rng.range(1, 20)),
+            0..=39 => (
+                &PERSISTENT[..],
+                self.rng.range(1, m + 3),
+                self.rng.range(1, 20),
+            ),
             40..=54 => (&OCCASIONAL[..], 1, 0),
             55..=71 => (&OWNERS[..], self.rng.range(1, m + 1), self.rng.range(2, 40)),
-            72..=81 => (&PRIVATE[..], self.rng.range(1, m + 2), self.rng.range(1, 10)),
+            72..=81 => (
+                &PRIVATE[..],
+                self.rng.range(1, m + 2),
+                self.rng.range(1, 10),
+            ),
             _ => (&PERSISTENT[..], self.rng.range(1, m), self.rng.range(1, 10)),
         };
         let plain = self.rng.pick(pool);
@@ -1002,7 +1033,12 @@ impl Sim {
             let address = self.rng.pick(&PERSISTENT);
             let from = self.host + self.rng.range(0, duration / 2);
             for k in 0..self.p.maxretry as i64 + 1 {
-                items.push((from + 3 * k, address.to_string(), FAIL, address.parse().ok()));
+                items.push((
+                    from + 3 * k,
+                    address.to_string(),
+                    FAIL,
+                    address.parse().ok(),
+                ));
             }
             attackers.push(format!("{} from +{}s", address, from - self.host));
         }
@@ -1120,6 +1156,7 @@ impl Sim {
             );
             self.note(text);
             self.recount.extend(hit);
+            self.recounts += 1;
         }
     }
 
@@ -1463,7 +1500,11 @@ impl Sim {
             ("tracked addresses", state.fails.len(), MAX_TRACKED),
             ("waiting bans", state.pending.len(), MAX_PENDING),
             ("recent bans", state.recent_bans.len(), self.p.max_per_hour),
-            ("queued notifications", self.h.engine.queued_notifications(), 100),
+            (
+                "queued notifications",
+                self.h.engine.queued_notifications(),
+                100,
+            ),
         ];
         for (what, n, cap) in caps {
             if n > cap {
@@ -1477,7 +1518,11 @@ impl Sim {
         }
         for (name, st) in &state.nvr {
             if st.seen.len() > MAX_SEEN {
-                return Err(format!("[caps] {} seen entries for {}", st.seen.len(), name));
+                return Err(format!(
+                    "[caps] {} seen entries for {}",
+                    st.seen.len(),
+                    name
+                ));
             }
         }
         Ok(())
@@ -1546,7 +1591,8 @@ impl Sim {
     }
 
     /// See `liveness` in the module comment.
-    fn check_liveness(&self) -> Result<(), String> {
+    fn check_liveness(&self) -> Result<usize, String> {
+        let mut musts = 0;
         let polls: Vec<Vec<usize>> = (0..self.p.nvrs)
             .map(|n| {
                 (0..self.cycles.len())
@@ -1595,6 +1641,7 @@ impl Sim {
             let Some(start) = start else {
                 continue;
             };
+            musts += 1;
             let keep = self.p.keep();
             let done = if self.p.report_once() {
                 self.bans
@@ -1620,7 +1667,7 @@ impl Sim {
                 ));
             }
         }
-        Ok(())
+        Ok(musts)
     }
 
     fn report(&self, violation: &str) -> String {
@@ -1684,7 +1731,8 @@ fn run_class(class: Class) {
     let replay = env("HIK_F2B_SIM_SEED").is_some();
     let seeds = seeds(class);
     let mut failures = Vec::new();
-    let mut cycles = 0;
+    // cycles, accepted, listed, reported, alerts, liveness, excluded
+    let mut stats = [0usize; 7];
     for &seed in &seeds {
         let mut sim = Sim::new(seed);
         let result = match catch_unwind(AssertUnwindSafe(|| sim.run())) {
@@ -1692,7 +1740,25 @@ fn run_class(class: Class) {
             Err(panic) => Err(format!("[panic] {}", panic_text(&*panic))),
         };
         let _ = util::captured_log();
-        cycles += sim.cycles.len();
+        let count = |kind: Ban| sim.bans.iter().filter(|(_, _, k)| *k == kind).count();
+        let alerts = sim
+            .cycles
+            .iter()
+            .flat_map(|c| &c.notices)
+            .filter(|n| n.starts_with("alert "))
+            .count();
+        let seen = [
+            sim.cycles.len(),
+            count(Ban::Accepted),
+            count(Ban::Listed),
+            count(Ban::Reported),
+            alerts,
+            sim.musts,
+            sim.recounts,
+        ];
+        for (total, n) in stats.iter_mut().zip(seen) {
+            *total += n;
+        }
         match result {
             Err(violation) => failures.push(sim.report(&violation)),
             Ok(()) if replay => say(&sim.report("no violation")),
@@ -1700,12 +1766,19 @@ fn run_class(class: Class) {
         }
     }
     let summary = format!(
-        "sim {:?}: {} seed(s), {} cycles, {:.1} s, {} violation(s)",
+        "sim {:?}: {} seed(s), {} cycles, {:.1} s, {} violation(s); bans {}, already listed {}, \
+         reports {}, health alerts {}, addresses due for liveness {}, excluded re-reads {}",
         class,
         seeds.len(),
-        cycles,
+        stats[0],
         started.elapsed().as_secs_f64(),
-        failures.len()
+        failures.len(),
+        stats[1],
+        stats[2],
+        stats[3],
+        stats[4],
+        stats[5],
+        stats[6]
     );
     say(&summary);
     for failure in &failures {

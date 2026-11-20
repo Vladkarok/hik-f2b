@@ -24,7 +24,8 @@ generate() {
     local out
     out=$("$quadlet" -dryrun -user 2>&1) || { echo "$out"; fail "Quadlet rejected hik-f2b.container"; }
     echo "$out"
-    if grep -Eiq "unsupported|converting|error" <<< "$out"; then
+    # Quadlet also reports search paths that do not exist; that is no error.
+    if grep -Ei "unsupported|converting|error" <<< "$out" | grep -v "resolving path"; then
         fail "Quadlet complained about hik-f2b.container"
     fi
     grep -q '^ExecStart=.*podman run' <<< "$out" || fail "Quadlet made no podman run command"

@@ -32,14 +32,11 @@ compose() {
     docker compose -f compose.yaml -f ci-image.yaml "$@"
 }
 
-# The permissions from the header of compose.yaml.
-chmod 644 hik-f2b.ini router-ca.crt
-sudo chown 65532 secrets/*
-sudo chmod 400 secrets/*
-
 container() {
     compose ps --all --quiet hik-f2b
 }
+
+chmod 644 hik-f2b.ini router-ca.crt
 
 state_volume() {
     docker inspect --format \
@@ -83,6 +80,20 @@ check_stop() {
     [ "$(docker inspect --format '{{.State.ExitCode}}' "$(container)")" = 0 ] \
         || fail "hik-f2b exited with a non-zero code"
 }
+
+echo "=== pass 0: secret files that only their owner on the host can read"
+# Docker Compose mounts a secret file as it is on the host, so uid 65532
+# cannot read a file that is private to another user.
+chmod 600 secrets/*
+compose up -d
+wait_for 30 logs "cannot read /run/secrets/hik-f2b-" \
+    || { cat log.txt; fail "hik-f2b did not report the unreadable secret"; }
+cat log.txt
+compose down --volumes
+
+# The permissions from the header of compose.yaml.
+sudo chown 65532 secrets/*
+sudo chmod 400 secrets/*
 
 echo "=== pass 1: compose.yaml as it is"
 compose up -d

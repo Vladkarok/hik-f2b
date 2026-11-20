@@ -75,14 +75,16 @@ STATE_EMPTY='hik-f2b-state 2'
 # could not be read.
 check_log() {
     local log=$1 version=$2 telegram=$3
-    grep -F "INFO hik-f2b $version started: 1 NVR(s), maxretry=5 findtime=3600s bantime=86400s telegram=$telegram" "$log" \
+    # The startup line comes after the config, every secret file and the CA
+    # file have been read; hik-f2b exits before it if one cannot be read.
+    grep -Fq "INFO hik-f2b $version started: 1 NVR(s), maxretry=5 findtime=3600s bantime=86400s telegram=$telegram" "$log" \
         || fail "no startup line with telegram=$telegram"
-    grep -F "INFO mode: ban on MikroTik, address-list cctv_ban" "$log" \
+    grep -Fq "INFO mode: ban on MikroTik, address-list cctv_ban" "$log" \
         || fail "no mode line"
     # The router and the NVR do not exist, so these fail; that they are
     # logged shows the startup check and the first poll ran.
-    grep -F "ERROR firewall check failed:" "$log" || fail "no firewall check line"
-    grep -F "WARNING nvr1: poll failed:" "$log" || fail "no poll line"
+    grep -Fq "ERROR firewall check failed:" "$log" || fail "no firewall check line"
+    grep -Fq "WARNING nvr1: poll failed:" "$log" || fail "no poll line"
     if grep -Ei "cannot read|permission denied|cannot save state|bad CA|no certificates|does not look like" "$log"; then
         fail "hik-f2b could not read or write a file"
     fi

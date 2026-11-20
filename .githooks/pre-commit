@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Runs the repository guard on the staged content of the files being
+# committed. Enable the hooks with: git config core.hooksPath .githooks
+set -euo pipefail
+root=$(git rev-parse --show-toplevel)
+exec bash "$root/.github/scripts/repo-guard.sh" --staged

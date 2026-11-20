@@ -6,6 +6,24 @@ numbers follow [Semantic Versioning](https://semver.org/). Each version is
 published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 (from 0.3.0 on); see "Versions and updates" in the [README](README.md).
 
+## [Unreleased]
+
+### Added
+
+- `.github/scripts/repo-guard.sh` fails on addresses that are not
+  documentation addresses or listed in `.github/repo-guard-allow.txt`, on
+  letters that only Russian uses, on binary files and, with
+  `git config hikf2b.denylist`, on the entries of a private denylist. It
+  runs on the tracked files and on every commit of a push or pull request,
+  in CI and through the hooks in `.githooks/`.
+- `.github/scripts/docs-check.sh` checks that the two READMEs are in step,
+  that internal links resolve, that no term from the "Do not use" column of
+  `GLOSSARY.md` is used, that sentences in numbered steps have at most 20
+  words, and that `hik-f2b.example.ini` has the lines the deploy files rely
+  on.
+- A CI job runs both checks and the guard's self-test, also before a release.
+- `AGENTS.md`: how to run the checks, and the rules they cannot express.
+
 ## [0.3.1] - 2026-11-20
 
 ### Added

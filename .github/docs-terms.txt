@@ -1,0 +1,102 @@
+# Terms from the "Do not use" column of GLOSSARY.md, for docs-check.py.
+#
+# Every item of that column is listed here, exactly as the column writes it,
+# and nothing else: docs-check.py fails if the two disagree. An item is either
+# checked or skipped with the reason.
+#
+#   <row> | <item> | en | <regex> [| except <file>#<anchor> ...]
+#   <row> | <item> | uk | <regex> [| except <file>#<anchor> ...]
+#   <row> | <item> | skip | <why it is not checked>
+#
+# <row> is the English column of the row. en is checked in the English docs,
+# uk in README.uk.md, only in prose: fenced blocks, inline code and link
+# targets are left out. Regexes are Python regexes, matched ignoring case.
+# "except" names sections where the term is allowed; #intro is the text
+# before the first second-level heading.
+
+NVR | recorder | en | \brecorders?\b | except README.md#requirements
+NVR | DVR (except in Requirements) | en | \bDVRs?\b | except README.md#requirements
+NVR | відеореєстратор (лише у вступі) | uk | відеореєстратор | except README.uk.md#intro
+NVR | NVR у тексті | uk | \bNVRs?\b | except README.uk.md#вимоги
+device | "device" for the NVR alone | skip | depends on what the word refers to
+device | «пристрій» лише про реєстратор | skip | depends on what the word refers to
+router | маршрутизатор | uk | маршрутизатор
+host | server | skip | also a TLS server certificate, a Telegram or ISAPI server; the meaning decides
+host | machine | en | \bmachines?\b
+host | сервер | uk | \bсервер(а|у|ом|і|и|ів)?\b
+# "IP" is allowed in the name DB-IP and in the names of its products, and in
+# "IP address" / «IP-адреса» for the type of value (IPv4 or IPv6).
+address | IP (in prose) | en | (?<!DB-)\bIP\b(?! address| geolocation| to Country)
+address | IP | uk | (?<!DB-)\bIP\b(?!-адрес| geolocation| to Country)
+address | айпі (у тексті) | uk | \bайпі\b
+failed login | failure | en | \bfailures?\b
+failed login | failed attempt | en | \bfailed attempts?\b
+failed login | невдала спроба | uk | \bневдал\w* спроб\w*
+failed login | помилка входу | uk | \bпомилк\w* входу\b
+log entry | event | en | \bevents?\b
+log entry | line | skip | "line" is also a line of the hik-f2b log, of a file and of a command
+log entry | подія | uk | \bпод(ія|ії|ію|ій|іям|іями|іях)\b
+NVR log | лог | uk | \bлог(и|у|ом|ів|ам|ах|а)?\b
+hik-f2b log | output (for the log) | skip | "output" is right for command output; only the meaning tells them apart
+hik-f2b log | лог | uk | \bлог(и|у|ом|ів|ам|ах|а)?\b
+user name | login name | en | \blogin names?\b
+user name | username | en | \busernames?\b
+user name | логін | uk | \bлогін\w*
+user name | ім'я для входу | uk | ім'я для входу
+client app | client | skip | also right for LAN, VPN and hairpin-NAT clients
+client app | program | en | \bprograms?\b
+client app | програма | uk | \bпрограм(а|и|у|ою|і)?\b
+client app | клієнт | skip | also right for LAN and VPN clients
+poll | cycle (`--help` says "poll cycle") | en | \bcycles?\b
+poll | цикл | uk | \bцикл\w*
+ban | block (for this action) | skip | "block" is the router's action, the meaning decides
+ban | блокувати (про цю дію) | skip | «блокувати» is the router's action, the meaning decides
+block | cut off | en | \bcut(s|ting)? off\b
+block | shut out | en | \bshut(s|ting)? out\b
+block | відрізати | uk | \bвідріза\w*|\bвідріж\w*
+timed ban | temporary ban | en | \btemporary bans?\b
+timed ban | бан на час | uk | \bбан\w* на час\b
+permanent ban | static ban | en | \bstatic bans?\b
+permanent ban | вічний бан | uk | \bвічн\w* бан\w*
+remove a ban | lift a ban | en | \blift(s|ed|ing)? (a |the )?bans?\b
+remove a ban | unban | en | \bunban\w*
+remove a ban | розбанити | uk | \bрозбан\w*
+address-list | ban list | en | \bban[ -]?lists?\b
+address-list | block list | en | \bblock[ -]?lists?\b
+address-list | бан-лист | uk | \bбан-?лист\w*
+address-list | чорний список | uk | \bчорн\w* списк?\w*
+address-list entry | ban entry | en | \bban entr(y|ies)\b
+drop rule | block rule | en | \bblock(ing)? rules?\b
+drop rule | ban rule | en | \bban rules?\b
+drop rule | правило блокування | uk | \bправил\w* блокування\b
+config | configuration file | en | \bconfiguration files?\b
+config | settings file | en | \bsettings files?\b
+config | файл налаштувань | uk | \bфайл\w* налаштувань\b
+config | конфігурація (про файл) | skip | «конфігурація роутера» is right; only the meaning tells them apart
+setting | option (for this) | skip | "option" is the term for command-line options; the meaning decides
+setting | опція (про це) | skip | «опція» is the term for command-line options; the meaning decides
+option | flag | skip | also an emoji flag and "flagged" in --dump output
+option | switch | skip | also the verb ("switch to permanent")
+option | setting | skip | "setting" is the term for config lines; the meaning decides
+option | ключ | skip | also a key in general (config keys, a TLS key)
+option | параметр (про це) | skip | «параметр» is the term for config lines; the meaning decides
+secret | credential (for one password or token; "credentials" means user name and password) | skip | systemd calls a passed secret a credential, and the docs use that name for it
+secret file | password file | en | \bpassword files?\b
+secret file | файл пароля | uk | \bфайл\w* парол\w*
+service | daemon | en | \bdaemons?\b
+service | демон | uk | \bдемон\w*
+service | служба | uk | \bслужб\w*
+Quadlet unit / systemd unit | unit file (for the service itself) | skip | right for the file itself; only the meaning tells them apart
+image / container | package (except the GitHub package page) | skip | GitHub's package page and settings are named so; only the meaning tells them apart
+dry run | test mode | en | \btest mode\b
+dry run | тестовий режим | uk | \bтестов\w* режим\w*
+notify-only mode | report-only mode | en | \breport-only\b
+notification | alert (for this) | skip | "health alert" is a term of its own; the meaning decides
+health alert | failure alert | en | \bfailure alerts?\b
+health alert | сповіщення про збій | uk | \bсповіщен\w* про збій\b
+health alert | алерт | uk | \bалерт\w*
+country database | GeoIP database | en | \bGeoIP database\b
+country database | геобаза | uk | \bгеобаз\w*
+topic | thread | en | \bthreads?\b
+topic | гілка | uk | \bгілк\w*
+topic | тред | uk | \bтред\w*

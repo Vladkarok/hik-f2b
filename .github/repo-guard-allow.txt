@@ -1,0 +1,23 @@
+# IPv4 literals that .github/scripts/repo-guard.sh accepts in tracked files,
+# beyond the ones it accepts by rule: documentation addresses (RFC 5737),
+# loopback, and ranges written exactly as the docs describe them
+# (10.0.0.0/8, 100.64.0.0/10, 0.0.0.0, 255.255.255.255 and the like).
+#
+# One address or CIDR block per line, with the reason. Never add an address
+# of a real device or network here: use a documentation address instead.
+# A line `binary:<path>` accepts a binary file at that path.
+
+# MikroTik's default LAN in the setup commands and examples.
+192.168.88.1    # the router's default address, in the README setup commands
+192.168.88.10   # example NVR address in hik-f2b.example.ini and the README
+192.168.88.11   # second example NVR in hik-f2b.example.ini
+
+# Test values in src/ and tests/.
+8.8.8.8         # src/config.rs: a public resolver, inside 0.0.0.0/0
+1.2.3.4         # src/state.rs: placeholder in lines of a broken state file
+10.0.0.0/33     # src/config.rs: deliberately invalid prefix length
+172.31.255.255  # src/config.rs: last address of 172.16.0.0/12
+172.32.0.0      # src/config.rs: first address after 172.16.0.0/12
+192.168.1.5     # src/config.rs: a private address that the default ignoreip covers
+192.168.1.50    # tests/e2e.rs: a private address that ignoreip covers
+198.51.101.1    # src/country.rs: just outside the documentation range 198.51.100.0/24

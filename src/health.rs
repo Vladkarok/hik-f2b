@@ -8,7 +8,9 @@
 //! - a problem is alerted once it has lasted `alert_after`, not before;
 //! - while it persists, a reminder at most every `REMIND_EVERY`;
 //! - one "recovered" notice when an alerted problem goes away; a problem
-//!   that clears before it was alerted produces nothing.
+//!   that clears before it was alerted produces nothing;
+//! - a problem that can no longer be observed is withdrawn: one "unknown"
+//!   notice if it was alerted, nothing otherwise, and no more reminders.
 //!
 //! State is kept in memory only.
 
@@ -19,6 +21,10 @@ use std::collections::BTreeMap;
 pub const REMIND_EVERY: u64 = 86400;
 /// Longest reason kept for a notice.
 const MAX_REASON: usize = 150;
+/// Said when every refused ban has expired or been dropped while the
+/// problem was alerted: nothing is left to show whether it is over.
+const BAN_REFUSED_UNKNOWN: &str = "no refused ban is waiting any more; whether the firewall \
+                                   accepts bans is not known until the next ban";
 
 /// What is being watched. Each value is one problem with a stable key.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -33,6 +39,9 @@ pub enum Check {
     Rule,
     /// Bans are waiting because `max_bans_per_hour` has been reached.
     RateLimit,
+    /// The firewall answers, but refuses to add a ban (for example because
+    /// our account may read but not write). Only an accepted ban clears it.
+    BanRefused,
 }
 
 impl Check {
@@ -43,6 +52,7 @@ impl Check {
             Check::Firewall => "firewall".to_string(),
             Check::Rule => "firewall-rule".to_string(),
             Check::RateLimit => "rate-limit".to_string(),
+            Check::BanRefused => "ban-refused".to_string(),
         }
     }
 
@@ -52,6 +62,7 @@ impl Check {
             Check::Firewall => "the firewall is not usable".to_string(),
             Check::Rule => "banned addresses are not blocked".to_string(),
             Check::RateLimit => "new bans are held back by max_bans_per_hour".to_string(),
+            Check::BanRefused => "the firewall refuses bans".to_string(),
         }
     }
 
@@ -61,6 +72,15 @@ impl Check {
             Check::Firewall => "the firewall is usable again".to_string(),
             Check::Rule => "banned addresses are blocked again".to_string(),
             Check::RateLimit => "bans are no longer held back".to_string(),
+            Check::BanRefused => "the firewall accepts bans again".to_string(),
+        }
+    }
+
+    /// What is said when an alerted problem can no longer be observed.
+    fn unknown(&self) -> String {
+        match self {
+            Check::BanRefused => BAN_REFUSED_UNKNOWN.to_string(),
+            other => format!("{} can no longer be checked", other.key()),
         }
     }
 }
@@ -73,6 +93,9 @@ pub enum Kind {
     Reminder,
     /// An alerted problem went away.
     Recovered,
+    /// An alerted problem can no longer be observed: neither its end nor
+    /// its persistence can be shown, so it is no longer reminded of.
+    Unknown,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +121,11 @@ impl Notice {
             Kind::Recovered => format!(
                 "\u{2705} hik-f2b: {} (after {})",
                 self.check.fixed(),
+                fmt_duration(self.lasted)
+            ),
+            Kind::Unknown => format!(
+                "\u{2139}\u{fe0f} hik-f2b: {} (after {})",
+                self.check.unknown(),
                 fmt_duration(self.lasted)
             ),
         }
@@ -148,6 +176,23 @@ impl Alerts {
                 self.recovered.push(Notice {
                     check: check.clone(),
                     kind: Kind::Recovered,
+                    lasted: now.saturating_sub(open.since),
+                    reason: String::new(),
+                });
+            }
+        }
+    }
+
+    /// `check` can no longer be observed at `now`. The problem is closed
+    /// without claiming a recovery: an alerted one gets one `Unknown`
+    /// notice, one not yet alerted ends silently. The next `fail` opens it
+    /// as a new problem.
+    pub fn withdraw(&mut self, check: &Check, now: u64) {
+        if let Some(open) = self.open.remove(check) {
+            if open.alerted.is_some() {
+                self.recovered.push(Notice {
+                    check: check.clone(),
+                    kind: Kind::Unknown,
                     lasted: now.saturating_sub(open.since),
                     reason: String::new(),
                 });
@@ -433,5 +478,35 @@ mod tests {
         assert_eq!(Check::Firewall.key(), "firewall");
         assert_eq!(Check::Rule.key(), "firewall-rule");
         assert_eq!(Check::RateLimit.key(), "rate-limit");
+        assert_eq!(Check::BanRefused.key(), "ban-refused");
+    }
+
+    #[test]
+    fn withdrawn_problem_is_neither_reminded_nor_recovered() {
+        let mut a = Alerts::new(AFTER);
+        // not yet alerted: ends silently
+        a.fail(Check::BanRefused, "HTTP 400", T0);
+        a.withdraw(&Check::BanRefused, T0 + 60);
+        assert!(a.due(T0 + AFTER).is_empty());
+
+        // alerted: one notice that says the outcome is unknown
+        a.fail(Check::BanRefused, "HTTP 400", T0 + AFTER);
+        assert_eq!(a.due(T0 + 2 * AFTER).len(), 1);
+        a.withdraw(&Check::BanRefused, T0 + 3 * AFTER);
+        let notices = a.due(T0 + 3 * AFTER);
+        assert_eq!(kinds(&notices), vec![(Check::BanRefused, Kind::Unknown)]);
+        assert_eq!(
+            notices[0].text(),
+            "\u{2139}\u{fe0f} hik-f2b: no refused ban is waiting any more; whether the \
+             firewall accepts bans is not known until the next ban (after 20 min)"
+        );
+        assert!(a.alerted().is_empty());
+        // no reminder, and a pass is not news either
+        assert!(a.due(T0 + 3 * AFTER + 2 * REMIND_EVERY).is_empty());
+        a.pass(&Check::BanRefused, T0 + 4 * AFTER);
+        assert!(a.due(T0 + 4 * AFTER).is_empty());
+        // withdrawing what is not open does nothing
+        a.withdraw(&Check::Firewall, T0);
+        assert!(a.due(T0 + 5 * AFTER).is_empty());
     }
 }

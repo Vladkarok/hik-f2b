@@ -70,6 +70,9 @@ struct Fake {
     router_down: bool,
     /// Drop REST connections without an answer.
     router_unreachable: bool,
+    /// Answer reads, refuse every PUT: a router user whose group lacks the
+    /// `write` policy.
+    refuse_writes: bool,
     router_requests: u32,
     /// Error detail for a duplicate entry; `None` = today's RouterOS text.
     duplicate_text: Option<String>,
@@ -331,6 +334,16 @@ fn route(
         if method == "PUT" {
             if f.router_down {
                 return reply(500, json, "{\"error\":500,\"message\":\"down\"}");
+            }
+            if f.refuse_writes {
+                // RouterOS error format; the detail is the console's text
+                // for a missing policy
+                return reply(
+                    400,
+                    json,
+                    "{\"detail\":\"not enough permissions (9)\",\"error\":400,\
+                     \"message\":\"Bad Request\"}",
+                );
             }
             let address = between(body, "\"address\":\"", "\"").to_string();
             if f.bans.contains(&address) {
@@ -596,7 +609,8 @@ impl Harness {
         })
     }
 
-    /// A harness after its first poll, which only records the starting point.
+    /// A harness after its first poll, which records the starting point
+    /// (and, as seen, what the overlap before it holds).
     fn with(opts: Opts) -> Harness {
         let mut h = Harness::build(opts);
         h.tick();
@@ -721,6 +735,56 @@ fn backlog_before_first_run_is_ignored() {
     assert!(h.banned().is_empty());
 }
 
+/// The first poll reads the `lookback` overlap before its own time and
+/// records it as already seen: failed logins from before the start are
+/// never counted, the ones after it are.
+#[test]
+fn failed_logins_just_before_the_start_are_not_counted() {
+    let mut h = Harness::raw(false);
+    // four inside the overlap (lookback = 120 s) before the first poll
+    for clock in ["09:58:30", "09:59:00", "09:59:30", "09:59:59"] {
+        h.add(clock, ATTACKER);
+    }
+    h.burst("09:59", OWNER, 5);
+    h.tick(); // the first poll, at 10:00:00
+    assert_eq!(h.since("nvr1"), format!("{}10:00:00", DAY));
+    assert_eq!(h.fake.lock().unwrap().search_requests, 1);
+    // one after the start: counted, and it does not make five
+    h.add("10:00:10", ATTACKER);
+    h.cycle("10:00:30");
+    assert_eq!(h.fails(ATTACKER), 1);
+    assert_eq!(h.fails(OWNER), 0);
+    run(&mut h, 4, 30);
+    assert_eq!(h.fails(ATTACKER), 1);
+    assert!(h.banned().is_empty());
+    assert!(h.engine.state.pending.is_empty());
+    // five after the start are a ban
+    h.burst("10:03", "198.51.100.8", 5);
+    h.cycle("10:04:00");
+    assert_eq!(h.banned(), vec!["198.51.100.8"]);
+}
+
+/// A first poll that cannot read the log leaves the NVR unknown; the next
+/// poll starts again from its own time.
+#[test]
+fn first_poll_that_cannot_read_the_log_is_tried_again() {
+    let mut h = Harness::raw(false);
+    h.fake.lock().unwrap().poison = Some(format!("{}09:59:00", DAY));
+    h.tick();
+    assert!(!h.engine.state.nvr.contains_key("nvr1"));
+    assert_eq!(h.engine.nvrs[0].failed_polls, 0, "no window to skip yet");
+    h.fake.lock().unwrap().poison = None;
+    h.burst("10:00", ATTACKER, 5); // before the start that succeeds
+    h.cycle("10:00:30");
+    assert_eq!(h.since("nvr1"), format!("{}10:00:30", DAY));
+    run(&mut h, 4, 30);
+    assert_eq!(h.fails(ATTACKER), 0);
+    assert!(h.banned().is_empty());
+    h.burst("10:03", ATTACKER, 5);
+    h.cycle("10:04:00");
+    assert_eq!(h.banned(), vec![ATTACKER]);
+}
+
 #[test]
 fn ban_on_fifth_failure() {
     let mut h = Harness::new(false);
@@ -813,6 +877,58 @@ fn ban_is_retried_when_router_is_down() {
     h.cycle("10:02:30");
     assert_eq!(h.banned(), vec![ATTACKER]);
     assert!(h.engine.state.pending.is_empty());
+}
+
+/// A waiting ban is checked against `ignoreip` again before it is applied:
+/// an owner who adds their address and restarts is not banned when the
+/// router is back.
+#[test]
+fn waiting_ban_of_an_address_now_in_ignoreip_is_dropped() {
+    const NEIGHBOUR: &str = "203.0.113.21";
+    let mut h = Harness::new(false);
+    h.fake.lock().unwrap().router_unreachable = true;
+    h.burst("10:01", OWNER, 5);
+    h.burst("10:01", ATTACKER, 5);
+    h.add("10:01:30", NEIGHBOUR);
+    h.cycle("10:02:00");
+    assert!(h.engine.state.pending.contains_key(&ip(OWNER)));
+    assert!(h.engine.state.pending.contains_key(&attacker()));
+    assert_eq!(h.fails(NEIGHBOUR), 1);
+
+    // OWNER and NEIGHBOUR are in 203.0.113.16/29
+    h.ini = h.ini.replace("[general]\n", "[general]\nignoreip = 203.0.113.16/29\n");
+    util::capture_log();
+    h.restart();
+    let log = util::captured_log();
+    assert_eq!(
+        logged(
+            &log,
+            "INFO 203.0.113.20: waiting ban dropped, 5 counted failed login(s) forgotten: the \
+             address is in ignoreip or a reserved range and is never banned"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    assert_eq!(
+        logged(&log, "INFO 203.0.113.21: 1 counted failed login(s) forgotten: "),
+        1,
+        "{:?}",
+        log
+    );
+    assert!(!h.engine.state.pending.contains_key(&ip(OWNER)));
+    assert_eq!(h.fails(OWNER), 0);
+    assert_eq!(h.fails(NEIGHBOUR), 0);
+
+    h.fake.lock().unwrap().router_unreachable = false;
+    h.advance(30);
+    assert_eq!(h.banned(), vec![ATTACKER], "no ban request for the owner");
+    assert!(h.engine.state.pending.is_empty());
+    assert!(h.fake.lock().unwrap().lookups.is_empty());
+    let path = h.dir.join("state");
+    h.engine.state.save(&path).unwrap();
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(!saved.contains(OWNER), "{}", saved);
 }
 
 #[test]
@@ -1518,32 +1634,168 @@ fn unreachable_router_is_tried_once_per_cycle() {
 }
 
 /// A6: more entries in one second than one poll can read: the cursor still
-/// moves on.
+/// moves on, whichever order the NVR lists them in.
 #[test]
 fn capped_poll_still_makes_progress() {
-    let mut h = Harness::new(false);
-    let fake = Arc::clone(&h.fake);
-    {
-        // an address in ignoreip, so that nothing is banned
-        let mut f = fake.lock().unwrap();
-        for n in 0..3300 {
-            f.entries.push(Entry {
-                ts: format!("{}10:01:10", DAY),
-                minor: "illlegealAccess".to_string(),
-                ip: "192.168.1.50".to_string(),
-                user: format!("u{:04}", n).into_bytes(),
-            });
-        }
-        f.entries.sort();
+    for newest_first in [false, true] {
+        let mut h = Harness::new(false);
+        let fake = Arc::clone(&h.fake);
+        let before = {
+            // an address in ignoreip, so that nothing is banned
+            let mut f = fake.lock().unwrap();
+            f.newest_first = newest_first;
+            for n in 0..3300 {
+                f.entries.push(Entry {
+                    ts: format!("{}10:01:10", DAY),
+                    minor: "illlegealAccess".to_string(),
+                    ip: "192.168.1.50".to_string(),
+                    user: format!("u{:04}", n).into_bytes(),
+                });
+            }
+            f.entries.sort();
+            f.search_requests
+        };
+        let warning = "more log entries within one second than can be read in one poll; \
+                       moving on by one second";
+        util::capture_log();
+        h.cycle("10:02:00");
+        // 50 pages of that second, then one search of the time before it
+        assert_eq!(h.fake.lock().unwrap().search_requests - before, 51);
+        assert_eq!(h.since("nvr1"), format!("{}10:01:10", DAY));
+        assert_eq!(logged(&util::captured_log(), warning), 0);
+        h.cycle("10:02:30");
+        assert_eq!(h.since("nvr1"), format!("{}10:01:11", DAY));
+        assert_eq!(logged(&util::captured_log(), warning), 1);
+        h.cycle("10:03:00");
+        assert_eq!(h.since("nvr1"), format!("{}10:01:12", DAY));
+        assert!(h.engine.state.nvr["nvr1"].seen.len() >= 3200);
     }
-    h.cycle("10:02:00");
-    assert_eq!(h.fake.lock().unwrap().search_requests, 50);
-    assert_eq!(h.since("nvr1"), format!("{}10:01:10", DAY));
-    h.cycle("10:02:30");
-    assert_eq!(h.since("nvr1"), format!("{}10:01:11", DAY));
-    h.cycle("10:03:00");
-    assert_eq!(h.since("nvr1"), format!("{}10:01:12", DAY));
-    assert!(h.engine.state.nvr["nvr1"].seen.len() >= 3200);
+}
+
+/// `count` failed logins from each address, `per_second` a second from
+/// `DAY` 10:01:00 on (device time), the addresses taken in turn.
+fn backlog(fake: &Mutex<Fake>, addresses: &[String], count: usize, per_second: usize) {
+    let start = util::parse_ts(&format!("{}10:01:00", DAY)).unwrap();
+    let mut f = fake.lock().unwrap();
+    for n in 0..addresses.len() * count {
+        f.entries.push(Entry {
+            ts: device(start + (n / per_second) as i64),
+            minor: "illlegealAccess".to_string(),
+            ip: addresses[n % addresses.len()].clone(),
+            user: b"admin".to_vec(),
+        });
+    }
+    f.entries.sort();
+}
+
+/// 600 addresses with 12 failed logins each and three with 20 each (for
+/// maxretry = 20): 7260 entries from 10:01:00 to 10:40:59, more than two
+/// searches return (50 pages of 64 entries each).
+fn big_backlog(h: &Harness) -> (Vec<String>, Vec<String>) {
+    let light: Vec<String> = (0..600)
+        .map(|n| match n / 256 {
+            0 => format!("192.0.2.{}", n),
+            1 => format!("198.51.100.{}", n - 256),
+            _ => format!("203.0.113.{}", n - 512),
+        })
+        .collect();
+    backlog(&h.fake, &light, 12, 3);
+    let heavy: Vec<String> = (200..203).map(|n| format!("203.0.113.{}", n)).collect();
+    for minute in 0..20 {
+        for address in &heavy {
+            h.add(&format!("10:{:02}:30", 1 + 2 * minute), address);
+        }
+    }
+    (light, heavy)
+}
+
+/// An NVR that lists newest first: a backlog larger than one search is read
+/// to its end in the same poll, and every failed login is counted once.
+#[test]
+fn newest_first_backlog_is_counted_once() {
+    let mut h = Harness::with(Opts {
+        general: "maxretry = 20",
+        ..Default::default()
+    });
+    h.fake.lock().unwrap().newest_first = true;
+    let (light, heavy) = big_backlog(&h);
+    util::capture_log();
+    let before = h.fake.lock().unwrap().search_requests;
+    h.cycle("10:42:00");
+    let pages = h.fake.lock().unwrap().search_requests - before;
+    assert!(pages > 100, "{} pages: more than two searches", pages);
+    let log = util::captured_log();
+    assert_eq!(logged(&log, "SKIPPING"), 0);
+    assert_eq!(logged(&log, "within one second"), 0);
+    for _ in 0..3 {
+        for address in &light {
+            assert_eq!(h.fails(address), 12, "{}", address);
+        }
+        let mut banned = h.banned();
+        banned.sort();
+        assert_eq!(banned, heavy);
+        assert_eq!(h.since("nvr1"), format!("{}10:40:59", DAY));
+        // the next polls read the overlap again and count nothing twice
+        h.advance(30);
+    }
+}
+
+/// The same backlog listed oldest first is read as before: one part per
+/// poll, with the cursor at the newest entry read.
+#[test]
+fn oldest_first_backlog_is_read_over_several_polls() {
+    let mut h = Harness::with(Opts {
+        general: "maxretry = 20",
+        ..Default::default()
+    });
+    let (light, heavy) = big_backlog(&h);
+    h.cycle("10:42:00");
+    let cursor = h.since("nvr1");
+    assert!(cursor < format!("{}10:40:00", DAY), "{}", cursor);
+    run(&mut h, 4, 30);
+    assert_eq!(h.since("nvr1"), format!("{}10:40:59", DAY));
+    for address in &light {
+        assert_eq!(h.fails(address), 12, "{}", address);
+    }
+    let mut banned = h.banned();
+    banned.sort();
+    assert_eq!(banned, heavy);
+}
+
+/// Newest first, and the window holds more than `MAX_SEARCHES` (4)
+/// searches return: the newest part is counted, and the oldest part is
+/// reported in an ERROR line with its time range.
+#[test]
+fn newest_first_backlog_beyond_the_bound_is_reported() {
+    let mut h = Harness::new(false);
+    h.fake.lock().unwrap().newest_first = true;
+    // 13,500 entries (ignoreip) from 10:01:00 to 10:38:29, six a second
+    backlog(&h.fake, &["192.168.1.50".to_string()], 13_500, 6);
+    // in the oldest part, which cannot be read in one poll
+    h.burst("10:01", ATTACKER, 5);
+    // newer than the rest
+    h.burst("10:39", "198.51.100.8", 5);
+    util::capture_log();
+    h.cycle("10:40:00");
+    let log = util::captured_log();
+    let skipped: Vec<&String> = log.iter().filter(|l| l.contains("SKIPPING")).collect();
+    assert_eq!(skipped.len(), 1, "{:?}", skipped);
+    assert!(
+        skipped[0].starts_with(&format!(
+            "ERROR nvr1: not every log entry in {}09:58:00Z .. {}10:0",
+            DAY, DAY
+        )),
+        "{}",
+        skipped[0]
+    );
+    assert!(
+        skipped[0].contains("(device time) could be read with 4 searches in one poll"),
+        "{}",
+        skipped[0]
+    );
+    assert_eq!(h.banned(), vec!["198.51.100.8"]);
+    assert_eq!(h.fails(ATTACKER), 0);
+    assert_eq!(h.since("nvr1"), format!("{}10:39:14", DAY));
 }
 
 /// C12: no router at all, only Telegram.
@@ -2074,6 +2326,109 @@ fn held_back_bans_are_alerted() {
         texts[3],
         format!("{}bans are no longer held back (after 60 min)", OK)
     );
+}
+
+/// A router that answers reads but refuses every ban: the read checks pass,
+/// the refused bans raise their own alert, and only an accepted ban ends it.
+#[test]
+fn refused_bans_are_alerted_until_a_ban_is_accepted() {
+    let mut h = Harness::with(Opts {
+        telegram: true,
+        general: "bantime = 7d",
+        ..Default::default()
+    });
+    h.fake.lock().unwrap().refuse_writes = true;
+    h.burst("10:01", ATTACKER, 5);
+    h.cycle("10:02:00"); // refused: the problem starts now
+    assert_eq!(h.engine.state.pending.len(), 1);
+    run(&mut h, 19, 30); // read checks at 10:05 and 10:10 pass
+    assert!(telegram_texts(&h).is_empty());
+    h.advance(30); // 10:12:00
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 1, "{:?}", texts);
+    assert!(
+        texts[0].starts_with(&format!(
+            "{}the firewall refuses bans for 10 min: 198.51.100.7: HTTP 400: ",
+            WARN
+        )),
+        "{}",
+        texts[0]
+    );
+    assert!(texts[0].contains("not enough permissions"), "{}", texts[0]);
+    assert!(!texts[0].contains("127.0.0.1"), "{}", texts[0]);
+    // the router still answers every read
+    assert!(h.engine.firewall.as_ref().unwrap().check().is_ok());
+
+    // a day of read checks does not clear it; the reminder comes after 24 h
+    run(&mut h, 23, 3600);
+    h.advance(3300); // one day after the alert, less 5 minutes
+    assert_eq!(telegram_texts(&h).len(), 1);
+    assert_eq!(h.engine.alerted_problems(), vec!["ban-refused"]);
+    h.advance(300);
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 2, "{:?}", texts);
+    assert!(
+        texts[1].starts_with(&format!("{}the firewall refuses bans for 24 h: ", WARN)),
+        "{}",
+        texts[1]
+    );
+    assert!(h.banned().is_empty());
+
+    // writes are allowed again: the waiting ban is applied, then one recovery
+    h.fake.lock().unwrap().refuse_writes = false;
+    h.advance(30);
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 4, "{:?}", texts);
+    assert!(
+        texts[2].starts_with("\u{26d4} hik-f2b: 198.51.100.7 banned for "),
+        "{}",
+        texts[2]
+    );
+    assert_eq!(
+        texts[3],
+        format!("{}the firewall accepts bans again (after 24 h)", OK)
+    );
+    assert!(h.engine.alerted_problems().is_empty());
+    run(&mut h, 4, 30);
+    assert_eq!(telegram_texts(&h).len(), 4);
+}
+
+/// The refused bans expire while the alert is on: there is nothing left to
+/// show the end of the problem. One notice says so, without claiming a
+/// recovery, and there are no more reminders.
+#[test]
+fn refused_bans_that_expire_end_the_alert_without_a_recovery() {
+    let mut h = Harness::new(true);
+    h.fake.lock().unwrap().refuse_writes = true;
+    util::capture_log();
+    h.burst("10:01", ATTACKER, 5);
+    h.cycle("10:02:00");
+    run(&mut h, 20, 30); // 10:12:00: alerted
+    assert_eq!(telegram_texts(&h).len(), 1);
+    // the ban waits for bantime (24 hours), then is dropped
+    h.set_host(host_of("10:02:00") + 86400 + 60);
+    h.tick();
+    assert!(h.engine.state.pending.is_empty());
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 2, "{:?}", texts);
+    assert_eq!(
+        texts[1],
+        "\u{2139}\u{fe0f} hik-f2b: no refused ban is waiting any more; whether the firewall \
+         accepts bans is not known until the next ban (after 24 h)"
+    );
+    assert!(h.engine.alerted_problems().is_empty());
+    let log = util::captured_log();
+    assert_eq!(
+        logged(&log, "INFO health unknown [ban-refused]: hik-f2b: no refused ban is waiting"),
+        1,
+        "{:?}",
+        log
+    );
+    assert_eq!(logged(&log, "health recovered"), 0);
+    // no reminder a day later
+    run(&mut h, 25, 3600);
+    assert_eq!(telegram_texts(&h).len(), 2);
 }
 
 /// Without [telegram] the same events only reach the log.

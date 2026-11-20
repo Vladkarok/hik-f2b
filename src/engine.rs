@@ -17,7 +17,7 @@ use crate::country::{self, Code};
 use crate::health::{Alerts, Check, CheckLine, Kind, Notice, Status};
 use crate::mikrotik::Mikrotik;
 use crate::nvr::{Event, Nvr, NvrError};
-use crate::state::{Pending, State, MAX_PENDING, MAX_SEEN, MAX_TRACKED};
+use crate::state::{NvrState, Pending, State, MAX_PENDING, MAX_SEEN, MAX_TRACKED};
 use crate::telegram::Telegram;
 use crate::util;
 use std::collections::HashMap;
@@ -41,6 +41,11 @@ const CLOCK_JUMP: i64 = 900;
 const PERMANENT_MEMORY: u64 = 86400;
 /// Time between two health checks of the firewall.
 pub const HEALTH_CHECK_INTERVAL: u64 = 300;
+/// Searches of one NVR's log per poll, when the NVR lists newest first and
+/// the window holds more than one search returns (see `read_window`). With
+/// the caps in `nvr.rs` one poll reads at most this many times 50 pages or
+/// 5000 entries.
+const MAX_SEARCHES: usize = 4;
 
 /// How long the engine remembers a ban (see `PERMANENT_MEMORY`).
 fn memory(bantime: BanTime) -> u64 {
@@ -77,6 +82,11 @@ fn never_ban(ip: Ipv4Addr) -> bool {
         || ip.octets()[0] >= 240
 }
 
+/// Never banned: in `ignoreip`, or in a range `never_ban` names.
+fn exempt(cfg: &Config, ip: Ipv4Addr) -> bool {
+    never_ban(ip) || cfg.ignored(ip)
+}
+
 fn host_i64(host_now: u64) -> i64 {
     i64::try_from(host_now).unwrap_or(i64::MAX)
 }
@@ -88,8 +98,126 @@ struct Polled {
     offset: i64,
 }
 
+/// What one poll read from an NVR's log window.
+struct Window {
+    /// Each entry read, once, however many searches it took.
+    events: Vec<Event>,
+    /// The newest entry time read (device time).
+    newest: Option<i64>,
+    /// Entries newer than `newest` may not have been read (the NVR lists
+    /// oldest first, or the order could not be told): the cursor must not
+    /// move past `newest`.
+    cut_after: bool,
+}
+
+/// Reads the log window `start ..= end` (device time) of one NVR.
+///
+/// A search stops at the cap in `nvr.rs`. The times of the entries a capped
+/// search returned tell which end of the window it read:
+///
+/// - Oldest first (both tested NVRs): the rest is newer. `cut_after` is
+///   set, and the caller keeps its cursor at the newest entry read, so the
+///   next poll reads on from there.
+/// - Newest first: the rest is older, and a cursor can never reach it.
+///   Further searches read it now, each ending just after the oldest
+///   second read so far, up to `MAX_SEARCHES` in all. A search may stop in
+///   the middle of a second; that second is read again by the next search
+///   and taken from that search only, so no entry is counted twice. What
+///   cannot be read within the bound is reported as an ERROR.
+/// - All entries in one second: the order cannot be told. What was read is
+///   kept, the older part is read as for newest first, and `cut_after` is
+///   set as for oldest first.
+fn read_window(nvr: &mut Nvr, start: i64, end: i64, meta_id: &str) -> Result<Window, NvrError> {
+    let mut window = Window {
+        events: Vec::new(),
+        newest: None,
+        cut_after: false,
+    };
+    let mut end = end;
+    // Entries after this came from an earlier search of this poll.
+    let mut keep_to: Option<i64> = None;
+    for n in 0..MAX_SEARCHES {
+        let search = nvr.search(start, end, meta_id, None)?;
+        let first = search.events.iter().find_map(|ev| ev.ts);
+        let last = search.events.iter().rev().find_map(|ev| ev.ts);
+        let newest_first = matches!((first, last), (Some(f), Some(l)) if f > l);
+        let kept: Vec<Event> = search
+            .events
+            .into_iter()
+            .filter(|ev| keep_to.is_none_or(|to| ev.ts.is_some_and(|ts| ts <= to)))
+            .collect();
+        let oldest = kept.iter().filter_map(|ev| ev.ts).min();
+        let newest = kept.iter().filter_map(|ev| ev.ts).max();
+        window.newest = window.newest.max(newest);
+        if !search.truncated {
+            window.events.extend(kept);
+            return Ok(window);
+        }
+        let Some(oldest) = oldest else {
+            if n == 0 {
+                // nothing with a time to go by: keep the cursor where it is
+                window.events.extend(kept);
+                window.cut_after = true;
+                return Ok(window);
+            }
+            break;
+        };
+        let unread_to = if oldest == newest.unwrap_or(oldest) {
+            if n > 0 {
+                crate::warn!(
+                    "{}: more log entries within one second ({}, device time) than one search \
+                     can read; some entries of that second may have been skipped",
+                    nvr.name,
+                    util::fmt_ts(oldest)
+                );
+            }
+            window.cut_after |= n == 0;
+            window.events.extend(kept);
+            end = oldest.saturating_sub(1);
+            oldest.saturating_sub(1)
+        } else if newest_first {
+            // the second the search stopped in is left to the next search
+            window
+                .events
+                .extend(kept.into_iter().filter(|ev| ev.ts.is_some_and(|ts| ts > oldest)));
+            end = oldest.saturating_add(1);
+            oldest
+        } else if n == 0 {
+            window.events.extend(kept);
+            window.cut_after = true;
+            return Ok(window);
+        } else {
+            // oldest first after a search that was newest first: the order
+            // cannot be relied on, stop here
+            window.events.extend(kept);
+            break;
+        };
+        keep_to = Some(unread_to);
+        if unread_to < start {
+            return Ok(window);
+        }
+    }
+    if let Some(to) = keep_to {
+        crate::error!(
+            "{}: not every log entry in {} .. {} (device time) could be read with {} searches \
+             in one poll; SKIPPING the rest of it, failed logins in it are not counted",
+            nvr.name,
+            util::fmt_ts(start),
+            util::fmt_ts(to),
+            MAX_SEARCHES
+        );
+    }
+    Ok(window)
+}
+
 /// Reads one NVR's log. Owns the read cursor (`since`, device time) and the
 /// `seen` set; the rest of the engine never sees device time.
+///
+/// The first poll of an NVR reads from its current time. It records what
+/// the `lookback` overlap before that holds as already seen, without
+/// counting it, so failed logins from before the start are never counted.
+/// Until that read succeeds the NVR stays unknown, and the next poll tries
+/// again.
 fn poll_nvr(
     nvr: &mut Nvr,
     cfg: &Config,
@@ -100,33 +228,36 @@ fn poll_nvr(
     // a log window (`failed_polls`): only a log that cannot be read does.
     let now = nvr.now()?;
     let offset = now.saturating_sub(host_now);
-    let lookback = cfg.lookback;
-    let Some(st) = state.nvr.get_mut(&nvr.name) else {
-        state.nvr.insert(
-            nvr.name.clone(),
-            crate::state::NvrState {
-                since: now,
-                offset: Some(offset),
-                ..Default::default()
-            },
-        );
-        nvr.failed_polls = 0;
-        crate::info!(
-            "{}: first run, watching log entries from {} (device time)",
-            nvr.name,
-            util::fmt_ts(now)
-        );
-        return Ok(Polled {
-            fresh: Vec::new(),
-            offset,
-        });
-    };
+    let first = !state.nvr.contains_key(&nvr.name);
+    let st = state.nvr.entry(nvr.name.clone()).or_insert_with(|| NvrState {
+        since: now,
+        offset: Some(offset),
+        ..Default::default()
+    });
+    let result = read_log(nvr, cfg, st, now, offset, first);
+    if first && result.is_err() {
+        state.nvr.remove(&nvr.name);
+    }
+    result
+}
 
+/// `poll_nvr` once the NVR's state exists (`first`: it was just made).
+fn read_log(
+    nvr: &mut Nvr,
+    cfg: &Config,
+    st: &mut NvrState,
+    now: i64,
+    offset: i64,
+    first: bool,
+) -> Result<Polled, NvrError> {
+    let lookback = cfg.lookback;
     // After a clock jump the device log holds entries whose times say
     // nothing about when they happened relative to new ones. Resync: read
     // from the new time, and record what the first window holds without
     // counting it, so old entries are never counted (again).
-    let jump = if now < st.since.saturating_sub(lookback) {
+    let jump = if first {
+        None
+    } else if now < st.since.saturating_sub(lookback) {
         Some(format!(
             "went back from {} to {}",
             util::fmt_ts(st.since),
@@ -138,7 +269,7 @@ fn poll_nvr(
             .filter(|jump| *jump > CLOCK_JUMP)
             .map(|jump| format!("jumped forward by {} s (to {})", jump, util::fmt_ts(now)))
     };
-    let baseline = jump.is_some();
+    let baseline = first || jump.is_some();
     let mut since = st.since;
     if let Some(jump) = jump {
         crate::warn!(
@@ -161,14 +292,17 @@ fn poll_nvr(
         since = horizon;
     }
 
-    let result = nvr.search(
+    let result = read_window(
+        nvr,
         since.saturating_sub(lookback),
         now.saturating_add(86400),
         &cfg.meta_id,
-        None,
     );
-    let search = match result {
-        Ok(search) => search,
+    let window = match result {
+        Ok(window) => window,
+        // On the first run there is no cursor to move on: the next poll
+        // starts from its own time anyway.
+        Err(NvrError::Other(e)) if first => return Err(NvrError::Other(e)),
         Err(NvrError::Other(e)) => {
             nvr.failed_polls = nvr.failed_polls.saturating_add(1);
             if nvr.failed_polls >= MAX_FAILED_POLLS {
@@ -196,11 +330,8 @@ fn poll_nvr(
     // if it occurs more often than it did in the previous poll.
     let mut counter: HashMap<String, u32> = HashMap::new();
     let mut fresh = Vec::new();
-    let mut newest = since;
-    for ev in search.events {
-        if let Some(ts) = ev.ts {
-            newest = newest.max(ts);
-        }
+    let newest = window.newest.map_or(since, |ts| ts.max(since));
+    for ev in window.events {
         if !cfg.log_filter.is_match(&ev.meta) {
             continue;
         }
@@ -214,18 +345,28 @@ fn poll_nvr(
             fresh.push(ev);
         }
     }
-    if baseline {
+    let entries = if counter.len() == 1 { "y" } else { "ies" };
+    if first {
+        crate::info!(
+            "{}: first run, watching log entries from {} (device time); {} log entr{} from \
+             before the start recorded as already seen, not counted",
+            nvr.name,
+            util::fmt_ts(now),
+            counter.len(),
+            entries
+        );
+    } else if baseline {
         crate::info!(
             "{}: {} existing log entr{} recorded as already seen",
             nvr.name,
             counter.len(),
-            if counter.len() == 1 { "y" } else { "ies" }
+            entries
         );
     }
     fresh.sort_by_key(|ev| ev.ts);
 
     let mut next = newest.min(now);
-    if search.truncated && !baseline {
+    if window.cut_after && !baseline {
         // Only the start of the window was read: entries seen before that
         // were not re-read this time must stay known, or the next poll would
         // count them again.
@@ -277,7 +418,7 @@ fn register(
             return None;
         }
     };
-    if never_ban(ip) || cfg.ignored(ip) {
+    if exempt(cfg, ip) {
         crate::info!(
             "{}: failed login from {} (user={:?}): never banned (ignoreip or reserved), not counted",
             ev.nvr,
@@ -384,7 +525,7 @@ impl Engine {
             .as_ref()
             .map(|t| t.message.clone())
             .unwrap_or_else(|| DEFAULT_MESSAGE.replace("\\n", "\n"));
-        Ok(Engine {
+        let mut engine = Engine {
             alerts: Alerts::new(cfg.alert_after),
             cfg,
             state,
@@ -395,7 +536,45 @@ impl Engine {
             notifications: Vec::new(),
             next_check: 0,
             country_failure: None,
-        })
+        };
+        // The state may come from a run with another `ignoreip`.
+        engine.drop_exempt();
+        Ok(engine)
+    }
+
+    /// Forgets the waiting ban and the counted failed logins of every
+    /// address that is never banned. `register` keeps such addresses out,
+    /// but `ignoreip` may have changed since they were counted (a restart
+    /// with a new config), and a waiting ban must not be applied then.
+    fn drop_exempt(&mut self) {
+        let cfg = &self.cfg;
+        let mut addresses: Vec<Ipv4Addr> = self
+            .state
+            .pending
+            .keys()
+            .chain(self.state.fails.keys())
+            .copied()
+            .filter(|ip| exempt(cfg, *ip))
+            .collect();
+        addresses.sort_unstable();
+        addresses.dedup();
+        for ip in addresses {
+            let waiting = self.state.pending.remove(&ip).is_some();
+            let counted = self.state.fails.remove(&ip).map_or(0, |times| times.len());
+            let what = match (waiting, counted) {
+                (true, 0) => "waiting ban dropped".to_string(),
+                (true, n) => format!(
+                    "waiting ban dropped, {} counted failed login(s) forgotten",
+                    n
+                ),
+                (false, n) => format!("{} counted failed login(s) forgotten", n),
+            };
+            crate::info!(
+                "{}: {}: the address is in ignoreip or a reserved range and is never banned",
+                ip,
+                what
+            );
+        }
     }
 
     /// Runs the firewall health check once at startup and logs the result;
@@ -694,6 +873,7 @@ impl Engine {
         self.state
             .recent_bans
             .retain(|t| now.saturating_sub(*t) < 3600);
+        self.drop_exempt();
 
         let bantime = self.cfg.bantime;
         let keep = memory(bantime);
@@ -799,15 +979,21 @@ impl Engine {
                     }
                     Err(BanError::Refused(e)) => {
                         crate::error!("cannot ban {} on {}, will retry: {}", ip, fw.describe(), e);
+                        // A successful read does not clear this: only a
+                        // ban the firewall accepts does.
+                        let reason = format!("{}: {}", ip, e);
+                        self.alerts.fail(Check::BanRefused, &reason, now);
                         continue;
                     }
                     Ok(true) => {
                         self.alerts.pass(&Check::Firewall, now);
+                        self.alerts.pass(&Check::BanRefused, now);
                         crate::warn!("BAN {} {} ({})", shown, duration, comment);
                         (format!("banned {}", duration), true, true)
                     }
                     Ok(false) => {
                         self.alerts.pass(&Check::Firewall, now);
+                        self.alerts.pass(&Check::BanRefused, now);
                         // The router is the source of truth for bans. A
                         // listed address should not reach the NVR, unless
                         // these failures were logged just before our ban.
@@ -871,6 +1057,11 @@ impl Engine {
             self.alerts.fail(Check::RateLimit, &reason, now);
         } else if !unreachable {
             self.alerts.pass(&Check::RateLimit, now);
+        }
+        if self.state.pending.is_empty() {
+            // Every refused ban expired or was dropped: nothing is left to
+            // show whether the firewall would accept one now.
+            self.alerts.withdraw(&Check::BanRefused, now);
         }
         unreachable
     }
@@ -941,5 +1132,6 @@ fn log_notice(notice: &Notice) {
         Kind::Alert => crate::error!("health alert [{}]: {}", key, text),
         Kind::Reminder => crate::error!("health reminder [{}]: {}", key, text),
         Kind::Recovered => crate::info!("health recovered [{}]: {}", key, text),
+        Kind::Unknown => crate::info!("health unknown [{}]: {}", key, text),
     }
 }

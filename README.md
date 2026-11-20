@@ -1018,9 +1018,10 @@ Not yet tried:
   permissions"; the exact answer of RouterOS was not checked.
 - An NVR that lists log entries newest first: no such NVR is known, so only
   the fake NVR of the tests does this.
-- The second `--check` line (the order of a log search, the page size) and
-  the clock difference on the first line, with real NVRs: only the fake NVR
-  of the tests was checked.
+- The page size in the second `--check` line with real NVRs: their logs held
+  too few entries to show it. The order was shown for one NVR (oldest first;
+  the other had no entries in the last 24 hours), and the clock difference
+  for both.
 - The handling of clock changes from 0.3.2 (a small correction backward, a
   change while the log cannot be read) on real NVRs: only the tests and the
   simulation make these happen.

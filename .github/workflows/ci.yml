@@ -27,6 +27,15 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
 
+  test-arm64:
+    # The same test suite (fake NVR, router and Telegram, the country
+    # reader) on arm64 hardware. fmt and clippy run in the test job only.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v7
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo test --locked
+
   audit:
     runs-on: ubuntu-latest
     steps:
@@ -35,8 +44,22 @@ jobs:
       - run: cargo audit
 
   image:
-    runs-on: ubuntu-latest
+    # Builds the image once, then starts it from the files in deploy/ with a
+    # dummy config: the release workflow must not ship deploy files that do
+    # not start. Pinned, so that the Docker, systemd and Podman versions the
+    # checks run on only change on purpose.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v7
       - run: docker build -f Containerfile -t hik-f2b:ci .
       - run: docker run --rm hik-f2b:ci --version
+      - name: Start it with deploy/compose.yaml
+        run: bash .github/scripts/deploy-compose-check.sh hik-f2b:ci
+      - name: Start it with deploy/hik-f2b.service
+        run: bash .github/scripts/deploy-systemd-check.sh hik-f2b:ci
+      - name: Check deploy/hik-f2b.container with Quadlet
+        run: bash .github/scripts/deploy-quadlet-check.sh

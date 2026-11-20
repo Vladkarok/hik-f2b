@@ -41,12 +41,17 @@ services:
     secrets:
       - hik-f2b-router
       - hik-f2b-nvr
+      # Telegram bot token, for a [telegram] section with
+      # bot_token_file = /run/secrets/hik-f2b-telegram:
+      # - hik-f2b-telegram
 
 secrets:
   hik-f2b-router:
     file: ./secrets/router
   hik-f2b-nvr:
     file: ./secrets/nvr
+  # hik-f2b-telegram:
+  #   file: ./secrets/telegram
 
 volumes:
   state: {}

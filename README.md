@@ -1,14 +1,14 @@
 # hik-f2b
 
-**English** | [Українська](README.uk.md)
+**English** | [Українська](README.uk.md) | [Glossary](GLOSSARY.md)
 
 fail2ban-style protection for Hikvision NVRs that sit behind a MikroTik router
 with their ports forwarded to the internet.
 
 hik-f2b polls the NVR's own log for failed logins and counts them per source
-IPv4 address. When an address reaches `maxretry` failures within `findtime`
+IPv4 address. When an address reaches `maxretry` failed logins within `findtime`
 seconds, hik-f2b adds it to a firewall address-list on the router, with a
-timeout (`bantime`) or permanently. The router drops that address from then
+timeout (`bantime`) or permanently. The router blocks that address from then
 on. Optionally it reports every ban to a Telegram chat, and tells you when it
 cannot do its job (see [Health alerts](#health-alerts)). Without a router it
 can run in [notify-only mode](#notify-only-mode-no-router): it reports such
@@ -19,7 +19,7 @@ uses about 2 MB of memory. It listens on no port.
 
 > **Status: beta.** Verified on real devices (see
 > [Tested hardware](#tested-hardware)): failed logins are read, the address is
-> banned, and the router drops its traffic. It has not yet run unattended for
+> banned, and the router blocks its traffic. It has not yet run unattended for
 > days or weeks, and several parts have not been tried at all (listed under
 > [Tested hardware](#tested-hardware)). Start with `dry_run = true`.
 
@@ -27,8 +27,8 @@ uses about 2 MB of memory. It listens on no port.
 
 A router cannot tell a wrong password from a right one: it only sees TCP
 connections, and a client app opens a burst of connections just to show a
-camera grid, so rate limits on the router ban real users. The NVR does know,
-and it writes every failed login with the remote IP to its log. hik-f2b
+camera grid, so rate limits on the router block real users. The NVR does know,
+and it writes every failed login with the source address to its log. hik-f2b
 connects the two.
 
 ```
@@ -41,21 +41,23 @@ attacker ──► MikroTik ──dst-nat──► NVR ── writes "Illegal Lo
 
 ## Is this the right tool?
 
-Exposing an NVR to the internet is a risk that no ban list fully removes:
+Exposing an NVR to the internet is a risk that no ban fully removes:
 several Hikvision vulnerabilities needed no password at all. In order of
 preference:
 
 1. Do not forward ports. Use a VPN, or the vendor's cloud relay.
-2. If you must forward ports, keep firmware current, forward only what the
-   client app needs, restrict by source country or network if you can, turn
-   UPnP off on the router, and keep the NVR's built-in illegal login lock
-   enabled.
-3. Then add hik-f2b, which turns the NVR's 30-minute lock into a router-level
-   ban of any length and covers all your NVRs at once.
+2. If you must forward ports, do all of these:
+   - Keep the firmware current.
+   - Forward only the ports that the client app needs.
+   - If you can, restrict access by source country or network.
+   - Turn off UPnP on the router.
+   - Keep the NVR's built-in illegal login lock enabled.
+3. Then add hik-f2b. It turns the NVR's 30-minute lock into a ban of any
+   length on the router. It covers all your NVRs at once.
 
 Related projects: [fail2ban](https://github.com/fail2ban/fail2ban) with a
 [MikroTik action](https://github.com/pincioc/fail2ban_mikrotik) works if your
-device can send logs to syslog, and
+NVR can send logs to syslog, and
 [mikrotik-fwban](https://github.com/middelink/mikrotik-fwban) bans from syslog
 messages directly. hik-f2b exists because many Hikvision NVRs have no usable
 syslog output, so the log has to be pulled over ISAPI (Hikvision's HTTP API).
@@ -73,14 +75,16 @@ syslog output, so the log has to be pulled over ISAPI (Hikvision's HTTP API).
 
 ### 1. Router
 
-Replace `192.168.88.1` with the router address the host will connect to, and
-`HOST_IP` with the address of the host running hik-f2b. Run the commands one at
-a time; signing takes a few seconds. Use only Latin characters: the RouterOS
-terminal rejects others.
+Before you start:
 
-HTTPS for the REST API, reachable only from the hik-f2b host. RouterOS will not
-self-sign a server certificate, so a small local CA (certificate authority)
-signs it:
+- In the commands, replace `192.168.88.1` with the router address that the
+  host connects to.
+- Replace `HOST_IP` with the address of the host that runs hik-f2b.
+- Use only Latin characters. The RouterOS terminal rejects other characters.
+- Run the commands one at a time. Signing takes a few seconds.
+
+1. Set up HTTPS for the REST API. RouterOS does not self-sign a server
+   certificate, so a small local CA (certificate authority) signs it:
 
 ```
 /certificate add name=f2b-ca common-name=f2b-ca days-valid=3650 key-usage=key-cert-sign,crl-sign
@@ -90,17 +94,19 @@ signs it:
 /ip service set www-ssl certificate=rest-api address=HOST_IP/32 disabled=no
 ```
 
-A dedicated account that can only be used from that host:
+The REST API is now reachable over HTTPS, and only from the hik-f2b host.
+
+2. Create a dedicated account. It can only be used from the hik-f2b host:
 
 ```
 /user group add name=f2b policy=read,write,api,rest-api
 /user add name=f2b group=f2b address=HOST_IP/32 password=CHANGE_ME
 ```
 
-`write` is needed to add bans. `read` lets hik-f2b read the firewall rules,
-which it does to check that the rule below exists.
+`write` is needed to add bans. `read` lets hik-f2b read the firewall rules.
+hik-f2b reads them to check that the drop rule from step 3 exists.
 
-The rule that actually blocks:
+3. Add the drop rule. This is the rule that blocks banned addresses:
 
 ```
 /ip firewall raw add chain=prerouting in-interface-list=WAN src-address-list=cctv_ban action=drop comment="hik-f2b: drop banned"
@@ -108,59 +114,80 @@ The rule that actually blocks:
 
 The rule lives in `raw`, ahead of connection tracking and fasttrack, so it also
 cuts connections the banned address already has open. It drops packets by
-source address on the WAN side, so it also drops replies from a banned address
+source address on the WAN side. So it also drops replies from a banned address
 to connections that your own LAN opened. hik-f2b checks at startup and every 5
-minutes that such a rule exists and is enabled, and alerts you if it is gone
-(see [Health alerts](#health-alerts)).
+minutes that such a rule exists and is enabled. If the rule is gone, hik-f2b
+sends a health alert (see [Health alerts](#health-alerts)).
 
-Export the CA certificate:
+4. Export the CA certificate:
 
 ```
 /certificate export-certificate f2b-ca
 ```
 
-This creates the file `cert_export_f2b-ca.crt` in the router's files. Copy it to
-the host and name it `router-ca.crt`; the steps below and the example config
-expect that name. hik-f2b trusts only this CA when it talks to the router.
+The router now has the file `cert_export_f2b-ca.crt` in its files.
+
+5. Copy this file to the host. The [Host](#3-host) step saves it as
+   `router-ca.crt`, the name that the example config expects. With Compose or
+   without a container, name it `router-ca.crt` yourself.
+
+hik-f2b trusts only this CA when it connects to the router.
 
 ### 2. NVR
 
-Create a user named `f2b` with the *Operator* level and a single permission:
-**Remote: Log Search / Interrogate Working Status**. Do not use the admin
-account.
+Do not use the admin account for hik-f2b. hik-f2b only needs to search the log.
+With the admin account, a leaked password from the config gives full control
+of the NVR. Create a separate user instead:
+
+1. Create a user named `f2b` with the *Operator* level.
+2. Give the user a single permission:
+   **Remote: Log Search / Interrogate Working Status**.
 
 ### 3. Host
 
-Copy [hik-f2b.example.ini](hik-f2b.example.ini) to `hik-f2b.ini` and edit it.
-Addresses and thresholds go in the config. Passwords should go in separate
-secret files that the config only points to (`password_file = ...`).
+1. Copy [hik-f2b.example.ini](hik-f2b.example.ini) to `hik-f2b.ini`.
+2. Edit `hik-f2b.ini`. Addresses and thresholds go in the config.
+3. Put passwords in separate secret files. The config only points to them
+   (`password_file = ...`).
 
 The container image is published on GitHub's container registry as
-`ghcr.io/vladkarok/hik-f2b`, for `linux/amd64` and `linux/arm64` (the arm64
-image is built natively but has not been tried on real hardware). The deploy
-files use an exact version; fetch it with:
+`ghcr.io/vladkarok/hik-f2b`, for `linux/amd64` and `linux/arm64`. The arm64
+image is built natively but has not been tried on real hardware. The deploy
+files use an exact version. To get it, run:
 
 ```bash
 podman pull ghcr.io/vladkarok/hik-f2b:0.3.0
 ```
 
-How versions are tagged and how to update: see
+For how versions are tagged and how to update, see
 [Versions and updates](#versions-and-updates).
 
-**Building the image yourself** instead of pulling it: build it from the
-repository with the [Containerfile](Containerfile):
+**Building the image yourself** instead of pulling it: run this command in the
+repository. It uses the [Containerfile](Containerfile):
 
 ```bash
 podman build -t hik-f2b -f Containerfile .
 ```
 
-Podman then knows it as `localhost/hik-f2b:latest`. Put that name in the
-`Image=` line of the unit (or `image:` in the Compose file) and in the
-commands below; the deploy files have it as a commented-out line.
+Podman then knows the image as `localhost/hik-f2b:latest`. Put that name in
+these places:
+
+- the `Image=` line of the Quadlet unit (or `image:` in the Compose file);
+- the commands below.
+
+The deploy files have that name as a commented-out line.
 
 **Podman (rootless), recommended.** Use
 [deploy/hik-f2b.container](deploy/hik-f2b.container), a Quadlet unit (a file
-from which Podman generates a systemd service):
+from which Podman generates a systemd service).
+
+Inside the container hik-f2b runs as uid 65532. In a rootless container that
+user is not you. So it can read the config and the CA certificate only if they
+are world-readable. That is why the commands below make them `644`. They hold
+no secrets as long as the passwords come from Podman secrets (`password_file`).
+Do not put passwords inline in a world-readable config.
+
+Run these commands:
 
 ```bash
 mkdir -p ~/.config/hik-f2b ~/.config/containers/systemd
@@ -174,24 +201,21 @@ cp deploy/hik-f2b.container ~/.config/containers/systemd/
 systemctl --user daemon-reload
 ```
 
-Inside the container hik-f2b runs as uid 65532. In a rootless container that
-user is not you, so it can read the config and the CA certificate only if they
-are world-readable. That is why they are `644` here. They hold no secrets as
-long as the passwords come from Podman secrets (`password_file`). Do not put
-passwords inline in a world-readable config.
-
 **Docker Compose:** see [deploy/compose.yaml](deploy/compose.yaml).
-`docker compose pull` fetches the image it names. To build the image yourself,
-run `docker build -t hik-f2b -f Containerfile .` and use the commented-out
-`image: hik-f2b:latest` line.
+`docker compose pull` fetches the image it names. To build the image yourself:
+
+1. Run `docker build -t hik-f2b -f Containerfile .`.
+2. Use the commented-out `image: hik-f2b:latest` line.
 
 **No container:** the systemd unit
-[deploy/hik-f2b.service](deploy/hik-f2b.service) runs the binary in a sandbox
-and passes the secrets as systemd credentials. A plain `cargo build --release`
+[deploy/hik-f2b.service](deploy/hik-f2b.service) runs the binary in a sandbox.
+It passes the secrets as systemd credentials. A plain `cargo build --release`
 on a glibc system gives a dynamically linked binary. To get the same static
-binary as in the image, either copy it out of the image (Podman pulls the
-image for the host's architecture; use `localhost/hik-f2b:latest` for one you
-built yourself):
+binary as in the image, use one of these two ways.
+
+**Way 1: copy the binary out of the image.** Podman pulls the image for the
+host's architecture. For an image that you built yourself, use
+`localhost/hik-f2b:latest`. Run:
 
 ```bash
 podman create --name hik-f2b-copy ghcr.io/vladkarok/hik-f2b:0.3.0
@@ -199,15 +223,17 @@ podman cp hik-f2b-copy:/hik-f2b ./hik-f2b
 podman rm hik-f2b-copy
 ```
 
-or build for the musl target (`rustup target add x86_64-unknown-linux-musl`,
-then `cargo build --release --target x86_64-unknown-linux-musl`; the binary is
-in `target/x86_64-unknown-linux-musl/release/`). The musl build needs a C
-compiler for musl (the TLS library contains C code); this path has not been
-tested.
+**Way 2: build for the musl target.** This way needs a C compiler for musl,
+because the TLS library contains C code. This path has not been tested.
+
+1. Run `rustup target add x86_64-unknown-linux-musl`.
+2. Run `cargo build --release --target x86_64-unknown-linux-musl`.
+
+The binary is in `target/x86_64-unknown-linux-musl/release/`.
 
 ### 4. Verify before enabling
 
-Run these the same way you run the service. For the plain binary:
+Run these commands the same way as you run the service. For the plain binary:
 
 ```bash
 # Every NVR (login, clock, log search), the router and its drop rule,
@@ -230,7 +256,7 @@ hik-f2b --config hik-f2b.ini --country 203.0.113.1
 ```
 
 With rootless Podman, give the container the same config and secrets as the
-unit does, and put the options after the image name, for example:
+Quadlet unit does. Put the options after the image name. For example:
 
 ```bash
 podman run --rm --network host \
@@ -240,8 +266,11 @@ podman run --rm --network host \
   ghcr.io/vladkarok/hik-f2b:0.3.0 --dump --hours 72
 ```
 
-`--check` works the same way: put `--check` in place of `--dump --hours 72`.
-A healthy setup prints `ok` on every line, for example:
+To run `--check` in the container, put `--check` in place of
+`--dump --hours 72`. `--check` prints one line per part. In a healthy setup,
+every configured part prints `ok`. `off` marks a part that is not configured:
+Telegram, the country database, or the router in notify-only mode. `FAILED`
+marks a problem, and then `--check` exits non-zero. For example:
 
 ```
 ok       nvr nvr1: login accepted, device time 2026-01-10T10:00:00Z, log search works
@@ -250,14 +279,26 @@ off      telegram: not configured
 ok       country database: DBIP-Country-Lite, built 2026-11-01
 ```
 
-If failed logins are listed without `MATCH`, look at their `metaId` and adjust
-`log_filter`. If nothing is listed or the NVR answers `badXmlFormat`, rerun
-with `--raw` and open an issue with the output (remove addresses first).
+If the `--dump` output is not as expected:
+
+- If failed logins are listed without `MATCH`, look at their `metaId`. Then
+  adjust `log_filter`.
+- If nothing is listed, or the NVR answers `badXmlFormat`:
+  1. Run the command again with `--raw`.
+  2. Remove the addresses from the output.
+  3. Open an issue with the output.
+
 Entries flagged `AMBIG` have a repeated field and are never counted (see
 [Security design](#security-design)). `--dump` prints times as the NVR's own
 clock shows them.
 
 ### 5. Enable
+
+Run these commands in this order:
+
+1. Start the service.
+2. Let the service run without a login session.
+3. Follow the service log.
 
 ```bash
 systemctl --user start hik-f2b
@@ -265,11 +306,14 @@ loginctl enable-linger "$USER"
 journalctl --user -u hik-f2b -f
 ```
 
-At startup the log shows the mode (`mode: ban on MikroTik`, `mode: DRY RUN`
-or `mode: notify-only`) and, with a router, how many entries the address-list
-has and the result of the firewall check (`firewall check ok: ...` or
-`firewall check failed: ...`). With `country_db` set, it also names the
-country database or warns that it cannot be read.
+At startup the log shows:
+
+- the mode: `mode: ban on MikroTik`, `mode: DRY RUN` or `mode: notify-only`;
+- with a router, how many entries the address-list has;
+- with a router, the result of the firewall check (`firewall check ok: ...`
+  or `firewall check failed: ...`);
+- with `country_db` set, the name of the country database, or a warning that
+  it cannot be read.
 
 ## Versions and updates
 
@@ -287,11 +331,14 @@ as these image tags:
 Pin an exact version, as the deploy files do. Before 1.0, a new second number
 (`0.3` to `0.4`) may need changes to your config; the changelog says so.
 
-**Update:** read the changelog from your version up to the new one, try the
-new image with `--check` (put it in the `podman run` command from
-[Verify before enabling](#4-verify-before-enabling)), then change the tag in
-the `Image=` line of `~/.config/containers/systemd/hik-f2b.container`, pull
-and restart:
+**Update:**
+
+1. Read the changelog from your version up to the new one.
+2. Try the new image with `--check`. Put the new image in the `podman run`
+   command from [Verify before enabling](#4-verify-before-enabling).
+3. Change the tag in the `Image=` line of
+   `~/.config/containers/systemd/hik-f2b.container`.
+4. Run these commands to pull the new image and restart the service:
 
 ```bash
 podman pull ghcr.io/vladkarok/hik-f2b:<new version>
@@ -300,10 +347,14 @@ systemctl --user restart hik-f2b
 journalctl --user -u hik-f2b -f
 ```
 
-With Compose: change `image:`, then `docker compose pull` and
-`docker compose up -d`.
+With Compose:
 
-**Roll back:** the same steps with the previous tag. Old tags stay published.
+1. Change `image:`.
+2. Run `docker compose pull`.
+3. Run `docker compose up -d`.
+
+**Roll back:** do the same steps with the previous tag. Old tags stay
+published.
 
 Podman can also update a container by itself (`AutoUpdate=registry` in the
 unit with `podman-auto-update.timer`), and there are similar tools for Docker.
@@ -345,7 +396,7 @@ The default `ignoreip` is `127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12,
 192.168.0.0/16`. If you set `ignoreip`, repeat the private ranges you still
 need.
 
-Failures are counted across all configured NVRs together.
+Failed logins are counted across all configured NVRs together.
 
 Every password or token can be given as `<name>_file = /path` (preferred) or
 inline as `<name> = value`. If the config holds an inline secret and other
@@ -360,11 +411,12 @@ https, `ca_file` in the `[nvr:...]` section is the path of its CA certificate,
 and without it (or with `public`) the public roots are used.
 
 `check_rule` in the `[mikrotik]` section (default `true`) turns the check for
-the drop rule on or off, see [Health alerts](#health-alerts). Set it to
-`false` if the address-list is blocked some other way, for example by a rule
-that uses it as `dst-address-list` or on another device.
+the drop rule on or off, see [Health alerts](#health-alerts). If the
+address-list is blocked some other way, set it to `false`. Examples: a rule
+that uses the address-list as `dst-address-list`, or blocking on another
+device.
 
-A state file written by an older version (format 1) is ignored: the daemon
+A state file written by an older version (format 1) is ignored: hik-f2b
 starts fresh, watches each NVR log from the current time on, and the hourly
 ban counter starts at zero.
 
@@ -383,19 +435,21 @@ run an address is reported again after 24 hours at the earliest. Log lines and
 `{action}` say `banned permanently`; `{bantime}` is `permanent`. `--test-ban`
 always adds a 60-second entry.
 
-If the address is already in the list, the router refuses a second entry and
-hik-f2b counts the address as already banned; it does not change the existing
-entry. Whenever the router refuses an entry and the error is not the known
-duplicate message, hik-f2b asks the router whether the address is listed, so
-this does not depend on the wording of RouterOS error messages. An address that is still listed with a timeout when you switch to
-`permanent` therefore gets a permanent entry only the next time it is banned,
-after the timed entry has expired. Remove the timed entry by hand if you want
-that sooner.
+If the address is already in the address-list, the router refuses a second
+entry and hik-f2b counts the address as already banned; it does not change the
+existing entry. Whenever the router refuses an entry and the error is not the
+known duplicate message, hik-f2b asks the router whether the address is
+listed. So this does not depend on the wording of RouterOS error messages. An
+address that is still listed with a timeout when you switch to `permanent`
+therefore gets a permanent entry only the next time it is banned, after the
+timed entry has expired. If you want that sooner, remove the timed entry by
+hand.
 
 ### Telegram notifications
 
-Create a bot with [@BotFather](https://t.me/BotFather), add it to the chat, and
-add a `[telegram]` section:
+1. Create a bot with [@BotFather](https://t.me/BotFather).
+2. Add the bot to the chat.
+3. Add a `[telegram]` section to the config:
 
 ```ini
 [telegram]
@@ -405,10 +459,35 @@ message_thread_id = 42
 ```
 
 `chat_id` is a user, group or supergroup id (supergroups look like `-100…`) or
-`@channelname`. `message_thread_id` is the topic of a forum supergroup; leave
-it out for ordinary chats. `silent = true` delivers without sound, and
+`@channelname`. `message_thread_id` is the topic of a forum supergroup. For
+ordinary chats, leave it out. `silent = true` delivers without sound, and
 `enabled = false` turns the section off. `health_alerts = false` keeps
 [health alerts](#health-alerts) out of the chat; they still go to the log.
+
+With the Quadlet unit, give the container the bot token as a Podman secret:
+
+1. Create the Podman secret `hik-f2b-telegram` with the bot token:
+
+```bash
+printf '%s' 'BOT_TOKEN' | podman secret create hik-f2b-telegram -
+```
+
+2. Enable the `Secret=hik-f2b-telegram` line in
+   `~/.config/containers/systemd/hik-f2b.container`.
+3. Run `systemctl --user daemon-reload`.
+4. Restart the service with `systemctl --user restart hik-f2b`.
+5. Run `--test-notify` as in [Verify before enabling](#4-verify-before-enabling).
+   In the `podman run` command, add `--secret hik-f2b-telegram,uid=65532,mode=0400`.
+
+hik-f2b then prints `ok: test message sent`, and the test message appears in
+the chat.
+
+With Compose: `deploy/compose.yaml` has no entry for the bot token.
+
+Without a container: enable the
+`LoadCredential=telegram:/etc/hik-f2b/secrets/telegram` line in
+`deploy/hik-f2b.service`. Then set
+`bot_token_file = /run/credentials/hik-f2b.service/telegram`.
 
 The message text is set with `message`. `\n` starts a new line. Placeholders:
 `{ip}`, `{country}`, `{action}`, `{bantime}`, `{nvr}`, `{user}`, `{count}`,
@@ -416,8 +495,8 @@ The message text is set with `message`. `\n` starts a new line. Placeholders:
 `banned permanently`, `would be banned for 1d00:00:00 (dry run)`,
 `would be banned permanently (dry run)` or
 `detected, no firewall configured`. `{country}` is empty when there is no
-country (no `country_db`, or none found for the address), and otherwise a
-space followed by the flag and the code in brackets, ` (🇲🇩 MD)`, so write it
+country (no `country_db`, or none found for the address). Otherwise it is a
+space followed by the flag and the code in brackets, ` (🇲🇩 MD)`. So write it
 right after `{ip}`. A `message` of your own shows the country only if it
 contains `{country}`. The default message is:
 
@@ -431,9 +510,9 @@ Failed logins: {count} within {findtime} s
 The text is sent without a parse mode, so nothing in it is read as markup.
 
 A ban is applied before any notification is attempted. Notifications that
-fail are retried on later cycles, at most 5 attempts each; at most 100 wait at
+fail are retried on later polls, at most 5 attempts each; at most 100 wait at
 a time, and they are kept in memory only, so a restart loses them. An
-unreachable Telegram costs at most one 10-second timeout per cycle.
+unreachable Telegram costs at most one 10-second timeout per poll.
 
 ### Country of a banned address
 
@@ -458,12 +537,12 @@ Files that work:
   account needed. Tried.
 - MaxMind GeoLite2 Country (`GeoLite2-Country.mmdb`): free with a MaxMind
   account. Tried. Its licence asks you to replace the file within 30 days of
-  each new release, so set up updates if you use it. GeoLite2 City has the
+  each new release. If you use it, set up updates. GeoLite2 City has the
   same layout (`country` → `iso_code`) and is not tried.
 - IPinfo Lite: a top-level `country_code`. Supported by its schema, not tried.
 
 Only a code of exactly two capital letters is used. An address that is not in
-the file, or whose record holds anything else, simply has no country.
+the file, or whose record holds anything else, has no country.
 
 The file is opened at every ban and read with a few small reads, never loaded
 into memory, so replacing it needs no restart. If it is missing or cannot be
@@ -477,11 +556,16 @@ as its last line and exits non-zero when `country_db` is set but the file
 cannot be read. `--country 203.0.113.1` prints one address and its code (or
 `unknown`); it reads only the file and contacts nothing.
 
-To get the DB-IP Lite file, download the current month's file (the URL pattern
-is `https://download.db-ip.com/free/dbip-country-lite-YYYY-MM.mmdb.gz`) and
-unpack it into the config directory, which the Quadlet unit mounts read-only
-at `/etc/hik-f2b` (the systemd unit reads `/etc/hik-f2b` itself; Compose mounts
-single files, see the comment in [deploy/compose.yaml](deploy/compose.yaml)):
+To get the DB-IP Lite file, put it into the config directory. The Quadlet
+unit mounts this directory read-only at `/etc/hik-f2b`. The systemd unit reads
+`/etc/hik-f2b` itself. Compose mounts single files, see the comment in
+[deploy/compose.yaml](deploy/compose.yaml).
+
+1. Download the current month's file. The URL pattern is
+   `https://download.db-ip.com/free/dbip-country-lite-YYYY-MM.mmdb.gz`.
+2. Unpack the file into the config directory.
+
+These commands do steps 1 and 2:
 
 ```bash
 cd ~/.config/hik-f2b
@@ -492,13 +576,16 @@ curl -fsS "https://download.db-ip.com/free/dbip-country-lite-$month.mmdb.gz" \
   && mv country.mmdb.new country.mmdb
 ```
 
-Then set `country_db = /etc/hik-f2b/country.mmdb`. The file is world-readable
-(`644`) for the same reason as the config (see [Host](#3-host)). DB-IP
-publishes a new file every month; to update, run the same commands again, for
-example from cron a few days into each month (`0 6 3 * *`). The new file is
-written under a temporary name in the same directory and then renamed over
-the old one, so a ban never reads a half-written file, and a failed download
-leaves the old file in place.
+3. Set `country_db = /etc/hik-f2b/country.mmdb` in the config.
+
+The file is world-readable (`644`) for the same reason as the config (see
+[Host](#3-host)).
+
+DB-IP publishes a new file every month. To update the file, run the same
+commands again. For example, run them from cron a few days into each month
+(`0 6 3 * *`). The new file is written under a temporary name in the same
+directory and then renamed over the old one. So a ban never reads a
+half-written file, and a failed download leaves the old file in place.
 
 The DB-IP Lite data is licensed under CC BY 4.0, which asks for this
 attribution:
@@ -508,7 +595,7 @@ IP geolocation by [DB-IP](https://db-ip.com)
 ### Notify-only mode (no router)
 
 Leave out the `[mikrotik]` section. hik-f2b then bans nothing. When an address
-reaches `maxretry` failures within `findtime`, it logs a `DETECTED` line and,
+reaches `maxretry` failed logins within `findtime`, it logs a `DETECTED` line and,
 if `[telegram]` is configured, sends a message whose `{action}` is
 `detected, no firewall configured`. The address is not reported again until
 `bantime` has passed (24 hours with `bantime = permanent`). Reports count
@@ -530,8 +617,12 @@ bot_token_file = /run/secrets/hik-f2b-telegram
 chat_id        = -1001234567890
 ```
 
-With the Quadlet unit, remove the `Secret=hik-f2b-router` line and enable the
-`Secret=hik-f2b-telegram` line. `--test-ban` does not work in this mode.
+If you use the Quadlet unit:
+
+1. Remove the `Secret=hik-f2b-router` line.
+2. Enable the `Secret=hik-f2b-telegram` line.
+
+`--test-ban` does not work in this mode.
 
 With neither `[mikrotik]` nor `[telegram]`, detections are only written to the
 log, and hik-f2b warns about it at startup. A dry run (`dry_run = true`) also
@@ -553,14 +644,14 @@ and always in its log. It watches:
   startup and every 5 minutes.
 - **The drop rule:** no enabled rule in `/ip/firewall/raw` or
   `/ip/firewall/filter` has `src-address-list` set to `address_list`. Without
-  such a rule the list fills up and nothing is blocked. hik-f2b asks each table
-  for the rules with that `src-address-list`
+  such a rule the address-list fills up and nothing is blocked. hik-f2b asks
+  each table for the rules with that `src-address-list`
   (`GET /rest/ip/firewall/raw?src-address-list=cctv_ban&.proplist=.id,disabled`,
-  then the same for `filter`) and counts a rule as enabled unless the reply
+  then the same for `filter`). It counts a rule as enabled unless the reply
   says `"disabled":"true"`: RouterOS 7.18 leaves the `disabled` property out
-  of enabled `raw` rules altogether. The check does not look
-  at the rule's chain, interface or action, so a rule that matches the list
-  but accepts the traffic still passes. Turn the check off with
+  of enabled `raw` rules altogether. The check does not look at the rule's
+  chain, interface or action. So a rule that matches the address-list but
+  accepts the traffic still passes. To turn the check off, set
   `check_rule = false` in `[mikrotik]`.
 - **The ban rate limit:** addresses are waiting because `max_bans_per_hour` has
   been reached.
@@ -591,22 +682,22 @@ there is reported again once it has lasted `alert_after`.
 
 Health alerts cannot report that hik-f2b itself has stopped, crashed or hangs,
 or that its host is down or offline: then nothing is left to send a message.
-Watch the service from outside for that, for example with your monitoring
-system checking that the systemd unit or container is running.
+To detect this, watch the service from outside. For example, let your
+monitoring system check that the systemd unit or container is running.
 
 ## Time and clock changes
 
 Each NVR's log is in that device's local time. On every poll hik-f2b reads the
-NVR's clock and converts each failure to the host's clock with that NVR's
-current offset. So NVRs may have different clocks or time zones. Times in
+NVR's clock and converts the time of each failed login to the host's clock with
+that NVR's current offset. So NVRs may have different clocks or time zones. Times in
 hik-f2b's own log lines and in the router comment are host time in UTC. Lines
 marked "(device time)" and the output of `--dump` show the NVR's clock.
 
 If an NVR's clock goes back further than the `lookback` overlap (a DST change,
 a reset real-time clock), or jumps forward by more than 15 minutes, hik-f2b
 logs a warning, records the entries the log holds at that moment as already
-seen without counting them, and reads on from the new time. Failures in the
-short window around the jump are not counted. Smaller corrections are covered
+seen without counting them, and reads on from the new time. Failed logins in
+the short window around the jump are not counted. Smaller corrections are covered
 by the overlap.
 
 Entries older than `findtime` are never counted, and neither are entries more
@@ -619,32 +710,33 @@ than 5 minutes in the future (host time).
   HTTP (web interface, ISAPI) on both devices and from iVMS-4200 over the
   device (SDK) port on one. A wrong password and a user name that does not
   exist are both logged and count the same. Other firmware or client apps may
-  differ: make one deliberate mistake and look at `--dump` if it matters to
-  you.
-- The counter for an address empties once its failures are older than
+  differ. If this matters to you, make one failed login on purpose. Then look
+  at the `--dump` output.
+- The counter for an address empties once its failed logins are older than
   `findtime`.
 - LAN and hairpin-NAT clients, and VPN clients with private addresses, are
   covered by the default `ignoreip`. Some VPNs use 100.64.0.0/10 (Tailscale,
-  carrier-grade NAT), which the default does not cover. Add such ranges, and
-  your own public addresses (office, monitoring host), to `ignoreip`, keeping
-  the private ranges in the list.
+  carrier-grade NAT), which the default does not cover. Add such ranges to
+  `ignoreip`. Also add your own public addresses (office, monitoring host).
+  Keep the private ranges in `ignoreip`.
 - A client app with a stale saved password retries on its own and reaches the
-  threshold quickly. Update saved passwords right after changing one.
+  threshold quickly. After you change a password, update the saved password
+  in the client apps at once.
 - Mobile carriers put many subscribers behind one address (CGNAT). A ban on
   such an address can hit a legitimate user on the same carrier, which is a
   reason to keep `bantime` moderate.
 - `bantime = permanent` has a cost. Many attacking addresses are dynamic or
   shared (CGNAT, cloud and hosting ranges). Once the attacker has moved on, the
-  address can go to someone else, who is then shut out of your NVR, perhaps
-  months later. Nothing ever removes a permanent entry, so the list only grows
-  and you have to review and prune it by hand. The comment of each entry holds
-  the NVR, the user name tried and the time (UTC) of the failure that triggered
-  the ban.
-- To see the list on the router:
+  address can go to someone else, who then cannot reach your NVR, perhaps
+  months later. Nothing ever removes a permanent entry, so the address-list
+  only grows and you have to review and prune it by hand. The comment of each
+  entry holds the NVR, the user name tried and the time (UTC) of the failed
+  login that triggered the ban.
+- To see the address-list on the router, run:
   `/ip firewall address-list print where list=cctv_ban`
-- To lift a ban, remove the entry on the router:
+- To remove a ban, remove its entry on the router:
   `/ip firewall address-list remove [find list=cctv_ban address=X.X.X.X]`
-- To empty the whole list (timed and permanent bans):
+- To empty the whole address-list (timed and permanent bans), run:
   `/ip firewall address-list remove [find list=cctv_ban]`
 
 ## Security design
@@ -667,13 +759,15 @@ login is whatever they typed). It is built accordingly:
   than any real entry has) is skipped with a warning, and the rest of the page
   is still read.
 - **Markup in the user name.** Both tested firmware versions escape `<` in the
-  logged login name, but hik-f2b does not rely on that: a firmware that does
+  logged user name, but hik-f2b does not rely on that: a firmware that does
   not would let an attacker type XML elements. Elements inside the user-name
-  element are treated as part of the name, never as fields. An entry in which the address, time, user or type field appears more
-  than once is never counted (`--dump` lists it as `AMBIG`).
+  element are treated as part of the name, never as fields. An entry in which
+  the address, time, user or type field appears more than once is never
+  counted (`--dump` lists it as `AMBIG`).
 - **Limits.** One result page may be at most 512 KiB, and one poll reads at
   most 50 pages or 5000 entries per NVR. At most 10,000 addresses are tracked
-  (the one with the oldest failure is forgotten first), and at most 1000 bans
+  (the one whose latest failed login is the oldest is forgotten first), and at
+  most 1000 bans
   wait to be applied (the oldest is dropped). A ban that cannot be applied
   within `bantime` (24 hours for a permanent ban) is dropped.
   `max_bans_per_hour` limits new bans and is kept across restarts; an address
@@ -683,7 +777,7 @@ login is whatever they typed). It is built accordingly:
   `max_bans_per_hour` an hour.
 - **Never banned.** Networks in `ignoreip`, plus loopback (127.0.0.0/8),
   unspecified (0.0.0.0), broadcast (255.255.255.255), multicast, link-local
-  (169.254.0.0/16), 0.0.0.0/8 and 240.0.0.0/4 whatever the configuration says.
+  (169.254.0.0/16), 0.0.0.0/8 and 240.0.0.0/4 whatever the config says.
   Setting `ignoreip` replaces the default list instead of adding to it, so
   repeat the private ranges if you still want them exempt.
 - **TLS.** Certificate verification cannot be turned off. An https router URL
@@ -692,7 +786,7 @@ login is whatever they typed). It is built accordingly:
   Endpoints that receive a password or token must be https unless they are on
   this host. Redirects are not followed.
 - **Passwords.** Only Digest authentication is used towards an NVR; a Basic
-  challenge is never answered, even when the device offers both. The router's
+  challenge is never answered, even when the NVR offers both. The router's
   REST API uses Basic authentication, which is why it must be https. Secrets
   can come from files (`*_file`) or be written in the config; a warning is
   logged when a config with inline secrets is readable by other users. Secrets
@@ -722,19 +816,19 @@ What it does not protect against:
   that traffic can forge log entries and get arbitrary public addresses banned
   (no more than `max_bans_per_hour`; with `bantime = permanent` they stay
   until removed by hand). Because the drop rule works by source address on the
-  WAN side, a banned address is also cut off for your LAN. They can also
+  WAN side, a banned address is also blocked for your LAN. They can also
   capture a Digest exchange and try to guess the password offline. Keep the
-  host and the NVRs on a network you trust, or use https to the NVR where the
-  device supports it.
-- A firmware that both leaves `<` unescaped in the logged login name and
+  host and the NVRs on a network you trust. Or, if the NVR supports https, use
+  https to the NVR.
+- A firmware that both leaves `<` unescaped in the logged user name and
   stores names of roughly 150 characters or more. Such a name can form a
   complete, well-formed forged entry with another address in it, which the
-  rules above cannot tell from a real one. Both devices tested here escape `<`
+  rules above cannot tell from a real one. Both NVRs tested here escape `<`
   and cut the logged name to 15 characters, so they are not affected.
 - A ban is per address, so it also affects anyone sharing that address.
 
 Never attach your real config, router export or `--dump --raw` output to an
-issue without removing passwords and public addresses. To report a
+issue unchanged. First remove passwords and public addresses. To report a
 vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Limitations
@@ -743,7 +837,7 @@ vulnerability, see [SECURITY.md](SECURITY.md).
 - Detection lags by up to `poll_interval` seconds.
 - Timed bans are address-list entries with a timeout, which RouterOS does not
   keep across a reboot. After a router reboot an address is banned again once
-  it reaches `maxretry` new failures. Permanent bans (`bantime = permanent`)
+  it reaches `maxretry` new failed logins. Permanent bans (`bantime = permanent`)
   are static entries and survive a reboot.
 - Field names in log search results vary between firmware versions. hik-f2b
   looks for the time, address and user under several field names, but unusual
@@ -757,7 +851,7 @@ vulnerability, see [SECURITY.md](SECURITY.md).
   the address-list as `src-address-list`. A rule in the wrong chain, on the
   wrong interface or with an action that does not drop still passes it.
 - Health alerts need hik-f2b to be running. A stopped service or a host that
-  is down sends nothing; watch the unit from outside for that.
+  is down sends nothing. To detect this, watch the service from outside.
 
 ## Tested hardware
 
@@ -794,7 +888,7 @@ Not yet tried:
   GitHub's arm64 runner and the build checks that it prints its version, but
   it has not been run on real hardware.
 - A health alert on real devices. The checks behind the alerts were run with
-  `--check` against both NVRs and the router, where the rule check found
+  `--check` against both NVRs and the router, where the drop-rule check found
   enabled rules in `raw` and in `filter` and left a disabled one out; no real
   outage was provoked.
 - Notify-only mode on real devices.
@@ -812,15 +906,15 @@ What real devices showed:
 - A wrong password is logged with the user name that was tried. A user name
   that does not exist is logged as `illegal usernam` when it comes over the
   device port, and under the name itself over HTTP. Every entry is counted.
-- `<` and `>` in a login name are stored escaped, and the name is cut to 15
+- `<` and `>` in a user name are stored escaped, and the name is cut to 15
   characters (both firmware versions).
 - Timestamps are the device's local time with a `Z` suffix.
 - A page holds at most 64 entries regardless of `maxResults`.
 - An unknown log type in `meta_id` gives HTTP 400 on one firmware and an empty
   result on the other, so narrow `meta_id` only after `--dump` confirms it.
 
-If you run hik-f2b on other hardware, please open an issue or PR with your NVR
-model, firmware version and RouterOS version.
+If you run hik-f2b on other hardware, please open an issue or PR. Include your
+NVR model, firmware version and RouterOS version.
 
 ## Development
 

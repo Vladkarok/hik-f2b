@@ -15,7 +15,7 @@
 # The container runs as uid 65532, so the mounted files must be readable by
 # it. hik-f2b.ini and router-ca.crt hold no secrets when password_file is
 # used:  chmod 644 hik-f2b.ini router-ca.crt
-# The password files, with rootful Docker:
+# The secret files, with rootful Docker:
 #   chown 65532 secrets/* && chmod 400 secrets/*
 # Z relabels the files for SELinux; it has no effect where SELinux is off.
 

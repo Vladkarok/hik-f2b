@@ -19,7 +19,7 @@
 # Secrets are created once with:
 #   printf '%s' 'ROUTER_PASSWORD' | podman secret create hik-f2b-router -
 #   printf '%s' 'NVR_PASSWORD'    | podman secret create hik-f2b-nvr -
-# Notify-only mode (no [mikrotik] section): drop the hik-f2b-router line and
+# Notify-only mode (no [mikrotik] section): remove the hik-f2b-router line and
 # enable the hik-f2b-telegram one.
 
 [Unit]

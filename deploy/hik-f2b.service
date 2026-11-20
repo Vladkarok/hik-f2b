@@ -15,7 +15,7 @@
 #   password_file = /run/credentials/hik-f2b.service/router   (and .../nvr)
 # hik-f2b.ini and router-ca.crt are read by a dynamic user, so they must be
 # world-readable; they hold no secrets when password_file is used.
-# Notify-only mode (no [mikrotik] section): drop the router credential.
+# Notify-only mode (no [mikrotik] section): remove the router credential.
 
 [Unit]
 Description=hik-f2b: ban Hikvision NVR brute-forcers on MikroTik

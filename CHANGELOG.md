@@ -121,6 +121,11 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 - Dates that do not exist (such as 2026-02-31) are no longer read as times.
   An NVR whose clock is set before 1970 is reported with a clear error and
   is not read until its clock is set; its state survives a restart.
+- The error that ends hik-f2b, errors about the country database and the
+  reasons in health alerts showed every non-Latin letter as `?`, so a path
+  with Cyrillic letters could not be read. They now keep such letters;
+  control characters and characters that change how a line is shown are
+  still replaced.
 
 ### Changed
 

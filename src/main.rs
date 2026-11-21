@@ -409,10 +409,17 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            eprintln!("hik-f2b: {}", util::sanitize(&e, 300));
+            eprintln!("{}", fatal_message(&e));
             ExitCode::FAILURE
         }
     }
+}
+
+/// The last line before hik-f2b exits with an error. It goes to the
+/// operator only and may hold a path with non-Latin characters, so other
+/// Unicode stays; control and invisible characters do not.
+fn fatal_message(e: &str) -> String {
+    format!("hik-f2b: {}", util::printable(e, 300))
 }
 
 #[cfg(test)]
@@ -480,6 +487,22 @@ mod tests {
         assert_eq!(
             parse("--dump --hours").err().unwrap(),
             "--hours needs a value"
+        );
+    }
+
+    #[test]
+    fn fatal_message_keeps_unicode_but_not_control_characters() {
+        assert_eq!(
+            fatal_message("cannot read /etc/hik-f2b/конфіг.ini: not found"),
+            "hik-f2b: cannot read /etc/hik-f2b/конфіг.ini: not found"
+        );
+        assert_eq!(
+            fatal_message("bad\n\u{1b}[2J\u{202e}line"),
+            "hik-f2b: bad??[2J?line"
+        );
+        assert_eq!(
+            fatal_message(&"ж".repeat(500)),
+            format!("hik-f2b: {}", "ж".repeat(300))
         );
     }
 }

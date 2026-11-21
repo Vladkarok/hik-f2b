@@ -263,8 +263,13 @@ pub fn fmt_duration(seconds: u64) -> String {
 
 /// A reason fit for a chat message: every URL (`scheme://...`, which names
 /// a host, a port, a path and a query string) is replaced by `<url>`,
-/// wherever it stands: after a space, in brackets or quotes, after `=`. The
-/// rest is printable ASCII and short. An address with a port outside a URL
+/// wherever it stands: after a space, in brackets or quotes, after `=`.
+/// URLs are masked first, on the raw text. The rest is cut to `MAX_REASON`
+/// characters with `util::printable`: control and invisible characters
+/// become `?`, other Unicode stays (a path with Cyrillic letters is shown
+/// as it is). That is safe because a reason goes only to the hik-f2b log
+/// and to the Telegram message body, never to the router, an HTTP header
+/// or the state file. An address with a port outside a URL
 /// (`192.0.2.1:443` in a connection error) stays: it is the operator's own
 /// device, and the chat is the operator's. The error strings this gets
 /// never hold passwords or tokens: credentials travel in headers or form
@@ -307,7 +312,7 @@ pub fn clean_reason(text: &str) -> String {
         rest = &after[url.len()..];
     }
     out.push_str(rest);
-    util::sanitize(&out, MAX_REASON)
+    util::printable(&out, MAX_REASON)
 }
 
 /// The result of one item of `--check`.
@@ -500,8 +505,18 @@ mod tests {
             ),
             "<url>: Connection Failed: refused"
         );
-        assert_eq!(clean_reason("a\nb\u{442}"), "a?b?");
+        assert_eq!(clean_reason("a\nb\u{442}"), "a?b\u{442}");
+        assert_eq!(clean_reason("a\u{202e}b\u{200b}c\u{2028}d"), "a?b?c?d");
+        assert_eq!(
+            clean_reason("cannot read /var/lib/hik-f2b/стан.txt: denied"),
+            "cannot read /var/lib/hik-f2b/стан.txt: denied"
+        );
+        assert_eq!(
+            clean_reason("see https://192.0.2.1/шлях?x=1 for /etc/конфіг"),
+            "see <url> for /etc/конфіг"
+        );
         assert_eq!(clean_reason(&"x".repeat(500)).len(), MAX_REASON);
+        assert_eq!(clean_reason(&"ж".repeat(500)).chars().count(), MAX_REASON);
         let mut a = Alerts::new(AFTER);
         a.fail(Check::Firewall, "see https://192.0.2.1/x now", T0);
         assert_eq!(a.due(T0 + AFTER)[0].reason, "see <url> now");

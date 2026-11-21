@@ -133,8 +133,12 @@ fn open(path: &Path) -> Result<std::fs::File, String> {
         .map_err(|e| clean(format!("cannot read {}: {}", path.display(), e.kind())))
 }
 
+/// An error message for the operator (the hik-f2b log, `--check`, stderr).
+/// It holds fixed text and the configured path, never text from the file,
+/// so other Unicode stays and a path with Cyrillic letters is shown as it
+/// is; control and invisible characters do not.
 fn clean(e: String) -> String {
-    util::sanitize(&e, MAX_ERROR)
+    util::printable(&e, MAX_ERROR)
 }
 
 fn damaged(what: &str) -> String {
@@ -1206,5 +1210,26 @@ mod tests {
             .built(),
             "9999-12-31"
         );
+    }
+
+    #[test]
+    fn error_paths_keep_unicode_but_not_control_characters() {
+        let e = lookup(Path::new("/nonexistent/бази/країни.mmdb"), ip("192.0.2.1")).unwrap_err();
+        assert!(
+            e.starts_with("cannot read /nonexistent/бази/країни.mmdb: "),
+            "{}",
+            e
+        );
+        let e = info(Path::new("/nonexistent/a\u{1b}[2J\u{202e}b.mmdb")).unwrap_err();
+        assert!(
+            e.starts_with("cannot read /nonexistent/a?[2J?b.mmdb: "),
+            "{}",
+            e
+        );
+        // The type comes from the file: printable ASCII only, as before.
+        let mut b = Builder::new(24, 4);
+        b.database_type = "Країни".to_string();
+        let i = info_from(Cursor::new(b.build())).unwrap();
+        assert_eq!(i.database_type, "??????");
     }
 }

@@ -16,13 +16,21 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   It stops at the first failed step (`--keep-going` runs them all), prints
   a summary with the time each step took, and finds cargo in
   `~/.cargo/bin` when it is not on PATH.
-- `.github/workflows/sim.yml` runs the simulation test with 1500 seeds per
+- `.github/workflows/sim.yml` runs the simulation test with 4000 seeds per
   class in release mode every Sunday, or by hand with
   `gh workflow run sim.yml -f seeds=N -f start=S`. Without a start, the
   seeds come from the run number, so that no run repeats the seeds of
   another. A violation fails the run; the job summary lists the seed, the
   class and the replay command. The steps are in
   `.github/scripts/sim-long.sh`, which can also be run locally.
+
+### Fixed
+
+- The tests' fake servers kept running after a test ended, each with its
+  listening socket, so a long simulation run (4000 seeds per class on
+  GitHub) reached the system's limit and could not start the next one; they
+  now stop with the test, and `tests/fake_leak.rs` and the simulation check
+  that.
 
 ## [0.4.0] - 2026-11-21
 

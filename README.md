@@ -822,7 +822,8 @@ login is whatever they typed). It is built accordingly:
   and reduced to printable ASCII before they reach a log line, the router or
   Telegram. Request bodies are built with escaping, Telegram messages are sent
   without a parse mode, and control characters never reach the log. Invalid
-  UTF-8 and characters that XML forbids are replaced. Each log entry is parsed
+  UTF-8 and characters that XML forbids are replaced, and a bare `&` is read
+  as text. Each log entry is parsed
   on its own: one that cannot be parsed (not well-formed XML, or more markup
   than any real entry has) is skipped with a warning, and the rest of the page
   is still read.
@@ -840,7 +841,10 @@ login is whatever they typed). It is built accordingly:
   with further searches, at most 4 searches per NVR and poll. Each entry is
   counted once, also when a search stops in the middle of a second. Entries
   that 4 searches cannot reach are skipped with an ERROR line that gives
-  their time range. At most 10,000 addresses are tracked
+  their time range. A search that gets the same page twice (the NVR ignores
+  the search position) is handled like one that stopped at the cap. A page
+  without a paging status that hik-f2b knows is never taken for the last
+  page. At most 10,000 addresses are tracked
   (the one whose latest failed login is the oldest is forgotten first), and at
   most 1000 bans
   wait to be applied (the oldest is dropped). A ban that cannot be applied
@@ -922,6 +926,11 @@ vulnerability, see [SECURITY.md](SECURITY.md).
 - Field names in log search results vary between firmware versions. hik-f2b
   looks for the time, address and user under several field names, but unusual
   firmware may need a `log_filter` or `meta_id` change.
+- A firmware that does not escape `<` in the logged user name: a user name
+  with `<` can make its entry unreadable. Such an entry is skipped with a
+  WARNING line that names the NVR, and its failed login is not counted. So
+  an attacker on such a firmware could avoid a ban. Both tested firmware
+  versions escape `<`.
 - If the NVR answers but its log cannot be read 10 polls in a row, hik-f2b
   skips the unreadable stretch of the log with an ERROR line; failed logins in
   it are not counted.

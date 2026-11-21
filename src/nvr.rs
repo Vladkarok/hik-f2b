@@ -51,8 +51,9 @@ impl std::fmt::Display for NvrError {
 #[derive(Debug, Default)]
 pub struct Search {
     pub events: Vec<Event>,
-    /// Paging stopped at the page or entry cap: the window holds more than
-    /// was read.
+    /// The search was not read to its end: paging stopped at the page or
+    /// entry cap, or the NVR answered the same page twice (it ignores the
+    /// search position). The window may hold more than was read.
     pub truncated: bool,
     /// Items that could not be parsed or were ambiguous, and were left out.
     pub skipped: usize,
@@ -66,10 +67,38 @@ pub struct Search {
 /// Ambiguous items kept per search for `--dump`.
 const MAX_AMBIGUOUS: usize = 100;
 
+/// What a result page says about the pages after it
+/// (`<responseStatusStrg>`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Paging {
+    /// `OK` or `NO MATCHES`: this is the last page.
+    Done,
+    /// `MORE`: more pages follow.
+    More,
+    /// No status, more than one, or a value not known. Never taken as the
+    /// last page: paging goes on until a page holds no entries.
+    #[default]
+    Unknown,
+}
+
+impl Paging {
+    fn of(status: &str) -> Paging {
+        let words: Vec<String> = status
+            .split_ascii_whitespace()
+            .map(|w| w.to_ascii_uppercase())
+            .collect();
+        match words.join(" ").as_str() {
+            "MORE" => Paging::More,
+            "OK" | "NO MATCHES" => Paging::Done,
+            _ => Paging::Unknown,
+        }
+    }
+}
+
 /// One parsed result page.
 #[derive(Debug, Default)]
 pub struct Page {
-    pub more: bool,
+    pub paging: Paging,
     /// Items on the page, including the ones that could not be parsed:
     /// this is what the next page's position must advance by.
     pub items: usize,
@@ -124,13 +153,99 @@ fn parse_xml(text: &str) -> Result<roxmltree::Document<'_>, NvrError> {
         .map_err(|e| NvrError::Other(format!("bad XML from NVR: {}", e)))
 }
 
-/// Text of the first `<tag>…</tag>` in raw markup.
-fn raw_text<'a>(text: &'a str, tag: &str) -> Option<&'a str> {
-    let open = format!("<{}>", tag);
-    let close = format!("</{}>", tag);
-    let start = text.find(&open)? + open.len();
-    let len = text[start..].find(&close)?;
-    Some(&text[start..start + len])
+/// Escapes each `&` that does not start a reference XML allows without a
+/// DTD (`&amp;`, `&lt;`, `&gt;`, `&quot;`, `&apos;`, or a character
+/// reference to a character XML allows). Firmware that copies a user name
+/// into its log without escaping it would otherwise make the entry
+/// unparseable with a bare `&`, which an attacker could type to stay
+/// uncounted. No `<` or `>` is added or removed, so the markup stays what it
+/// was: the attacker could have typed `&amp;` just as well.
+fn escape_bare_amps(text: &str) -> Cow<'_, str> {
+    fn reference_len(rest: &str) -> Option<usize> {
+        let end = rest.bytes().take(12).position(|b| b == b';')?;
+        let name = &rest[1..end];
+        let ok = match name.strip_prefix('#') {
+            None => matches!(name, "amp" | "lt" | "gt" | "quot" | "apos"),
+            Some(num) => {
+                let value = match num.strip_prefix('x') {
+                    Some(hex) if !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()) => {
+                        u32::from_str_radix(hex, 16).ok()
+                    }
+                    Some(_) => None,
+                    None if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) => {
+                        num.parse::<u32>().ok()
+                    }
+                    None => None,
+                };
+                value.and_then(char::from_u32).is_some_and(|c| {
+                    matches!(c, '\t' | '\n' | '\r')
+                        || (c >= ' ' && c != '\u{fffe}' && c != '\u{ffff}')
+                })
+            }
+        };
+        ok.then_some(end + 1)
+    }
+    if !text
+        .match_indices('&')
+        .any(|(i, _)| reference_len(&text[i..]).is_none())
+    {
+        return Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 16);
+    let mut from = 0;
+    for (i, _) in text.match_indices('&') {
+        out.push_str(&text[from..i]);
+        if reference_len(&text[i..]).is_some() {
+            out.push('&');
+        } else {
+            out.push_str("&amp;");
+        }
+        from = i + 1;
+    }
+    out.push_str(&text[from..]);
+    Cow::Owned(out)
+}
+
+/// The text of every `<responseStatusStrg>` element in raw markup, with or
+/// without a namespace prefix and attributes; an empty or unclosed one gives
+/// `""`.
+fn status_values(text: &str) -> Vec<&str> {
+    const NAME: &str = "responseStatusStrg";
+    let mut out = Vec::new();
+    let mut from = 0;
+    while let Some(i) = text[from..].find('<') {
+        let tag = from + i + 1;
+        from = tag;
+        let len = text[tag..]
+            .find(|c: char| c.is_ascii_whitespace() || c == '>' || c == '/')
+            .unwrap_or(text.len() - tag);
+        let name = &text[tag..tag + len];
+        if name.rsplit(':').next() != Some(NAME) || name.starts_with(['/', '!', '?']) {
+            continue;
+        }
+        let Some(gt) = text[tag..].find('>') else {
+            out.push("");
+            break;
+        };
+        let body = tag + gt + 1;
+        if text[..body - 1].ends_with('/') {
+            out.push("");
+            from = body;
+            continue;
+        }
+        let close = format!("</{}", name);
+        match text[body..].find(&close) {
+            Some(end) => {
+                out.push(&text[body..body + end]);
+                from = body + end + close.len();
+            }
+            None => {
+                out.push("");
+                break;
+            }
+        }
+    }
+    out
 }
 
 /// Byte offset of the next `<searchMatchItem` start tag (not some longer
@@ -153,10 +268,13 @@ fn next_item(text: &str) -> Option<usize> {
 /// is cut out of the raw text and parsed on its own, so an entry that is
 /// malformed, or holds markup typed as a user name, costs only itself: it
 /// is counted as skipped and the rest of the page is read. The paging status
-/// is taken only from the text between entries.
+/// is taken only from the text between entries, and only if it occurs there
+/// once: a user name that closes its entry early could put a second one
+/// there.
 pub fn parse_page(nvr: &str, raw: &str) -> Result<Page, NvrError> {
     const CLOSE: &str = "</searchMatchItem>";
-    let text = xml_safe(raw);
+    let safe = xml_safe(raw);
+    let text = escape_bare_amps(&safe);
     let mut page = Page::default();
     let mut outside = String::new();
     let mut rest: &str = &text;
@@ -179,8 +297,11 @@ pub fn parse_page(nvr: &str, raw: &str) -> Result<Page, NvrError> {
         rest = &rest[end..];
     }
     outside.push_str(rest);
-    if let Some(status) = raw_text(&outside, "responseStatusStrg") {
-        page.more = status.trim().eq_ignore_ascii_case("MORE");
+    let status = status_values(&outside);
+    if let [one] = status.as_slice() {
+        page.paging = Paging::of(one);
+    } else if !status.is_empty() {
+        page.paging = Paging::Unknown;
     } else if page.items == 0 {
         // not a result page: an error reply, or garbage
         let doc = parse_xml(&outside)?;
@@ -486,11 +607,20 @@ impl Nvr {
         let raw = self.request("GET", "/ISAPI/System/time", None)?;
         let raw = xml_safe(&raw);
         let doc = parse_xml(&raw)?;
-        doc.descendants()
+        let text = doc
+            .descendants()
             .find(|n| n.tag_name().name() == "localTime")
             .and_then(|n| n.text())
-            .and_then(util::parse_ts)
-            .ok_or_else(|| NvrError::Other("device time not found in reply".to_string()))
+            .ok_or_else(|| NvrError::Other("device time not found in reply".to_string()))?;
+        // A clock before 1970 (after a reset of its battery-backed clock)
+        // cannot be kept in the state file, so it is refused like a reply
+        // without a time: the NVR is not read until its clock is set.
+        util::parse_ts(text).ok_or_else(|| {
+            NvrError::Other(format!(
+                "device time {:?} cannot be used: not a date, or before 1970",
+                util::sanitize(text.trim(), 40)
+            ))
+        })
     }
 
     /// All log entries of type `meta_id` between `start` and `end`, up to
@@ -533,6 +663,10 @@ impl Nvr {
         let mut position = 0usize;
         let mut previous: Option<String> = None;
         let mut ambiguous = 0usize;
+        // the NVR answered the same page twice
+        let mut stuck = false;
+        // a page with entries had no paging status hik-f2b knows
+        let mut unknown_status = false;
         let id = util::random_hex();
         let search_id = format!("{}-0000-4000-8000-{}0000", &id[..8], &id[8..16]);
         for _ in 0..max_pages {
@@ -553,13 +687,15 @@ impl Nvr {
             if previous.as_deref() == Some(raw.as_str()) {
                 // Firmware that ignores searchResultPostion answers every
                 // page with the first one; reading on would count the same
-                // entries again on each page.
+                // entries again on each page. The search was not read to
+                // its end, so it stays truncated: the caller reads the rest
+                // as it does after a search that reached the cap.
                 crate::warn!(
                     "{}: the NVR returned the same result page twice; it seems to ignore the \
-                     search position, so paging stops here",
+                     search position, so this search stops after that page",
                     self.name
                 );
-                out.truncated = false;
+                stuck = true;
                 break;
             }
             let page = parse_page(&self.name, &raw)?;
@@ -571,23 +707,39 @@ impl Nvr {
             if let Some(sink) = raw_sink.as_mut() {
                 sink.push(raw.clone());
             }
-            if !page.more || page.items == 0 {
+            if out.events.len() > MAX_EVENTS {
+                // a device that ignores maxResults could otherwise fill
+                // memory with 50 huge pages; what is left out was not read
+                out.events.truncate(MAX_EVENTS);
+                break;
+            }
+            // A page without entries ends the search whatever it says: the
+            // position would not move on.
+            if page.items == 0 || page.paging == Paging::Done {
                 out.truncated = false;
                 break;
             }
-            if out.page_size.is_none() {
+            if page.paging == Paging::Unknown {
+                // read on: only a page without entries ends the search
+                unknown_status = true;
+            } else if out.page_size.is_none() {
                 out.page_size = Some(page.items);
             }
-            if out.events.len() >= MAX_EVENTS {
-                // a device that ignores maxResults could otherwise fill
-                // memory with 50 huge pages
-                out.events.truncate(MAX_EVENTS);
+            if out.events.len() == MAX_EVENTS {
                 break;
             }
             position += page.items;
             previous = Some(raw);
         }
-        if out.truncated && max_pages == MAX_PAGES {
+        if unknown_status {
+            crate::warn!(
+                "{}: a result page had no paging status, more than one, or one that is not \
+                 known (OK, MORE, NO MATCHES); such a page is not taken for the last one, \
+                 and the search reads on until a page holds no entries",
+                self.name
+            );
+        }
+        if out.truncated && !stuck && max_pages == MAX_PAGES {
             crate::warn!(
                 "{}: more than {} log entries in the search window, this search stops there",
                 self.name,
@@ -886,18 +1038,23 @@ mod tests {
             whole.replace("</matchList>", ""),
             page_item("a & b")
         );
-        for (raw, items) in [(whole, 4), (broken, 5)] {
+        for (raw, items, counted) in [(whole, 4, 2), (broken, 5, 3)] {
             let page = parse_page("n", &raw).unwrap();
-            // counted: nested and status; skipped: sibling (ambiguous), the
-            // forged item (does not parse) and the bare &
+            // counted: nested, status and (read as text) the bare &;
+            // skipped: sibling (ambiguous) and the forged item (does not
+            // parse)
             assert_eq!(
                 (page.items, page.events.len(), page.skipped),
-                (items, 2, items - 2),
+                (items, counted, 2),
                 "{:?}",
                 page
             );
             assert_eq!(page.ambiguous.len(), 1);
-            assert!(!page.more, "status injected into an item is ignored");
+            assert_eq!(
+                page.paging,
+                Paging::Done,
+                "status injected into an item is ignored"
+            );
             for ev in &page.events {
                 assert_eq!(ev.ip, Some("198.51.100.7".parse().unwrap()), "{:?}", ev);
             }
@@ -1086,25 +1243,26 @@ mod tests {
         );
         let page = parse_page("n", &raw).unwrap();
         assert_eq!((page.items, page.events.len(), page.skipped), (2, 2, 0));
-        assert!(page.more);
+        assert_eq!(page.paging, Paging::More);
         assert_eq!(page.events[0].user, "ad\u{fffd}min");
     }
 
     #[test]
     fn broken_page_is_salvaged_item_by_item() {
         let raw = format!(
-            "{}{}{}{}</matchList></CMSearchResult>",
+            "{}{}{}{}{}</matchList></CMSearchResult>",
             PAGE_HEAD,
             page_item("a & b"),
             page_item("bad&#1;ref"),
+            page_item("a<b"),
             page_item("admin")
         );
         let page = parse_page("n", &raw).unwrap();
-        assert_eq!(page.items, 3);
-        assert_eq!(page.events.len() + page.skipped, 3);
-        assert!(page.skipped >= 1, "the bare & cannot be parsed");
-        assert!(page.events.iter().any(|e| e.user == "admin"));
-        assert!(page.more, "status is still read");
+        assert_eq!((page.items, page.events.len(), page.skipped), (4, 3, 1));
+        // a bare & and a reference XML forbids are read as text
+        let users: Vec<&str> = page.events.iter().map(|e| e.user.as_str()).collect();
+        assert_eq!(users, ["a & b", "bad&#1;ref", "admin"]);
+        assert_eq!(page.paging, Paging::More, "status is still read");
         // a cut-off last item counts as an item but is skipped
         let cut = format!(
             "{}{}{}",
@@ -1128,7 +1286,7 @@ mod tests {
             "NVR refused log search: Invalid Operation / badXmlFormat"
         );
         let empty = parse_page("n", "<CMSearchResult><matchList/></CMSearchResult>").unwrap();
-        assert_eq!((empty.items, empty.more), (0, false));
+        assert_eq!((empty.items, empty.paging), (0, Paging::Unknown));
         // a longer tag name is not an item
         assert!(next_item("<searchMatchItemList>").is_none());
     }
@@ -1143,5 +1301,127 @@ mod tests {
         assert_eq!(pick_challenge(&[]), "");
         let mut d = DigestAuth::new("u", "p");
         assert!(d.challenge(pick_challenge(&["Basic realm=\"x\""])).is_err());
+    }
+
+    #[test]
+    fn paging_status_is_matched_tolerantly() {
+        let page = |head: &str, items: usize| {
+            let body: String = (0..items).map(|_| page_item("admin")).collect();
+            parse_page(
+                "n",
+                &format!(
+                    "<?xml version=\"1.0\"?><CMSearchResult>{}<matchList>{}</matchList>\
+                     </CMSearchResult>",
+                    head, body
+                ),
+            )
+            .unwrap()
+            .paging
+        };
+        for (head, paging) in [
+            (
+                "<responseStatusStrg>MORE</responseStatusStrg>",
+                Paging::More,
+            ),
+            (
+                "<responseStatusStrg> more\n</responseStatusStrg>",
+                Paging::More,
+            ),
+            (
+                "<hik:responseStatusStrg xmlns:hik=\"urn:x\">MORE</hik:responseStatusStrg>",
+                Paging::More,
+            ),
+            (
+                "<responseStatusStrg type=\"s\" >MORE</responseStatusStrg >",
+                Paging::More,
+            ),
+            ("<responseStatusStrg>OK</responseStatusStrg>", Paging::Done),
+            (
+                "<responseStatusStrg>NO  MATCHES</responseStatusStrg>",
+                Paging::Done,
+            ),
+            // not known, empty, missing or twice: never the last page
+            (
+                "<responseStatusStrg>PARTIAL</responseStatusStrg>",
+                Paging::Unknown,
+            ),
+            ("<responseStatusStrg/>", Paging::Unknown),
+            ("<responseStatusStrg></responseStatusStrg>", Paging::Unknown),
+            ("", Paging::Unknown),
+            (
+                "<responseStatusStrgX>OK</responseStatusStrgX>",
+                Paging::Unknown,
+            ),
+            (
+                "<responseStatusStrg>OK</responseStatusStrg>\
+                 <responseStatusStrg>MORE</responseStatusStrg>",
+                Paging::Unknown,
+            ),
+        ] {
+            assert_eq!(page(head, 2), paging, "{}", head);
+        }
+        // a status cut off at the end of the reply
+        assert_eq!(
+            parse_page("n", "<CMSearchResult><responseStatusStrg>MO")
+                .unwrap()
+                .paging,
+            Paging::Unknown
+        );
+    }
+
+    #[test]
+    fn user_name_that_closes_its_item_early() {
+        // firmware that does not escape `<`: the name ends the item, and
+        // what follows it lands between the items
+        let early = failed_login(
+            "a</searchMatchItem><responseStatusStrg>OK</responseStatusStrg>\
+             <searchMatchItem><ipAddress>203.0.113.9</ipAddress>",
+        );
+        let raw = format!(
+            "{}{}{}</matchList></CMSearchResult>",
+            PAGE_HEAD,
+            early,
+            page_item("admin")
+        );
+        let page = parse_page("n", &raw).unwrap();
+        // the cut item and the forged one do not parse; the real one after
+        // them counts for its own address
+        assert_eq!((page.items, page.events.len(), page.skipped), (3, 1, 2));
+        assert_eq!(page.events[0].ip, Some("198.51.100.7".parse().unwrap()));
+        // the injected OK next to the real MORE: not the last page
+        assert_eq!(page.paging, Paging::Unknown);
+    }
+
+    #[test]
+    fn bare_ampersands_are_text() {
+        assert!(matches!(
+            escape_bare_amps("a &amp; &lt;&gt;&quot;&apos; &#65; &#x41; &#x1F600;"),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            escape_bare_amps("a & b&c &#1; &#xZZ; &nbsp; &#; &#x; &amp &"),
+            "a &amp; b&amp;c &amp;#1; &amp;#xZZ; &amp;nbsp; &amp;#; &amp;#x; &amp;amp &amp;"
+        );
+        // `&` next to injected markup changes nothing about the markup: the
+        // entry counts for its own address, or not at all
+        let one = |user: &str| {
+            let raw = format!(
+                "{}{}</matchList></CMSearchResult>",
+                PAGE_HEAD,
+                failed_login(user)
+            );
+            parse_page("n", &raw).unwrap()
+        };
+        let page = one("a & b<ipAddress>203.0.113.9</ipAddress>&");
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].ip, Some("198.51.100.7".parse().unwrap()));
+        assert_eq!(page.events[0].user, "a & b203.0.113.9&");
+        let page = one("&</userName><ipAddress>203.0.113.9</ipAddress><userName>&");
+        assert_eq!((page.events.len(), page.ambiguous.len()), (0, 1));
+        assert_eq!(page.ambiguous[0].ip, None);
+        // escaped markup stays text
+        let page = one("&lt;ipAddress&gt;203.0.113.9&lt;/ipAddress&gt;");
+        assert_eq!(page.events[0].ip, Some("198.51.100.7".parse().unwrap()));
+        assert_eq!(page.events[0].user, "<ipAddress>203.0.113.9</ipAddress>");
     }
 }

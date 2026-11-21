@@ -156,7 +156,7 @@ image is built natively but has not been tried on real hardware. The deploy
 files use an exact version. To get it, run:
 
 ```bash
-podman pull ghcr.io/vladkarok/hik-f2b:0.3.2
+podman pull ghcr.io/vladkarok/hik-f2b:0.3.3
 ```
 
 For how versions are tagged and how to update, see
@@ -224,7 +224,7 @@ host's architecture. For an image that you built yourself, use
 `localhost/hik-f2b:latest`. Run:
 
 ```bash
-podman create --name hik-f2b-copy ghcr.io/vladkarok/hik-f2b:0.3.2
+podman create --name hik-f2b-copy ghcr.io/vladkarok/hik-f2b:0.3.3
 podman cp hik-f2b-copy:/hik-f2b ./hik-f2b
 podman rm hik-f2b-copy
 ```
@@ -269,7 +269,7 @@ podman run --rm --network host \
   -v ~/.config/hik-f2b:/etc/hik-f2b:ro,Z \
   --secret hik-f2b-router,uid=65532,mode=0400 \
   --secret hik-f2b-nvr,uid=65532,mode=0400 \
-  ghcr.io/vladkarok/hik-f2b:0.3.2 --dump --hours 72
+  ghcr.io/vladkarok/hik-f2b:0.3.3 --dump --hours 72
 ```
 
 To run `--check` in the container, put `--check` in place of
@@ -299,6 +299,11 @@ report a problem.
 `--check` only reads from the router, so it cannot show whether the router
 accepts a ban. A router user whose group has no `write` policy passes
 `--check`, but every ban fails. To try the write access, run `--test-ban`.
+
+`--dump` prints what it reads from each NVR. An NVR that cannot be read gets
+an `ERROR:` line on stderr, and `--dump` then exits non-zero. Use one of
+`--check`, `--dump`, `--test-ban`, `--test-notify` and `--country` at a time;
+`hik-f2b --help` lists which options work together.
 
 If the `--dump` output is not as expected:
 
@@ -330,9 +335,10 @@ journalctl --user -u hik-f2b -f
 At startup the log shows:
 
 - the mode: `mode: ban on MikroTik`, `mode: DRY RUN` or `mode: notify-only`;
-- with a router, how many entries the address-list has;
 - with a router, the result of the firewall check (`firewall check ok: ...`
   or `firewall check failed: ...`);
+- with a router that answered the check, how many entries the address-list
+  has;
 - with `country_db` set, the name of the country database, or a warning that
   it cannot be read.
 
@@ -344,10 +350,10 @@ as these image tags:
 
 | Tag | Meaning |
 | --- | --- |
-| `0.3.2` | Exactly this release. It never changes. Use this one. |
+| `0.3.3` | Exactly this release. It never changes. Use this one. |
 | `0.3` | The newest `0.3.x` release; moves with every bug-fix release. |
 | `latest` | The newest release; moves with every release, including ones that need config changes. |
-| `0.3.2-rc.1` | A release candidate, for trying out before `0.3.2`. Never `latest`, never `0.3`. |
+| `0.3.3-rc.1` | A release candidate, for trying out before `0.3.3`. Never `latest`, never `0.3`. |
 
 Pin an exact version, as the deploy files do. Before 1.0, a new second number
 (`0.3` to `0.4`) may need changes to your config; the changelog says so.
@@ -393,7 +399,7 @@ See [hik-f2b.example.ini](hik-f2b.example.ini). The settings in `[general]`:
 | --- | --- | --- | --- |
 | `maxretry` | 5 | 1–1000 | Failed-login log entries that trigger a ban. |
 | `findtime` | 3600 | 10–2592000 | Window in which they must happen. |
-| `bantime` | 86400 | 60–31536000 or `permanent` | Ban length; the router expires the entry itself. `permanent`: see [Permanent bans](#permanent-bans). |
+| `bantime` | 86400 | 60–21474836 or `permanent` | Ban length; the router expires the entry itself. `permanent`: see [Permanent bans](#permanent-bans). |
 | `ignoreip` | private ranges | | Addresses and networks that are never banned. Setting it replaces the default list. |
 | `max_bans_per_hour` | 20 | 1–10000 | Upper limit on new bans (or reports) per hour. |
 | `poll_interval` | 30 | 5–3600 | Time between log polls. |
@@ -410,8 +416,17 @@ The time settings (`findtime`, `bantime`, `poll_interval`, `lookback`,
 `auth_backoff`, `alert_after`) are in seconds, or a whole number with one suffix: `s`, `m`,
 `h`, `d` or `w` (seconds, minutes, hours, days, weeks), for example `10m`,
 `12h` or `7d`. A plain number is seconds. The limits in the table are in
-seconds and are checked after the conversion, so `365d` is the longest timed
-ban.
+seconds and are checked after the conversion. The longest timed ban is
+21474836 seconds (`248d` in whole days): the longest timeout RouterOS accepts
+for an address-list entry (35w3d13h13m56s). For a longer ban, use
+`bantime = permanent`. The same limit applies in notify-only mode.
+
+hik-f2b knows every setting in the table above, the settings of the other
+sections described below, and nothing else. A setting it does not know, for
+example a typo such as `ignore_ip` or `dryrun`, is an error. So is a setting
+that appears twice in one section, and an empty `state_file`. hik-f2b then
+does not start. The error names the line and, if a known setting is close,
+the setting you probably meant.
 
 The default `ignoreip` is `127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12,
 192.168.0.0/16`. If you set `ignoreip`, repeat the private ranges you still
@@ -420,8 +435,9 @@ need.
 Failed logins are counted across all configured NVRs together.
 
 Every password or token can be given as `<name>_file = /path` (preferred) or
-inline as `<name> = value`. If the config holds an inline secret and other
-users can read it, hik-f2b logs a warning at startup.
+inline as `<name> = value`. hik-f2b logs a warning at startup if the config
+holds an inline secret and its group or other users can read it. It also
+warns about each secret file that its group or other users can read.
 
 `ca_file` in the `[mikrotik]` section is required when the router URL is
 https. It is either the path of the CA certificate that signed the router's
@@ -437,9 +453,15 @@ address-list is blocked some other way, set it to `false`. Examples: a rule
 that uses the address-list as `dst-address-list`, or blocking on another
 device.
 
-A state file written by an older version (format 1) is ignored: hik-f2b
-starts fresh, watches each NVR log from the current time on, and the hourly
-ban counter starts at zero.
+hik-f2b does not use a state file that was written by an older version
+(format 1), whose first line is damaged, that cannot be read or that is
+larger than 16 MiB. It logs a WARNING that says why and renames the file to
+`<state_file>.unusable-<Unix time>`, because the file may hold the only
+record of bans that still wait. hik-f2b then starts fresh: it watches each
+NVR log from the current time on, and the hourly ban counter starts at zero.
+If the file cannot be renamed, hik-f2b does not start, so that it does not
+overwrite the file. Single lines that cannot be used are left out, with one
+WARNING that counts them.
 
 ### Permanent bans
 
@@ -552,8 +574,12 @@ The text is sent without a parse mode, so nothing in it is read as markup.
 
 A ban is applied before any notification is attempted. Notifications that
 fail are retried on later polls, at most 5 attempts each; at most 100 wait at
-a time, and they are kept in memory only, so a restart loses them. An
-unreachable Telegram costs at most one 10-second timeout per poll.
+a time, and they are kept in memory only, so a restart loses them. When 100
+already wait, a new one is dropped, with one WARNING per poll that counts
+them. An unreachable Telegram costs at most one 10-second timeout per poll.
+When Telegram answers that the chat gets too many messages (HTTP 429), it
+says how long to wait. hik-f2b sends nothing until then; that wait does not
+use up any of the 5 attempts.
 
 ### Country of a banned address
 
@@ -680,25 +706,40 @@ and always in its log. It watches:
 - **Each NVR:** it cannot be read, because it does not answer or rejects
   hik-f2b's login (for example after a password change). While hik-f2b waits
   `auth_backoff` after a rejected login, the problem counts as ongoing.
-- **The router:** it cannot be reached, refuses the login, or answers with an
-  error. This is seen when a ban fails to reach the router and by a check at
-  startup and every 5 minutes.
+- **The router:** it cannot be reached, refuses the login (HTTP 401 or 403),
+  or answers with an error, such as HTTP 500. An answer that is not the JSON
+  hik-f2b asked for, such as a page from a proxy, counts as an error too.
+  This is seen when a ban fails and by a check at startup and every 5
+  minutes. After such an error hik-f2b tries the other waiting bans at the
+  next poll, not in the same one.
 - **The drop rule:** no enabled rule in `/ip/firewall/raw` or
   `/ip/firewall/filter` has `src-address-list` set to `address_list`. Without
   such a rule the address-list fills up and nothing is blocked. hik-f2b asks
   each table for the rules with that `src-address-list`
-  (`GET /rest/ip/firewall/raw?src-address-list=cctv_ban&.proplist=.id,disabled`,
-  then the same for `filter`). It counts a rule as enabled unless the reply
-  says `"disabled":"true"`: RouterOS 7.18 leaves the `disabled` property out
-  of enabled `raw` rules altogether. The check does not look at the rule's
-  chain, interface or action. So a rule that matches the address-list but
-  accepts the traffic still passes. To turn the check off, set
-  `check_rule = false` in `[mikrotik]`.
+  (`GET /rest/ip/firewall/raw?src-address-list=cctv_ban&.proplist=.id,disabled,invalid`,
+  then the same for `filter`). It counts a rule unless the reply says
+  `"disabled":"true"` or `"invalid":"true"`. RouterOS 7.18 leaves the
+  `disabled` property out of some enabled rules. RouterOS marks a rule
+  invalid when something the rule names no longer exists, for example its
+  interface list; such a rule blocks nothing. The result names the rules
+  left out, for example `; left out: 1 invalid`. The check does not look at
+  the rule's chain, interface or action. So a rule that matches the
+  address-list but accepts the traffic still passes. To turn the check off,
+  set `check_rule = false` in `[mikrotik]`.
+- **Bans that do not block:** an address that has been in the address-list
+  for longer than two polls and a minute still reaches an NVR with
+  `maxretry` failed logins. The drop rule exists but does not block, for
+  example because it names the wrong interface list. Each time, hik-f2b logs
+  a WARNING (`... is already in ... but still reached the NVR`). The problem
+  lasts while such addresses keep coming back with pauses shorter than
+  `alert_after`. It is over once none has come back for `alert_after` while
+  every NVR could be read. hik-f2b cannot tell a fixed rule from an attacker
+  that has given up.
 - **The ban rate limit:** addresses are waiting because `max_bans_per_hour` has
   been reached.
 - **Refused bans:** the router answers, but refuses to add an address to the
-  address-list. For example, the router user's group has lost the `write`
-  policy. The checks every 5 minutes only read, so they cannot clear this
+  address-list (HTTP 400), and the address is not listed. For example, the
+  router user's group has lost the `write` policy. The checks every 5 minutes only read, so they cannot clear this
   problem. Only a ban that the router accepts ends it. If every refused ban
   expires or is dropped while the problem is alerted, nothing is left to show
   whether it is over. Then hik-f2b sends one message that says so, sends no
@@ -722,7 +763,9 @@ example:
 ```
 
 These texts are fixed; `message` applies to ban messages only. Reasons are
-taken from error messages, cut short, and URLs are left out. Health messages go
+taken from error messages and cut short. Every URL in them is replaced by
+`<url>`, wherever it stands. An address with a port outside a URL, as in a
+connection error, stays: it names your own device. Health messages go
 through the same queue as ban messages, so a Telegram outage costs no more
 than before and never holds up polling or banning. In the log each report is
 one ERROR line (`health alert [nvr:nvr2]: ...`, `health reminder [...]`) and
@@ -754,12 +797,18 @@ the next poll tries again from its own time.
 
 If an NVR's clock goes back to before the newest log entry that hik-f2b has
 read (a DST change, a reset real-time clock, or a correction of a few
-minutes), or jumps forward by more than 15 minutes, hik-f2b logs a warning,
-records the entries the log holds at that moment as already seen without
-counting them, and reads on from the new time. Failed logins in the short
-window around the change are not counted. A smaller forward correction, or a
-backward one that does not reach the newest entry read, needs nothing of this:
-the entries read before stay known, so none is counted again.
+minutes), or changes by more than 15 minutes in either direction since the
+last read, hik-f2b logs a warning. It then records the entries the log holds
+at that moment as already seen without counting them, and reads on from the
+new time. Failed logins in the short window around the change are not
+counted. This also covers the end of DST on an NVR that logged nothing new
+for a while, or that could not be reached: its clock stays ahead of the
+newest entry read, and only the difference to the host's clock shows the
+change. A change of at most 15 minutes that does not go back to before the
+newest entry read needs nothing of this: the entries read before stay known,
+so none is counted again. Entries logged before such a change and read after
+it are converted with the new difference, so their times can be off by up to
+15 minutes.
 
 If the clock changes while the NVR's log cannot be read, and hik-f2b skips
 the unreadable stretch after 10 polls (see [Limitations](#limitations)), the
@@ -841,8 +890,11 @@ login is whatever they typed). It is built accordingly:
   counted once, also when a search stops in the middle of a second. Entries
   that 4 searches cannot reach are skipped with an ERROR line that gives
   their time range. At most 10,000 addresses are tracked
-  (the one whose latest failed login is the oldest is forgotten first), and at
-  most 1000 bans
+  (the one whose latest failed login is the oldest is forgotten first), with
+  at most 200,000 failed-login times in all: hik-f2b keeps the newest
+  `4 × maxretry` (at least 16) per address, so with `maxretry` above 5 it
+  tracks fewer addresses. At most 100,000 banned addresses are remembered
+  (the one whose ban ends first is forgotten first), and at most 1000 bans
   wait to be applied (the oldest is dropped). A ban that cannot be applied
   within `bantime` (24 hours for a permanent ban) is dropped.
   `max_bans_per_hour` limits new bans and is kept across restarts; an address
@@ -868,9 +920,10 @@ login is whatever they typed). It is built accordingly:
   challenge is never answered, even when the NVR offers both. The router's
   REST API uses Basic authentication, which is why it must be https. Secrets
   can come from files (`*_file`) or be written in the config; a warning is
-  logged when a config with inline secrets is readable by other users. Secrets
+  logged when a config with inline secrets, or a secret file, is readable by
+  its group or other users. Secrets
   are never logged, and the Telegram token is removed from error messages.
-  Health alerts quote error messages without the URLs in them.
+  Health alerts quote error messages with every URL in them replaced.
 - **Country database.** The `.mmdb` file is untrusted input too. The reader
   (`src/country.rs`) checks every offset, bounds the search-tree walk, the
   nesting, the pointers followed and the number of fields decoded, never
@@ -938,8 +991,8 @@ vulnerability, see [SECURITY.md](SECURITY.md).
   This is known and not fixed yet.
 - Only MD5 Digest authentication is supported towards the NVR.
 - Only MikroTik RouterOS is supported as the firewall.
-- The drop-rule check only looks for an enabled `raw` or `filter` rule with
-  the address-list as `src-address-list`. A rule in the wrong chain, on the
+- The drop-rule check only looks for an enabled, valid `raw` or `filter` rule
+  with the address-list as `src-address-list`. A rule in the wrong chain, on the
   wrong interface or with an action that does not drop still passes it.
 - Health alerts need hik-f2b to be running. A stopped service or a host that
   is down sends nothing. To detect this, watch the service from outside.
@@ -1024,6 +1077,13 @@ Not yet tried:
   for both.
 - The handling of clock changes from 0.3.2 (a small correction backward, a
   change while the log cannot be read) on real NVRs: only the tests and the
+  simulation make these happen.
+- The changes of 0.3.3 on real devices: a drop rule that RouterOS marks
+  invalid (the replies of a real router showed only `"invalid":"false"`),
+  the answers of a real router to a wrong password, with HTTP 5xx and
+  through a proxy, Telegram's HTTP 429, the `ban-bypassed` alert, the end of
+  DST on an NVR that could not be reached, and a stop of the Quadlet unit
+  or the Compose service in the middle of a poll. Only the tests and the
   simulation make these happen.
 - Notify-only mode on real devices.
 - A ban with a country on real devices: only `--country` and `--check` were

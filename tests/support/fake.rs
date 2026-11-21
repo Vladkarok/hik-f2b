@@ -35,6 +35,45 @@ pub struct Entry {
     pub user: Vec<u8>, // inserted into the XML as is (may be XML-escaped, may be broken)
 }
 
+/// A firewall rule on the fake router.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Rule {
+    pub table: &'static str,
+    /// Its `src-address-list`.
+    pub list: String,
+    pub disabled: bool,
+    /// RouterOS marks a rule invalid when, for example, the interface list
+    /// it names is removed; the rule then matches nothing.
+    pub invalid: bool,
+    pub dynamic: bool,
+}
+
+impl Rule {
+    pub fn new(table: &'static str, list: &str, disabled: bool) -> Rule {
+        Rule {
+            table,
+            list: list.to_string(),
+            disabled,
+            invalid: false,
+            dynamic: false,
+        }
+    }
+
+    pub fn invalid(table: &'static str, list: &str) -> Rule {
+        Rule {
+            invalid: true,
+            ..Rule::new(table, list, false)
+        }
+    }
+
+    pub fn dynamic(table: &'static str, list: &str) -> Rule {
+        Rule {
+            dynamic: true,
+            ..Rule::new(table, list, false)
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Fake {
     // --- NVR
@@ -77,8 +116,21 @@ pub struct Fake {
     pub router_requests: u32,
     /// Error detail for a duplicate entry; `None` = today's RouterOS text.
     pub duplicate_text: Option<String>,
-    /// Firewall rules as (table, src-address-list, disabled).
-    pub rules: Vec<(&'static str, String, bool)>,
+    /// Answer every REST request with this HTTP status (401: a wrong
+    /// password, 403, 5xx), in RouterOS's error format.
+    pub rest_status: Option<u16>,
+    /// Answer every PUT with this HTTP status, reads work.
+    pub put_status: Option<u16>,
+    /// Answer every REST request with HTTP 200 and an HTML page, as a proxy
+    /// in front of the router might.
+    pub rest_html: bool,
+    /// Every REST request that reached the router.
+    pub rest_requests: u32,
+    /// Set this flag when a PUT arrives (a stop signal in the middle of a
+    /// cycle).
+    pub stop_on_put: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Firewall rules.
+    pub rules: Vec<Rule>,
     /// `path?query` of every rule lookup.
     pub rule_queries: Vec<String>,
     /// `query` of every address-list lookup by address.
@@ -86,12 +138,16 @@ pub struct Fake {
     pub identity_requests: u32,
     /// (address, outcome) of every PUT that reached the router: `accepted`,
     /// `duplicate`, `refused`, `refused-listed` (refused, but the address is
-    /// listed) or `down`.
+    /// listed), `down` or `status` (answered with `rest_status` or
+    /// `put_status`).
     pub put_log: Vec<(String, &'static str)>,
     // --- Telegram
     pub tg_sent: Vec<String>,
     pub tg_attempts: u32,
     pub tg_fail: bool,
+    /// Accept this many messages in all, then answer HTTP 429 with
+    /// `retry_after` 30, as Telegram does when a chat gets too many.
+    pub tg_accept: Option<usize>,
 }
 
 fn between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
@@ -230,6 +286,33 @@ fn route(
         if f.router_unreachable {
             return reply(DROP, json, "");
         }
+        f.rest_requests += 1;
+        if f.rest_html {
+            return reply(
+                200,
+                "text/html",
+                "<html><head><title>Proxy</title></head><body>Please log in</body></html>",
+            );
+        }
+        let status = f.rest_status.or(f.put_status.filter(|_| method == "PUT"));
+        if let Some(code) = status {
+            if path.starts_with("/rest/ip/firewall/address-list") && method == "PUT" {
+                let address = between(body, "\"address\":\"", "\"").to_string();
+                f.put_log.push((address, "status"));
+            }
+            let message = match code {
+                401 => "Unauthorized",
+                403 => "Forbidden",
+                404 => "Not Found",
+                503 => "Service Unavailable",
+                _ => "Internal Server Error",
+            };
+            return reply(
+                code,
+                json,
+                format!("{{\"error\":{},\"message\":\"{}\"}}", code, message),
+            );
+        }
         if auth != format!("Basic {}", util::b64(b"f2b:rpass")) {
             return reply(401, json, "{\"error\":401,\"message\":\"Unauthorized\"}");
         }
@@ -240,33 +323,43 @@ fn route(
         let list = param(query, "src-address-list");
         let wanted = param(query, "disabled");
         let proplist = param(query, ".proplist").unwrap_or_default();
-        // As on RouterOS 7.18.1: enabled `raw` rules have no `disabled`
-        // member at all (so a `disabled=false` filter misses them); `filter`
-        // rules always have one.
-        let shown = |t: &str, d: bool| -> Option<&'static str> {
-            match (d, t) {
-                (true, _) => Some("true"),
-                (false, "filter") => Some("false"),
-                (false, _) => None,
+        let asked = |p: &str| proplist.split(',').any(|q| q == p);
+        // As on RouterOS 7.18.1 (`.proplist=.id,disabled,invalid,dynamic`):
+        // `disabled` is `"true"` on a disabled rule, `"false"` on some
+        // enabled rules and missing on others (so a `disabled=false` filter
+        // misses them), in `raw` as in `filter`; `invalid` is `"false"` on an
+        // ordinary rule; a dynamic rule has only `"dynamic":"true"`.
+        let shown = |n: usize, r: &Rule| -> Option<&'static str> {
+            match (r.dynamic, r.disabled) {
+                (true, _) => None,
+                (false, true) => Some("true"),
+                (false, false) if n % 2 == 1 => Some("false"),
+                (false, false) => None,
             }
         };
         let ids: Vec<String> = f
             .rules
             .iter()
             .enumerate()
-            .filter(|(_, (t, l, d))| {
-                *t == table
-                    && list.as_ref().is_none_or(|want| want == l)
+            .filter(|(n, r)| {
+                r.table == table
+                    && list.as_ref().is_none_or(|want| *want == r.list)
                     && wanted
                         .as_ref()
-                        .is_none_or(|want| shown(t, *d) == Some(want.as_str()))
+                        .is_none_or(|want| shown(*n, r) == Some(want.as_str()))
             })
-            .map(|(n, (t, _, d))| {
+            .map(|(n, r)| {
                 let mut member = format!("{{\".id\":\"*{:X}\"", n + 1);
-                if let Some(v) = shown(t, *d) {
-                    if proplist.split(',').any(|p| p == "disabled") {
+                if let Some(v) = shown(n, r) {
+                    if asked("disabled") {
                         member.push_str(&format!(",\"disabled\":\"{}\"", v));
                     }
+                }
+                if !r.dynamic && asked("invalid") {
+                    member.push_str(&format!(",\"invalid\":\"{}\"", r.invalid));
+                }
+                if r.dynamic && asked("dynamic") {
+                    member.push_str(",\"dynamic\":\"true\"");
                 }
                 member.push('}');
                 member
@@ -340,6 +433,9 @@ fn route(
             return reply(200, json, format!("[{}]", list.join(",")));
         }
         if method == "PUT" {
+            if let Some(flag) = &f.stop_on_put {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             let address = between(body, "\"address\":\"", "\"").to_string();
             let listed = f.bans.contains(&address);
             if f.router_down {
@@ -371,13 +467,27 @@ fn route(
                 return reply(400, json, out);
             }
             f.put_log.push((address.clone(), "accepted"));
-            f.bans.push(address);
+            f.bans.push(address.clone());
             f.ban_bodies.push(body.to_string());
-            return reply(201, json, "{}");
+            // RouterOS answers with the entry it made
+            let out = format!(
+                "{{\".id\":\"*{:X}\",\"address\":\"{}\",\"list\":\"cctv_ban\"}}",
+                f.bans.len(),
+                address
+            );
+            return reply(201, json, out);
         }
     }
     if path == format!("/bot{}/sendMessage", TOKEN) && method == "POST" {
         f.tg_attempts += 1;
+        if f.tg_accept.is_some_and(|n| f.tg_sent.len() >= n) {
+            return reply(
+                429,
+                json,
+                "{\"ok\":false,\"error_code\":429,\"description\":\"Too Many Requests: retry \
+                 after 30\",\"parameters\":{\"retry_after\":30}}",
+            );
+        }
         if f.tg_fail {
             let out = format!(
                 "{{\"ok\":false,\"description\":\"boom at /bot{}/x\"}}",
@@ -456,7 +566,7 @@ fn spawn_fake() -> (Arc<Mutex<Fake>>, u16) {
         nvr_auth_ok: true,
         nonce: NONCE.to_string(),
         // the drop rule from the README
-        rules: vec![("raw", "cctv_ban".to_string(), false)],
+        rules: vec![Rule::new("raw", "cctv_ban", false)],
         ..Default::default()
     }));
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -577,9 +687,23 @@ impl Harness {
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        // A setting may appear only once: `general` replaces the defaults
+        // it sets.
+        let set: Vec<String> = opts
+            .general
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(key, _)| key.trim().to_string())
+            .collect();
+        let defaults: String = ["maxretry = 5", "findtime = 3600", "bantime = 86400"]
+            .iter()
+            .filter(|line| !set.iter().any(|key| line.starts_with(&format!("{} ", key))))
+            .map(|line| format!("{}\n", line))
+            .collect();
         let mut ini = format!(
-            "[general]\nmaxretry = 5\nfindtime = 3600\nbantime = 86400\nstate_file = {}\n{}\n\
+            "[general]\n{}state_file = {}\n{}\n\
              [nvr:nvr1]\nurl = http://127.0.0.1:{port}\nuser = f2b\npassword = secret\n",
+            defaults,
             dir.join("state").display(),
             opts.general,
             port = port
@@ -735,7 +859,7 @@ impl Harness {
     pub fn restart(&mut self) {
         let path = self.dir.join("state");
         self.engine.state.save(&path).unwrap();
-        let restored = State::load(&path);
+        let restored = State::load(&path).unwrap();
         assert_eq!(restored, self.engine.state, "state file round trip");
         self.engine = Engine::new(Config::parse(&self.ini).unwrap(), restored).unwrap();
     }

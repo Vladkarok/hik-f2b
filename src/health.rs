@@ -42,6 +42,11 @@ pub enum Check {
     /// The firewall answers, but refuses to add a ban (for example because
     /// our account may read but not write). Only an accepted ban clears it.
     BanRefused,
+    /// An address that has been banned for a while still reaches an NVR:
+    /// the drop rule exists but does not block. Observed only when such an
+    /// address reaches `maxretry` again; over once none has for
+    /// `alert_after` (see `Engine::bypass_over`).
+    Bypassed,
 }
 
 impl Check {
@@ -53,6 +58,7 @@ impl Check {
             Check::Rule => "firewall-rule".to_string(),
             Check::RateLimit => "rate-limit".to_string(),
             Check::BanRefused => "ban-refused".to_string(),
+            Check::Bypassed => "ban-bypassed".to_string(),
         }
     }
 
@@ -63,6 +69,7 @@ impl Check {
             Check::Rule => "banned addresses are not blocked".to_string(),
             Check::RateLimit => "new bans are held back by max_bans_per_hour".to_string(),
             Check::BanRefused => "the firewall refuses bans".to_string(),
+            Check::Bypassed => "banned addresses still reach an NVR".to_string(),
         }
     }
 
@@ -73,6 +80,7 @@ impl Check {
             Check::Rule => "banned addresses are blocked again".to_string(),
             Check::RateLimit => "bans are no longer held back".to_string(),
             Check::BanRefused => "the firewall accepts bans again".to_string(),
+            Check::Bypassed => "banned addresses no longer reach the NVRs".to_string(),
         }
     }
 
@@ -253,26 +261,53 @@ pub fn fmt_duration(seconds: u64) -> String {
     }
 }
 
-/// A reason fit for a chat message: URLs (which name hosts, ports and
-/// query strings) are left out, and the rest is printable ASCII and short.
-/// The error strings it gets never hold passwords or tokens: credentials
-/// travel in headers or form bodies, which errors do not quote.
+/// A reason fit for a chat message: every URL (`scheme://...`, which names
+/// a host, a port, a path and a query string) is replaced by `<url>`,
+/// wherever it stands: after a space, in brackets or quotes, after `=`. The
+/// rest is printable ASCII and short. An address with a port outside a URL
+/// (`192.0.2.1:443` in a connection error) stays: it is the operator's own
+/// device, and the chat is the operator's. The error strings this gets
+/// never hold passwords or tokens: credentials travel in headers or form
+/// bodies, which errors do not quote.
 pub fn clean_reason(text: &str) -> String {
-    let words: Vec<String> = text
-        .split(' ')
-        .map(|word| {
-            if word.starts_with("http://") || word.starts_with("https://") {
-                if word.ends_with(':') {
-                    "<url>:".to_string()
-                } else {
-                    "<url>".to_string()
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("://") {
+        // the scheme: the letters, digits, `+`, `-` and `.` just before
+        let start = rest[..at]
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| c.is_ascii_alphanumeric() || "+-.".contains(*c))
+            .last()
+            .map_or(at, |(i, _)| i);
+        let after = &rest[at + 3..];
+        if start == at {
+            out.push_str(&rest[..at + 3]);
+            rest = after;
+            continue;
+        }
+        out.push_str(&rest[..start]);
+        // The URL ends at a space, a quote, a bracket that it did not open,
+        // or the end; punctuation at its end belongs to the sentence.
+        let mut end = after.len();
+        let mut open = 0usize;
+        for (i, c) in after.char_indices() {
+            match c {
+                '[' => open += 1,
+                ']' if open > 0 => open -= 1,
+                c if c.is_whitespace() || "\"'`<>(){}]".contains(c) => {
+                    end = i;
+                    break;
                 }
-            } else {
-                word.to_string()
+                _ => {}
             }
-        })
-        .collect();
-    util::sanitize(&words.join(" "), MAX_REASON)
+        }
+        let url = after[..end].trim_end_matches(|c| ".,;:!?".contains(c));
+        out.push_str("<url>");
+        rest = &after[url.len()..];
+    }
+    out.push_str(rest);
+    util::sanitize(&out, MAX_REASON)
 }
 
 /// The result of one item of `--check`.
@@ -473,12 +508,47 @@ mod tests {
     }
 
     #[test]
+    fn urls_are_masked_wherever_they_stand() {
+        for (text, clean) in [
+            ("https://192.0.2.1/x", "<url>"),
+            ("(https://192.0.2.1/rest?x=1)", "(<url>)"),
+            ("[http://192.0.2.1:80/a]", "[<url>]"),
+            ("\"https://192.0.2.1/a\" failed", "\"<url>\" failed"),
+            ("'http://192.0.2.1/a'", "'<url>'"),
+            ("url=https://192.0.2.1/a?token=x, retry", "url=<url>, retry"),
+            ("<https://192.0.2.1/a>", "<<url>>"),
+            ("see http://[2001:db8::1]:8080/ISAPI/x.", "see <url>."),
+            (
+                "at HTTPS://Router.Example.Net:8443/rest: refused",
+                "at <url>: refused",
+            ),
+            (
+                "two: http://192.0.2.1/a http://192.0.2.2/b",
+                "two: <url> <url>",
+            ),
+            ("glued:http://192.0.2.1/a", "glued:<url>"),
+            ("ftp://192.0.2.1/x", "<url>"),
+            ("Network Error:\thttp://192.0.2.1/x", "Network Error:?<url>"),
+            // not URLs: kept as they are
+            ("://nothing", "://nothing"),
+            (
+                "connect to 192.0.2.1:8443 refused",
+                "connect to 192.0.2.1:8443 refused",
+            ),
+            ("HTTP 401: Unauthorized", "HTTP 401: Unauthorized"),
+        ] {
+            assert_eq!(clean_reason(text), clean, "{:?}", text);
+        }
+    }
+
+    #[test]
     fn keys_are_stable() {
         assert_eq!(nvr("nvr2").key(), "nvr:nvr2");
         assert_eq!(Check::Firewall.key(), "firewall");
         assert_eq!(Check::Rule.key(), "firewall-rule");
         assert_eq!(Check::RateLimit.key(), "rate-limit");
         assert_eq!(Check::BanRefused.key(), "ban-refused");
+        assert_eq!(Check::Bypassed.key(), "ban-bypassed");
     }
 
     #[test]

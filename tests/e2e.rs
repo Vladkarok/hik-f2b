@@ -397,11 +397,102 @@ fn telegram_outage_does_not_block_bans_and_is_retried() {
     assert_eq!(h.engine.queued_notifications(), 0);
 }
 
+/// Telegram's rate limit (HTTP 429 with `retry_after`): nothing is sent
+/// until the wait is over, the wait costs no attempt, and the rest of the
+/// queue goes out afterwards.
+#[test]
+fn telegram_rate_limit_is_waited_out() {
+    let mut h = Harness::with(Opts {
+        telegram: true,
+        general: "max_bans_per_hour = 100",
+        ..Default::default()
+    });
+    util::capture_log();
+    h.fake.lock().unwrap().tg_accept = Some(20);
+    for n in 1..=30 {
+        h.burst("10:01", &format!("198.51.100.{}", n), 5);
+    }
+    h.cycle("10:02:00");
+    assert_eq!(h.banned().len(), 30);
+    {
+        let f = h.fake.lock().unwrap();
+        assert_eq!(f.tg_sent.len(), 20);
+        assert_eq!(f.tg_attempts, 21, "the queue stops at the first 429");
+    }
+    assert_eq!(h.engine.queued_notifications(), 10);
+    // within retry_after (30 s): not a single request
+    h.advance(20);
+    assert_eq!(h.fake.lock().unwrap().tg_attempts, 21);
+    // after it: the rest, none dropped
+    h.fake.lock().unwrap().tg_accept = None;
+    h.advance(10);
+    let f = h.fake.lock().unwrap();
+    assert_eq!(f.tg_sent.len(), 30);
+    assert_eq!(f.tg_attempts, 31);
+    drop(f);
+    assert_eq!(h.engine.queued_notifications(), 0);
+    let log = util::captured_log();
+    assert_eq!(
+        logged(&log, "Telegram asks to wait 30 s before the next message"),
+        1
+    );
+    assert_eq!(
+        logged(&log, "notification failed"),
+        0,
+        "a 429 is not an outage"
+    );
+}
+
+/// A full queue drops new notifications, with one WARNING per poll that
+/// counts them.
+#[test]
+fn dropped_notifications_are_logged() {
+    let mut h = Harness::with(Opts {
+        telegram: true,
+        general: "max_bans_per_hour = 200",
+        ..Default::default()
+    });
+    util::capture_log();
+    h.fake.lock().unwrap().tg_fail = true;
+    for n in 1..=105 {
+        let address = if n <= 100 {
+            format!("198.51.100.{}", n)
+        } else {
+            format!("203.0.113.{}", n - 100)
+        };
+        h.burst("10:01", &address, 5);
+    }
+    h.cycle("10:02:00");
+    assert_eq!(h.banned().len(), 105);
+    assert_eq!(h.engine.queued_notifications(), 100);
+    let log = util::captured_log();
+    assert_eq!(
+        logged(
+            &log,
+            "WARNING 5 notification(s) dropped: 100 already wait to be sent"
+        ),
+        1,
+        "{:?}",
+        log.iter()
+            .filter(|l| l.contains("dropped"))
+            .collect::<Vec<_>>()
+    );
+    h.advance(30);
+    assert_eq!(logged(&util::captured_log(), "dropped:"), 0);
+}
+
 #[test]
 fn telegram_errors_never_reveal_the_token() {
     let h = Harness::new(true);
     h.fake.lock().unwrap().tg_fail = true;
-    let err = h.engine.notifier.as_ref().unwrap().send("x").unwrap_err();
+    let err = h
+        .engine
+        .notifier
+        .as_ref()
+        .unwrap()
+        .send("x")
+        .unwrap_err()
+        .to_string();
     assert!(!err.contains(TOKEN), "{}", err);
     assert!(err.contains("<token>"), "{}", err);
 }
@@ -413,7 +504,7 @@ fn state_survives_a_restart() {
     h.cycle("10:02:00");
     let path = h.dir.join("state");
     h.engine.state.save(&path).unwrap();
-    let restored = State::load(&path);
+    let restored = State::load(&path).unwrap();
     assert_eq!(restored, h.engine.state);
     assert_eq!(restored.fails[&attacker()].len(), 4);
 }
@@ -457,6 +548,55 @@ fn dst_fall_back() {
     h.advance(30);
     assert_eq!(h.fails(OWNER), 4);
     assert_eq!(h.banned(), vec![ATTACKER]);
+}
+
+/// DST ends on a quiet NVR while it cannot be reached. Its read position
+/// trails its clock by `findtime + lookback`, so after the step the clock is
+/// still ahead of it, and only the offset (one hour less) shows the step.
+/// Failed logins logged before the step and read after it must not be
+/// converted with the new offset (an hour later than they happened).
+#[test]
+fn dst_end_on_a_quiet_nvr_after_an_outage_is_a_resync() {
+    let mut h = Harness::new(false);
+    util::capture_log();
+    run(&mut h, 3, 30);
+    // the NVR goes away; an attacker is logged at the start of the outage
+    h.fake.lock().unwrap().nvr_down = true;
+    let down = h.host;
+    for i in 0..5 {
+        Harness::add_at(&h.fake, &device(down + 10 + i + SKEW), ATTACKER);
+    }
+    run(&mut h, 13, 300);
+    // an hour later DST has ended, and the NVR is back
+    h.fake.lock().unwrap().skew = SKEW - 3600;
+    h.fake.lock().unwrap().nvr_down = false;
+    h.advance(300);
+    let log = util::captured_log();
+    assert_eq!(
+        logged(&log, "nvr1: device clock jumped back by 3600 s"),
+        1,
+        "{:?}",
+        log
+    );
+    // the old entries are recorded as seen, not counted an hour late
+    assert_eq!(h.fails(ATTACKER), 0);
+    assert!(h.engine.state.pending.is_empty());
+    assert!(h.banned().is_empty());
+    assert_eq!(h.engine.state.nvr["nvr1"].offset, Some(SKEW - 3600));
+    // after the step, failed logins count as usual
+    let now = h.host;
+    for i in 0..5 {
+        Harness::add_at(&h.fake, &device(now + 5 + i + SKEW - 3600), ATTACKER);
+    }
+    h.advance(30);
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    // a change of 15 minutes or less is no jump, in either direction
+    for step in [-900, 900] {
+        let skew = h.fake.lock().unwrap().skew;
+        h.fake.lock().unwrap().skew = skew + step;
+        h.advance(30);
+        assert_eq!(logged(&util::captured_log(), "device clock jumped"), 0);
+    }
 }
 
 /// A device clock that ran 400 s fast is corrected (more than lookback, less
@@ -928,6 +1068,191 @@ fn pending_bans_oldest_first() {
     h.cycle("10:04:00");
     assert_eq!(h.banned(), vec!["198.51.100.3"]);
     assert_eq!(h.engine.state.pending.len(), 2);
+}
+
+/// A stop signal arrives while the first of three bans is sent: the cycle
+/// sends no further ban, no firewall check and no notification, and the
+/// state keeps the bans that wait.
+#[test]
+fn a_stop_ends_the_cycle_after_its_current_step() {
+    let mut h = Harness::new(true);
+    util::capture_log();
+    for n in 1..=3 {
+        h.burst("10:01", &format!("198.51.100.{}", n), 5);
+    }
+    let stop = h.engine.stop_flag();
+    h.fake.lock().unwrap().stop_on_put = Some(stop.clone());
+    h.cycle("10:05:00"); // the firewall check would be due
+    let f = h.fake.lock().unwrap();
+    assert_eq!(f.put_log.len(), 1, "{:?}", f.put_log);
+    assert_eq!(f.rule_queries.len(), 1, "only the first cycle's check");
+    assert_eq!(f.tg_attempts, 0);
+    drop(f);
+    assert_eq!(h.engine.state.pending.len(), 2);
+    assert_eq!(h.engine.state.banned.len(), 1);
+    assert_eq!(h.engine.queued_notifications(), 1);
+    let log = util::captured_log();
+    assert_eq!(
+        logged(&log, "stop requested: the rest of this poll is skipped"),
+        1
+    );
+    // no health problem was claimed to be over because of the stop
+    assert!(h.engine.alerted_problems().is_empty());
+    // a stop before the NVRs are polled: nothing is asked of any device
+    let before = h.fake.lock().unwrap().search_requests;
+    h.advance(30);
+    assert_eq!(h.fake.lock().unwrap().search_requests, before);
+    assert_eq!(h.engine.state.pending.len(), 2);
+}
+
+/// `Engine::run` saves the state of a cycle that a stop cut short, and does
+/// not start another.
+#[test]
+fn a_stop_during_the_service_saves_the_state() {
+    use hik_f2b::state::Pending;
+    let mut h = Harness::new(false);
+    let path = h.dir.join("service-state");
+    let now = util::unix_now() as i64;
+    for n in 1..=3 {
+        h.engine.state.pending.insert(
+            ip(&format!("198.51.100.{}", n)),
+            Pending {
+                ts: now - 10 + n,
+                count: 5,
+                nvr: "nvr1".to_string(),
+                user: "admin".to_string(),
+            },
+        );
+    }
+    let stop = h.engine.stop_flag();
+    h.fake.lock().unwrap().stop_on_put = Some(stop.clone());
+    let started = std::time::Instant::now();
+    h.engine.run(&path, false);
+    assert!(
+        started.elapsed().as_secs() < 20,
+        "no second cycle, no sleep"
+    );
+    let saved = State::load(&path).unwrap();
+    assert_eq!(saved, h.engine.state);
+    assert_eq!(saved.pending.len(), 2);
+    assert_eq!(saved.banned.len(), 1);
+    assert_eq!(saved.recent_bans.len(), 1);
+    assert_eq!(h.fake.lock().unwrap().put_log.len(), 1);
+    // stopped before it starts: no cycle at all
+    let requests = h.fake.lock().unwrap().isapi_requests;
+    h.engine.run(&path, false);
+    assert_eq!(h.fake.lock().unwrap().isapi_requests, requests);
+}
+
+/// At startup a router that does not answer is asked once (the firewall
+/// check), not a second time for the size of the address-list; one that
+/// answers is asked both.
+#[test]
+fn an_unreachable_router_is_asked_once_at_startup() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&connections);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            seen.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    let h = Harness::build(Opts::default());
+    let run = |ini: &str| {
+        let path = h.dir.join("startup.ini");
+        std::fs::write(&path, ini).unwrap();
+        std::process::Command::new(env!("CARGO_BIN_EXE_hik-f2b"))
+            .arg("--config")
+            .arg(&path)
+            .arg("--once")
+            .output()
+            .unwrap()
+    };
+    let out = run(&h.ini.replace(
+        &format!("[mikrotik]\nurl = http://127.0.0.1:{}", h.port),
+        &format!("[mikrotik]\nurl = http://127.0.0.1:{}", port),
+    ));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout);
+    assert_eq!(connections.load(Ordering::SeqCst), 1, "{}", stdout);
+    assert!(stdout.contains("firewall check failed"), "{}", stdout);
+    assert!(!stdout.contains("address-list cctv_ban has"), "{}", stdout);
+    // a router that answers: the check, then the count
+    let before = h.fake.lock().unwrap().rest_requests;
+    let out = run(&h.ini);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout);
+    assert!(
+        stdout.contains("MikroTik address-list cctv_ban has 0 entries"),
+        "{}",
+        stdout
+    );
+    assert_eq!(h.fake.lock().unwrap().rest_requests - before, 2);
+}
+
+/// `MAX_BANNED` holds also where bans are added, not only when the state
+/// file is read: the address whose end is nearest is forgotten first.
+#[test]
+fn remembered_bans_are_bounded() {
+    use hik_f2b::state::MAX_BANNED;
+    let mut h = Harness::new(false);
+    let now = h.host as u64;
+    let address = |i: usize| std::net::Ipv4Addr::from(0x0B00_0000u32 + i as u32);
+    for i in 0..MAX_BANNED {
+        // address(0) has the nearest end
+        let until = if i == 0 { now + 1000 } else { now + 2000 };
+        h.engine.state.banned.insert(address(i), until);
+    }
+    h.burst("10:01", ATTACKER, 5);
+    h.cycle("10:02:00");
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    assert_eq!(h.engine.state.banned.len(), MAX_BANNED);
+    assert!(h.engine.state.banned.contains_key(&attacker()));
+    assert!(!h.engine.state.banned.contains_key(&address(0)));
+}
+
+/// The failure times of all addresses together are bounded: with a large
+/// `maxretry` more times are kept per address, so fewer addresses are
+/// tracked. A state from a run with a smaller `maxretry` is cut down at
+/// the start.
+#[test]
+fn failure_times_are_bounded_in_total() {
+    use hik_f2b::engine::fail_limits;
+    use hik_f2b::state::MAX_FAIL_TIMES;
+    assert_eq!(fail_limits(5), (20, 10_000));
+    assert_eq!(fail_limits(100), (400, 500));
+    assert_eq!(fail_limits(1000), (4000, 50));
+    let mut h = Harness::with(Opts {
+        general: "maxretry = 100",
+        ..Default::default()
+    });
+    let address = |i: usize| std::net::Ipv4Addr::from(0x0B00_0000u32 + i as u32);
+    let now = h.host;
+    for i in 0..500 {
+        h.engine
+            .state
+            .fails
+            .insert(address(i), vec![now - 600 + i as i64]);
+    }
+    h.add("10:00:40", ATTACKER);
+    h.cycle("10:01:00");
+    assert_eq!(h.engine.state.fails.len(), 500);
+    assert_eq!(h.fails(ATTACKER), 1);
+    assert!(
+        !h.engine.state.fails.contains_key(&address(0)),
+        "the oldest goes"
+    );
+    // more than this config allows, from the state file
+    for i in 0..700 {
+        h.engine.state.fails.insert(address(i), vec![now - 60; 450]);
+    }
+    h.restart();
+    let total: usize = h.engine.state.fails.values().map(Vec::len).sum();
+    assert_eq!(h.engine.state.fails.len(), 500);
+    assert!(h.engine.state.fails.values().all(|t| t.len() <= 400));
+    assert!(total <= MAX_FAIL_TIMES);
 }
 
 /// C11b: the rate limit survives a restart.
@@ -1543,11 +1868,11 @@ fn missing_drop_rule_is_alerted_until_a_rule_is_back() {
     // `,` is percent-encoded by the HTTP client
     assert_eq!(
         queries[0],
-        "/rest/ip/firewall/raw?src-address-list=cctv_ban&.proplist=.id%2Cdisabled"
+        "/rest/ip/firewall/raw?src-address-list=cctv_ban&.proplist=.id%2Cdisabled%2Cinvalid"
     );
     assert_eq!(
         queries[1],
-        "/rest/ip/firewall/filter?src-address-list=cctv_ban&.proplist=.id%2Cdisabled"
+        "/rest/ip/firewall/filter?src-address-list=cctv_ban&.proplist=.id%2Cdisabled%2Cinvalid"
     );
 
     // a disabled rule does not count
@@ -1555,7 +1880,7 @@ fn missing_drop_rule_is_alerted_until_a_rule_is_back() {
         .lock()
         .unwrap()
         .rules
-        .push(("filter", "cctv_ban".to_string(), true));
+        .push(Rule::new("filter", "cctv_ban", true));
     h.advance(300); // 10:20
     assert_eq!(telegram_texts(&h).len(), 1);
     // an enabled one in filter does
@@ -1563,7 +1888,7 @@ fn missing_drop_rule_is_alerted_until_a_rule_is_back() {
         .lock()
         .unwrap()
         .rules
-        .push(("filter", "cctv_ban".to_string(), false));
+        .push(Rule::new("filter", "cctv_ban", false));
     h.advance(300); // 10:25
     let texts = telegram_texts(&h);
     assert_eq!(texts.len(), 2, "{:?}", texts);
@@ -1573,8 +1898,8 @@ fn missing_drop_rule_is_alerted_until_a_rule_is_back() {
     );
 }
 
-/// The rule check against replies shaped like RouterOS 7.18.1's: enabled
-/// `raw` rules have no `disabled` member, `filter` rules always have one.
+/// The rule check against replies shaped like RouterOS 7.18.1's: some
+/// enabled rules have no `disabled` member, others `"disabled":"false"`.
 #[test]
 fn rule_check_reads_the_disabled_member_as_the_router_prints_it() {
     use hik_f2b::action::HealthError;
@@ -1582,7 +1907,7 @@ fn rule_check_reads_the_disabled_member_as_the_router_prints_it() {
     let set = |rules: &[(&'static str, bool)]| {
         h.fake.lock().unwrap().rules = rules
             .iter()
-            .map(|(t, d)| (*t, "cctv_ban".to_string(), *d))
+            .map(|(t, d)| Rule::new(t, "cctv_ban", *d))
             .collect();
     };
     let check = || h.engine.firewall.as_ref().unwrap().check();
@@ -1600,15 +1925,191 @@ fn rule_check_reads_the_disabled_member_as_the_router_prints_it() {
     set(&[("raw", true), ("filter", false), ("filter", true)]);
     assert_eq!(
         check(),
-        Ok("1 enabled rule(s) in /ip/firewall/filter with src-address-list=cctv_ban".to_string())
+        Ok(
+            "1 enabled rule(s) in /ip/firewall/filter with src-address-list=cctv_ban; left out: \
+             2 disabled"
+                .to_string()
+        )
     );
 
     // only disabled rules, in both tables
     set(&[("raw", true), ("filter", true)]);
     assert!(matches!(check(), Err(HealthError::NotEnforced(_))));
     // a rule for another list does not count
-    h.fake.lock().unwrap().rules = vec![("raw", "other".to_string(), false)];
+    h.fake.lock().unwrap().rules = vec![Rule::new("raw", "other", false)];
     assert!(matches!(check(), Err(HealthError::NotEnforced(_))));
+    // the enabled rule with and without `"disabled":"false"`
+    set(&[("raw", true), ("raw", false)]);
+    assert!(check().is_ok());
+    set(&[("raw", false), ("raw", true)]);
+    assert!(check().is_ok());
+}
+
+/// A rule RouterOS marks invalid (its interface list was removed, say)
+/// blocks nothing: it is left out, and the check says so.
+#[test]
+fn invalid_rules_do_not_count() {
+    use hik_f2b::action::HealthError;
+    let mut h = Harness::new(true);
+    let check = |h: &Harness| h.engine.firewall.as_ref().unwrap().check();
+    h.fake.lock().unwrap().rules = vec![Rule::invalid("raw", "cctv_ban")];
+    assert_eq!(
+        check(&h),
+        Err(HealthError::NotEnforced(
+            "no enabled rule in /ip/firewall/raw or /ip/firewall/filter has \
+             src-address-list=cctv_ban; left out: 1 invalid"
+                .to_string()
+        ))
+    );
+    // an invalid rule in raw, a good one in filter
+    h.fake.lock().unwrap().rules = vec![
+        Rule::invalid("raw", "cctv_ban"),
+        Rule::new("raw", "cctv_ban", true),
+        Rule::new("filter", "cctv_ban", false),
+    ];
+    assert_eq!(
+        check(&h),
+        Ok(
+            "1 enabled rule(s) in /ip/firewall/filter with src-address-list=cctv_ban; left \
+            out: 1 disabled, 1 invalid"
+                .to_string()
+        )
+    );
+    // a dynamic rule reports neither property, and counts
+    h.fake.lock().unwrap().rules = vec![Rule::dynamic("raw", "cctv_ban")];
+    assert_eq!(
+        check(&h),
+        Ok("1 enabled rule(s) in /ip/firewall/raw with src-address-list=cctv_ban".to_string())
+    );
+    // the alert names the reason
+    h.fake.lock().unwrap().rules = vec![Rule::invalid("raw", "cctv_ban")];
+    run(&mut h, 3, 300);
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 1, "{:?}", texts);
+    assert!(texts[0].ends_with("left out: 1 invalid"), "{}", texts[0]);
+}
+
+/// An answer that is not the JSON asked for (a proxy's login page, say)
+/// is an error, never "no rule" or "the router answers".
+#[test]
+fn an_answer_that_is_not_json_is_an_error() {
+    use hik_f2b::action::{BanError, BanTime, HealthError};
+    for check_rule in [true, false] {
+        let h = Harness::with(Opts {
+            mikrotik_extra: if check_rule { "" } else { "check_rule = false" },
+            ..Default::default()
+        });
+        h.fake.lock().unwrap().rest_html = true;
+        let fw = h.engine.firewall.as_ref().unwrap();
+        match fw.check() {
+            Err(HealthError::Unusable(e)) => {
+                assert!(
+                    e.starts_with("the firewall answers with an error: "),
+                    "{}",
+                    e
+                );
+                assert!(e.contains("<html>"), "{}", e);
+            }
+            other => panic!("{:?}", other),
+        }
+        match fw.ban(attacker(), BanTime::Seconds(60), "t") {
+            Err(BanError::Router(e)) => assert!(
+                e.starts_with("the answer to the ban is not the JSON object RouterOS sends"),
+                "{}",
+                e
+            ),
+            other => panic!("{:?}", other),
+        }
+    }
+}
+
+/// Error answers that say nothing about one address stop the queue for
+/// the cycle and raise one alert, under `firewall`; only an answer about
+/// the address (HTTP 400) is a refused ban.
+#[test]
+fn router_errors_are_classified_and_bound_the_requests() {
+    // (status, for PUT only, the start of the alert reason)
+    for (status, put_only, reason) in [
+        (401, false, "the firewall refuses our login: HTTP 401: "),
+        (403, false, "the firewall refuses our login: HTTP 403: "),
+        (500, true, "the firewall answers with an error: HTTP 500: "),
+        (503, false, "the firewall answers with an error: HTTP 503: "),
+    ] {
+        let mut h = Harness::new(true);
+        {
+            let mut f = h.fake.lock().unwrap();
+            if put_only {
+                f.put_status = Some(status);
+            } else {
+                f.rest_status = Some(status);
+            }
+        }
+        for n in 1..=5 {
+            h.burst("10:01", &format!("198.51.100.{}", n), 5);
+        }
+        let before = h.fake.lock().unwrap().rest_requests;
+        h.cycle("10:02:00");
+        // one ban request and no lookup, whatever the number waiting; no
+        // periodic check either (it is not due yet)
+        let f = h.fake.lock().unwrap();
+        assert_eq!(f.rest_requests - before, 1, "HTTP {}", status);
+        assert!(f.lookups.is_empty(), "HTTP {}", status);
+        drop(f);
+        assert_eq!(h.engine.state.pending.len(), 5);
+        // a cycle with the periodic check: at most one more request per table
+        let before = h.fake.lock().unwrap().rest_requests;
+        h.cycle("10:05:00");
+        let used = h.fake.lock().unwrap().rest_requests - before;
+        assert!(used <= 3, "HTTP {}: {} requests", status, used);
+        run(&mut h, 15, 30); // 10:12:30
+        let texts = telegram_texts(&h);
+        assert_eq!(texts.len(), 1, "HTTP {}: one alert: {:?}", status, texts);
+        assert!(
+            texts[0].starts_with(&format!(
+                "{}the firewall is not usable for 10 min: {}",
+                WARN, reason
+            )),
+            "{}",
+            texts[0]
+        );
+        assert_eq!(
+            h.engine.alerted_problems(),
+            vec!["firewall"],
+            "HTTP {}",
+            status
+        );
+        // fixed: the bans go through, one recovery
+        {
+            let mut f = h.fake.lock().unwrap();
+            f.rest_status = None;
+            f.put_status = None;
+        }
+        h.advance(30);
+        assert_eq!(h.banned().len(), 5, "HTTP {}", status);
+        let texts = telegram_texts(&h);
+        assert_eq!(texts.len(), 7, "HTTP {}: {:?}", status, texts);
+        assert!(texts[6].starts_with(&format!("{}the firewall is usable again", OK)));
+        assert!(h.engine.alerted_problems().is_empty());
+    }
+}
+
+/// HTTP 400 is about this request: the address is looked up, and an
+/// unlisted one is refused, per address; at most two requests per address.
+#[test]
+fn a_refused_ban_costs_two_requests_per_address() {
+    let mut h = Harness::new(false);
+    h.fake.lock().unwrap().refuse_writes = true;
+    for n in 1..=3 {
+        h.burst("10:01", &format!("198.51.100.{}", n), 5);
+    }
+    let before = h.fake.lock().unwrap().rest_requests;
+    h.cycle("10:02:00");
+    let f = h.fake.lock().unwrap();
+    assert_eq!(f.rest_requests - before, 6);
+    assert_eq!(f.lookups.len(), 3);
+    drop(f);
+    assert_eq!(h.engine.state.pending.len(), 3);
+    assert_eq!(h.engine.alerted_problems(), Vec::<String>::new());
 }
 
 #[test]
@@ -1846,12 +2347,153 @@ fn already_listed_is_recognised_whatever_the_wording() {
 #[test]
 fn refused_ban_of_an_unlisted_address_is_retried() {
     let mut h = Harness::new(false);
-    h.fake.lock().unwrap().router_down = true; // every PUT gets HTTP 500
+    h.fake.lock().unwrap().refuse_writes = true; // every PUT gets HTTP 400
     h.burst("10:01", ATTACKER, 5);
     h.cycle("10:02:00");
     assert!(h.banned().is_empty());
     assert_eq!(h.engine.state.pending.len(), 1);
     assert_eq!(h.fake.lock().unwrap().lookups.len(), 1);
+    h.fake.lock().unwrap().refuse_writes = false;
+    h.advance(30);
+    assert_eq!(h.banned(), vec![ATTACKER]);
+}
+
+/// HTTP 500 says nothing about the address: no lookup, and the next cycle
+/// tries again.
+#[test]
+fn server_error_is_retried_without_a_lookup() {
+    let mut h = Harness::new(false);
+    h.fake.lock().unwrap().router_down = true; // every PUT gets HTTP 500
+    h.burst("10:01", ATTACKER, 5);
+    h.cycle("10:02:00");
+    assert!(h.banned().is_empty());
+    assert_eq!(h.engine.state.pending.len(), 1);
+    assert!(h.fake.lock().unwrap().lookups.is_empty());
+}
+
+/// The drop rule exists but does not block (wrong interface list, say): a
+/// banned attacker keeps reaching the NVR every `gap` seconds, `attacks`
+/// times, then stops. Returns the harness, the Telegram texts and the
+/// number of "still reached the NVR" warnings.
+fn bypass_run(gap: i64, attacks: i64) -> (Harness, Vec<String>, usize) {
+    let mut h = Harness::new(true);
+    util::capture_log();
+    let burst = |h: &Harness, at: i64| {
+        for i in 0..5 {
+            Harness::add_at(&h.fake, &device(at + SKEW + i), ATTACKER);
+        }
+    };
+    let t0 = h.host;
+    burst(&h, t0 + 60);
+    h.advance(120); // banned
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    let banned = h.host;
+    // the router lists it, the NVR still sees it
+    let bursts: Vec<i64> = (1..=attacks).map(|k| banned + k * gap - 20).collect();
+    let end = bursts.last().copied().unwrap_or(banned) + 1800;
+    let mut next = 0;
+    while h.host < end {
+        let now = h.host + 30;
+        while next < bursts.len() && bursts[next] + 5 <= now {
+            burst(&h, bursts[next]);
+            next += 1;
+        }
+        h.advance(30);
+    }
+    assert!(h.engine.state.pending.is_empty());
+    let warnings = logged(&util::captured_log(), "but still reached the NVR");
+    let texts = telegram_texts(&h);
+    (h, texts, warnings)
+}
+
+#[test]
+fn a_ban_the_router_does_not_enforce_is_warned_and_alerted() {
+    for gap in [30, 60, 300] {
+        let (h, texts, warnings) = bypass_run(gap, 2400 / gap);
+        // every burst after the first two minutes is warned about, however
+        // fast the attacker comes back
+        assert!(
+            warnings as i64 >= 2400 / gap - 120 / gap,
+            "gap {}: {} warnings",
+            gap,
+            warnings
+        );
+        let alerts: Vec<&String> = texts
+            .iter()
+            .filter(|t| t.contains("banned addresses still reach an NVR"))
+            .collect();
+        assert_eq!(alerts.len(), 1, "gap {}: {:?}", gap, texts);
+        assert!(
+            alerts[0].starts_with(&format!(
+                "{}banned addresses still reach an NVR for 10 min: 198.51.100.7 has been in \
+                 MikroTik address-list cctv_ban for ",
+                WARN
+            )),
+            "{}",
+            alerts[0]
+        );
+        assert!(
+            alerts[0].ends_with(" and still reached nvr1"),
+            "{}",
+            alerts[0]
+        );
+        // the attacker stops (the rule is fixed): one recovery, alert_after
+        // after the last one
+        let last = texts.last().unwrap();
+        assert!(
+            last.starts_with(&format!(
+                "{}banned addresses no longer reach the NVRs (after ",
+                OK
+            )),
+            "gap {}: {:?}",
+            gap,
+            texts
+        );
+        assert!(h.engine.alerted_problems().is_empty());
+        // no ban notification for an address already listed
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|t| t.contains("198.51.100.7 banned"))
+                .count(),
+            1
+        );
+    }
+}
+
+/// An attacker that comes back less often than `alert_after` is warned
+/// about each time, but never stays a problem long enough to be alerted.
+#[test]
+fn a_rare_bypass_is_warned_but_not_alerted() {
+    let (h, texts, warnings) = bypass_run(900, 4);
+    assert_eq!(warnings, 4);
+    assert_eq!(texts.len(), 1, "only the ban: {:?}", texts);
+    assert!(h.engine.alerted_problems().is_empty());
+}
+
+/// The time of the original ban is kept while the address keeps coming
+/// back, also across a restart (it is in the state file).
+#[test]
+fn already_listed_keeps_the_time_of_the_ban() {
+    let mut h = Harness::new(false);
+    h.burst("10:01", ATTACKER, 5);
+    h.cycle("10:02:00");
+    let until = h.engine.state.banned[&attacker()];
+    h.burst("10:05", ATTACKER, 5);
+    h.cycle("10:06:00");
+    assert_eq!(h.engine.state.banned[&attacker()], until);
+    h.restart();
+    h.burst("10:08", ATTACKER, 5);
+    h.cycle("10:09:00");
+    assert_eq!(h.engine.state.banned[&attacker()], until);
+    // an address listed by hand counts from the first time it is seen
+    h.fake.lock().unwrap().bans.push("198.51.100.8".to_string());
+    h.burst("10:10", "198.51.100.8", 5);
+    h.cycle("10:11:00");
+    let first = h.engine.state.banned[&ip("198.51.100.8")];
+    h.burst("10:12", "198.51.100.8", 5);
+    h.cycle("10:13:00");
+    assert_eq!(h.engine.state.banned[&ip("198.51.100.8")], first);
 }
 
 #[test]
@@ -1936,6 +2578,49 @@ fn check_command_reports_each_item_and_changes_nothing() {
     assert_eq!(lines[2].status, Status::Off);
     assert_eq!(lines[3].status, Status::Off);
     assert_eq!(h.fake.lock().unwrap().router_requests, 0);
+}
+
+#[test]
+fn dump_fails_when_an_nvr_cannot_be_read() {
+    let h = Harness::build(Opts {
+        second_nvr: true,
+        ..Default::default()
+    });
+    h.add("09:30:00", ATTACKER);
+    h.fake2.as_ref().unwrap().lock().unwrap().nvr_down = true;
+    let ini = h.dir.join("hik-f2b.ini");
+    std::fs::write(&ini, &h.ini).unwrap();
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_hik-f2b"))
+            .arg("--config")
+            .arg(&ini)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let out = run(&["--dump", "--hours", "2"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{}\n{}", stdout, stderr);
+    // what could be read is still printed, the error goes to stderr
+    assert!(stdout.contains("=== nvr1"), "{}", stdout);
+    assert!(stdout.contains("MATCH"), "{}", stdout);
+    assert!(!stdout.contains("ERROR"), "{}", stdout);
+    assert!(stderr.contains("ERROR: nvr2: "), "{}", stderr);
+    assert!(
+        stderr.contains("hik-f2b: 1 of 2 NVR(s) could not be read"),
+        "{}",
+        stderr
+    );
+    h.fake2.as_ref().unwrap().lock().unwrap().nvr_down = false;
+    let out = run(&["--dump", "--hours", "2"]);
+    assert_eq!(out.status.code(), Some(0));
+    // options that exclude each other
+    let out = run(&["--check", "--dump"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--check and --dump cannot be used together")
+    );
 }
 
 /// The log line of `--check` for one NVR, after a few entries.

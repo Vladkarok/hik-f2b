@@ -7,7 +7,137 @@ use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
-pub type Section = BTreeMap<String, String>;
+/// The settings each section may have. Every setting is read through
+/// `Section::get`, which (in debug builds, so in every test) fails for a
+/// key that is not listed here; so a setting the code reads cannot be
+/// missing from these lists, and `parse_ini` rejects everything else.
+const GENERAL_KEYS: &[&str] = &[
+    "poll_interval",
+    "maxretry",
+    "findtime",
+    "bantime",
+    "lookback",
+    "auth_backoff",
+    "alert_after",
+    "max_bans_per_hour",
+    "state_file",
+    "ignoreip",
+    "meta_id",
+    "log_filter",
+    "dry_run",
+    "country_db",
+];
+const MIKROTIK_KEYS: &[&str] = &[
+    "url",
+    "user",
+    "password",
+    "password_file",
+    "address_list",
+    "ca_file",
+    "check_rule",
+];
+const NVR_KEYS: &[&str] = &["url", "user", "password", "password_file", "ca_file"];
+const TELEGRAM_KEYS: &[&str] = &[
+    "enabled",
+    "api_url",
+    "bot_token",
+    "bot_token_file",
+    "chat_id",
+    "message_thread_id",
+    "topic_id",
+    "silent",
+    "message",
+    "health_alerts",
+];
+/// Each kind of section with its settings, for error messages.
+const SECTIONS: [(&str, &[&str]); 4] = [
+    ("general", GENERAL_KEYS),
+    ("mikrotik", MIKROTIK_KEYS),
+    ("nvr:<name>", NVR_KEYS),
+    ("telegram", TELEGRAM_KEYS),
+];
+
+/// The settings a section of this name may have; `None` for a section that
+/// does not exist.
+fn known_keys(section: &str) -> Option<&'static [&'static str]> {
+    match section {
+        "general" => Some(GENERAL_KEYS),
+        "mikrotik" => Some(MIKROTIK_KEYS),
+        "telegram" => Some(TELEGRAM_KEYS),
+        s if s.starts_with("nvr:") => Some(NVR_KEYS),
+        _ => None,
+    }
+}
+
+/// One section of the config: its settings, each set once, all known.
+pub struct Section {
+    known: &'static [&'static str],
+    values: BTreeMap<String, String>,
+}
+
+impl Section {
+    fn new(known: &'static [&'static str]) -> Section {
+        Section {
+            known,
+            values: BTreeMap::new(),
+        }
+    }
+
+    /// The value of a setting. `key` must be one of the section's known
+    /// settings (see `GENERAL_KEYS`).
+    pub fn get(&self, key: &str) -> Option<&String> {
+        debug_assert!(
+            self.known.contains(&key),
+            "setting {} is read but not in the list of known settings",
+            key
+        );
+        self.values.get(key)
+    }
+}
+
+/// The number of single-character insertions, deletions and substitutions
+/// that turn `a` into `b`.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let substitute = diagonal + usize::from(ca != *cb);
+            diagonal = row[j + 1];
+            row[j + 1] = substitute.min(row[j] + 1).min(row[j + 1] + 1);
+        }
+    }
+    row[b.len()]
+}
+
+/// The error for a setting `key` that section `section` does not have,
+/// with the setting probably meant: the one known setting of the section
+/// that is closest to it (at most two characters away), or else the kind
+/// of section that has a setting of that name.
+fn unknown_key(line: usize, section: &str, key: &str) -> String {
+    let known = known_keys(section).unwrap_or(&[]);
+    let mut close: Vec<(usize, &str)> = known
+        .iter()
+        .map(|k| (edit_distance(key, k), *k))
+        .filter(|(d, _)| *d <= 2)
+        .collect();
+    close.sort_unstable();
+    let hint = match close.as_slice() {
+        [(d, k), rest @ ..] if rest.first().is_none_or(|(next, _)| next > d) => {
+            format!("; did you mean {}?", k)
+        }
+        _ => match SECTIONS.iter().find(|(_, keys)| keys.contains(&key)) {
+            Some((name, _)) => format!("; {} belongs in a [{}] section", key, name),
+            None => String::new(),
+        },
+    };
+    format!(
+        "line {}: unknown setting {} in [{}]{}",
+        line, key, section, hint
+    )
+}
 
 pub const DEFAULT_IGNORE: &str = "127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16";
 /// Seen on real firmware as `.../Exception/illlegealAccess` (sic).
@@ -76,6 +206,9 @@ pub struct Config {
     /// True when a password or token is written in the config itself
     /// rather than read from a separate secret file.
     pub inline_secrets: bool,
+    /// The secret files the config names (`password_file`,
+    /// `bot_token_file`) and that were read.
+    pub secret_files: Vec<PathBuf>,
     /// `None` = notify-only mode: nothing is banned.
     pub mikrotik: Option<MikrotikCfg>,
     pub nvrs: Vec<NvrCfg>,
@@ -117,6 +250,9 @@ impl Net {
     }
 }
 
+/// Reads the INI text. Every section and every setting must be known (a
+/// typo such as `ignore_ip` or `dryrun` would otherwise be ignored, and
+/// fail open), and a setting may appear only once in a section.
 pub fn parse_ini(text: &str) -> Result<BTreeMap<String, Section>, String> {
     let mut out: BTreeMap<String, Section> = BTreeMap::new();
     let mut current: Option<String> = None;
@@ -134,18 +270,32 @@ pub fn parse_ini(text: &str) -> Result<BTreeMap<String, Section>, String> {
             if out.contains_key(&name) {
                 return Err(format!("line {}: section [{}] appears twice", n + 1, name));
             }
-            out.insert(name.clone(), Section::new());
+            let known = known_keys(&name)
+                .ok_or_else(|| format!("line {}: unknown section [{}]", n + 1, name))?;
+            out.insert(name.clone(), Section::new(known));
             current = Some(name);
             continue;
         }
         let (key, value) = line
             .split_once('=')
             .ok_or_else(|| format!("line {}: expected key = value", n + 1))?;
-        let section = current
+        let (name, section) = current
             .as_ref()
-            .and_then(|name| out.get_mut(name))
+            .and_then(|name| out.get_mut(name).map(|section| (name, section)))
             .ok_or_else(|| format!("line {}: key outside of a section", n + 1))?;
-        section.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
+        let key = key.trim().to_ascii_lowercase();
+        if !section.known.contains(&key.as_str()) {
+            return Err(unknown_key(n + 1, name, &key));
+        }
+        if section.values.contains_key(&key) {
+            return Err(format!(
+                "line {}: {} is set twice in [{}]",
+                n + 1,
+                key,
+                name
+            ));
+        }
+        section.values.insert(key, value.trim().to_string());
     }
     Ok(out)
 }
@@ -205,11 +355,22 @@ fn duration(sec: &Section, key: &str, default: u64, min: u64, max: u64) -> Resul
     Ok(value)
 }
 
+/// The longest timeout RouterOS accepts for an address-list entry,
+/// `35w3d13h13m56s`; a longer one fails with "value of timeout is out of
+/// range". It is also the limit in notify-only mode, so that a config works
+/// the same with and without a router.
+pub const MAX_BANTIME: u64 = 21_474_836;
+
 /// `bantime`: a time setting, or `permanent`.
 fn bantime(sec: &Section) -> Result<BanTime, String> {
     match sec.get("bantime") {
         Some(v) if v.eq_ignore_ascii_case("permanent") => Ok(BanTime::Permanent),
-        _ => duration(sec, "bantime", 86400, 60, 365 * 86400)
+        Some(v) if parse_seconds(v).is_some_and(|s| s > MAX_BANTIME) => Err(format!(
+            "bantime must be at most {} seconds (35w3d13h13m56s, about 248 days): RouterOS \
+             accepts no longer timeout; for a longer ban use bantime = permanent",
+            MAX_BANTIME
+        )),
+        _ => duration(sec, "bantime", 86400, 60, MAX_BANTIME)
             .map(BanTime::Seconds)
             .map_err(|e| format!("{} (or the word permanent)", e)),
     }
@@ -278,19 +439,35 @@ pub fn check_url(url: &str, secret_bearing: bool, what: &str) -> Result<String, 
     } else {
         return Err(format!("{}: url must start with http:// or https://", what));
     };
-    let ok = !rest.is_empty()
-        && rest.len() <= 255
-        && rest
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || ".-:[]".contains(c));
-    if !ok {
-        return Err(format!("{}: url must be just scheme://host[:port]", what));
+    let bad = || format!("{}: url must be just scheme://host[:port]", what);
+    if rest.is_empty() || rest.len() > 255 {
+        return Err(bad());
     }
-    let host = if let Some(v6) = rest.strip_prefix('[') {
-        v6.split(']').next().unwrap_or("")
+    // `[v6]` or a name or IPv4 address, then nothing or `:port`.
+    let (host, port, host_ok) = if let Some(v6) = rest.strip_prefix('[') {
+        let (host, port) = v6.split_once(']').ok_or_else(bad)?;
+        let ok = host.contains(':')
+            && host
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.');
+        (host, port, ok)
     } else {
-        rest.split(':').next().unwrap_or("")
+        let (host, port) = rest.find(':').map_or((rest, ""), |i| rest.split_at(i));
+        let ok = host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+        (host, port, ok)
     };
+    let port_ok = port.is_empty()
+        || port.strip_prefix(':').is_some_and(|p| {
+            !p.is_empty()
+                && p.len() <= 5
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && p.parse::<u32>().is_ok_and(|n| (1..=65535).contains(&n))
+        });
+    if host.is_empty() || !host_ok || !port_ok {
+        return Err(bad());
+    }
     let local = host == "localhost" || host == "127.0.0.1" || host == "::1";
     if secret_bearing && !https && !local {
         return Err(format!(
@@ -346,7 +523,7 @@ impl Config {
 
     pub fn parse(text: &str) -> Result<Config, String> {
         let ini = parse_ini(text)?;
-        let empty = Section::new();
+        let empty = Section::new(GENERAL_KEYS);
         let g = ini.get("general").unwrap_or(&empty);
 
         let mut ignore = Vec::new();
@@ -418,10 +595,41 @@ impl Config {
             _ => None,
         };
 
-        for name in ini.keys() {
-            let known = ["general", "mikrotik", "telegram"].contains(&name.as_str());
-            if !known && !name.starts_with("nvr:") {
-                return Err(format!("unknown section [{}]", name));
+        // An empty path would put the state file (and its temporary file)
+        // in the working directory, and saving would fail on every poll.
+        let state_file = g
+            .get("state_file")
+            .map(|s| s.as_str())
+            .unwrap_or("/var/lib/hik-f2b/state");
+        if state_file.is_empty() {
+            return Err(
+                "state_file must not be empty (leave it out for the default \
+                 /var/lib/hik-f2b/state)"
+                    .to_string(),
+            );
+        }
+
+        let mut secret_files: Vec<PathBuf> = Vec::new();
+        let used = ini
+            .get("mikrotik")
+            .map(|m| (m, "password_file"))
+            .into_iter()
+            .chain(
+                ini.iter()
+                    .filter(|(name, _)| name.starts_with("nvr:"))
+                    .map(|(_, sec)| (sec, "password_file")),
+            )
+            .chain(
+                ini.get("telegram")
+                    .filter(|_| telegram.is_some())
+                    .map(|t| (t, "bot_token_file")),
+            );
+        for (sec, key) in used {
+            if let Some(path) = sec.get(key) {
+                let path = PathBuf::from(path);
+                if !secret_files.contains(&path) {
+                    secret_files.push(path);
+                }
             }
         }
 
@@ -436,11 +644,7 @@ impl Config {
             auth_backoff: duration(g, "auth_backoff", 900, 60, 86400)?,
             alert_after: duration(g, "alert_after", 600, 60, 7 * 86400)?,
             max_bans_per_hour: number(g, "max_bans_per_hour", 20, 1, 10000)? as usize,
-            state_file: PathBuf::from(
-                g.get("state_file")
-                    .map(|s| s.as_str())
-                    .unwrap_or("/var/lib/hik-f2b/state"),
-            ),
+            state_file: PathBuf::from(state_file),
             ignore,
             meta_id,
             log_filter,
@@ -451,9 +655,10 @@ impl Config {
                 .get("country_db")
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from),
-            inline_secrets: ini
-                .values()
-                .any(|sec| sec.contains_key("password") || sec.contains_key("bot_token")),
+            inline_secrets: ini.values().any(|sec| {
+                sec.values.contains_key("password") || sec.values.contains_key("bot_token")
+            }),
+            secret_files,
             mikrotik,
             nvrs,
             telegram,
@@ -526,18 +731,21 @@ impl Config {
     }
 }
 
-/// True when other local users can read the file (it may hold passwords).
+/// The permission bits of a file that its group or other users can read
+/// (it may hold passwords); `None` when only its owner can, or when that
+/// cannot be told.
 #[cfg(unix)]
-pub fn world_readable(path: &Path) -> bool {
+pub fn readable_by_others(path: &Path) -> Option<u32> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
-        .map(|m| m.permissions().mode() & 0o007 != 0)
-        .unwrap_or(false)
+        .ok()
+        .map(|m| m.permissions().mode() & 0o7777)
+        .filter(|mode| mode & 0o044 != 0)
 }
 
 #[cfg(not(unix))]
-pub fn world_readable(_path: &Path) -> bool {
-    false
+pub fn readable_by_others(_path: &Path) -> Option<u32> {
+    None
 }
 
 #[cfg(test)]
@@ -787,9 +995,22 @@ mod tests {
     fn time_bounds_apply_after_conversion() {
         assert!(general("bantime = 1m").is_ok());
         assert!(general("bantime = 59s").is_err());
-        assert!(general("bantime = 365d").is_ok());
-        assert!(general("bantime = 366d").is_err());
-        assert!(general("bantime = 53w").is_err());
+        // the longest timeout RouterOS accepts, 35w3d13h13m56s
+        assert_eq!(
+            general("bantime = 21474836").unwrap().bantime,
+            BanTime::Seconds(21_474_836)
+        );
+        assert!(general("bantime = 248d").is_ok());
+        assert!(general("bantime = 35w").is_ok());
+        for long in ["21474837", "249d", "36w", "365d"] {
+            let err = general(&format!("bantime = {}", long)).err().unwrap();
+            assert!(
+                err.contains("at most 21474836 seconds") && err.contains("bantime = permanent"),
+                "{}: {}",
+                long,
+                err
+            );
+        }
         assert!(general("poll_interval = 1h").is_ok());
         assert!(general("poll_interval = 61m").is_err());
         assert!(general("lookback = 2d").is_ok());
@@ -800,7 +1021,7 @@ mod tests {
         assert!(general("findtime = 5w").is_err());
         // too large for any integer type: a bounds error, not a panic
         let huge = general("bantime = 99999999999999999999w").err().unwrap();
-        assert!(huge.contains("between 60 and 31536000"), "{}", huge);
+        assert!(huge.contains("at most 21474836"), "{}", huge);
         let big = general("findtime = 3000000000000000000w").err().unwrap();
         assert!(big.contains("findtime must be between"), "{}", big);
     }
@@ -848,6 +1069,241 @@ mod tests {
             general("bantime = 0").is_err(),
             "0 is not a way to say permanent"
         );
+    }
+
+    #[test]
+    fn unknown_settings_are_errors_with_a_hint() {
+        let err = |text: &str| Config::parse(text).err().unwrap();
+        // the typos that would fail open or be ignored silently
+        for (section, typo, meant) in [
+            ("general", "ignore_ip = 198.51.100.0/24", "ignoreip"),
+            ("general", "dryrun = true", "dry_run"),
+            ("general", "max_retry = 3", "maxretry"),
+            ("general", "BanTimes = 1h", "bantime"),
+            ("mikrotik", "check_rules = false", "check_rule"),
+            ("mikrotik", "passwrd = x", "password"),
+            ("telegram", "health_alert = false", "health_alerts"),
+        ] {
+            let text = match section {
+                "general" => format!("{}[general]\n{}\n", BASE, typo),
+                "mikrotik" => BASE.replace(
+                    "ca_file = public\n",
+                    &format!("ca_file = public\n{}\n", typo),
+                ),
+                _ => format!(
+                    "{}[telegram]\nbot_token = 1:a\nchat_id = 5\n{}\n",
+                    BASE, typo
+                ),
+            };
+            let e = err(&text);
+            let key = typo.split(' ').next().unwrap().to_ascii_lowercase();
+            assert!(
+                e.contains(&format!("unknown setting {} in [{}]", key, section))
+                    && e.ends_with(&format!("did you mean {}?", meant)),
+                "{}",
+                e
+            );
+            assert!(e.starts_with("line "), "{}", e);
+        }
+        // no close setting: no guess, or the section the setting belongs in
+        let e = err(&format!("{}[general]\nwhatever = 1\n", BASE));
+        assert!(
+            e.ends_with("unknown setting whatever in [general]"),
+            "{}",
+            e
+        );
+        let e = err(&format!("{}[general]\nchat_id = 5\n", BASE));
+        assert!(
+            e.ends_with("chat_id belongs in a [telegram] section"),
+            "{}",
+            e
+        );
+        let e = err(&format!(
+            "{}[nvr:two]\nurl = http://192.0.2.11\ndry_run = 1\n",
+            BASE
+        ));
+        assert!(e.contains("unknown setting dry_run in [nvr:two]"), "{}", e);
+        assert!(e.ends_with("belongs in a [general] section"), "{}", e);
+        // also in a section that is switched off
+        let e = err(&format!("{}[telegram]\nenabled = false\nsilnt = 1\n", BASE));
+        assert!(e.ends_with("did you mean silent?"), "{}", e);
+        let e = err(&format!("{}[oops]\nx = 1\n", BASE));
+        assert!(e.ends_with("unknown section [oops]"), "{}", e);
+    }
+
+    #[test]
+    fn a_setting_given_twice_is_an_error() {
+        let e = Config::parse(&format!(
+            "{}[general]\nignoreip = 198.51.100.0/24\nmaxretry = 3\nignoreip = 203.0.113.0/24\n",
+            BASE
+        ))
+        .err()
+        .unwrap();
+        assert!(e.contains("ignoreip is set twice in [general]"), "{}", e);
+        // case does not make it another setting
+        let e = Config::parse(&BASE.replace(
+            "user = f2b\npassword = p\nca_file",
+            "user = f2b\nUSER = x\npassword = p\nca_file",
+        ))
+        .err()
+        .unwrap();
+        assert!(e.contains("user is set twice in [mikrotik]"), "{}", e);
+        // the same setting in two sections is fine
+        assert!(Config::parse(BASE).is_ok());
+    }
+
+    #[test]
+    fn empty_state_file_is_an_error() {
+        let e = general("state_file =").err().unwrap();
+        assert!(e.starts_with("state_file must not be empty"), "{}", e);
+        assert_eq!(
+            Config::parse(BASE).unwrap().state_file,
+            PathBuf::from("/var/lib/hik-f2b/state")
+        );
+        assert_eq!(
+            general("state_file = /tmp/x").unwrap().state_file,
+            PathBuf::from("/tmp/x")
+        );
+    }
+
+    #[test]
+    fn every_setting_the_code_reads_is_known() {
+        // `Section::get` fails on a setting that is not in the lists, so
+        // configs that set every setting (and take every branch that reads
+        // one) prove that the lists cover what the code reads.
+        let all = "[general]\npoll_interval = 30\nmaxretry = 5\nfindtime = 1h\nbantime = 1d\n\
+                   lookback = 120\nauth_backoff = 900\nalert_after = 10m\n\
+                   max_bans_per_hour = 20\nstate_file = /tmp/s\nignoreip = 10.0.0.0/8\n\
+                   meta_id = log.std-cgi.com/Exception\nlog_filter = x\ndry_run = false\n\
+                   country_db = /tmp/c.mmdb\n\
+                   [mikrotik]\nurl = https://192.0.2.1\nuser = f2b\npassword = p\n\
+                   address_list = l\nca_file = public\ncheck_rule = true\n\
+                   [nvr:one]\nurl = https://192.0.2.10\nuser = f2b\npassword = p\nca_file = public\n\
+                   [telegram]\nenabled = true\napi_url = https://api.telegram.org\n\
+                   bot_token = 1:a\nchat_id = 5\nmessage_thread_id = 7\nsilent = false\n\
+                   message = m\nhealth_alerts = true\n";
+        let cfg = Config::parse(all).unwrap();
+        assert!(cfg.inline_secrets);
+        assert!(Config::parse(&all.replace("message_thread_id", "topic_id")).is_ok());
+        let dir = std::env::temp_dir().join(format!("hik-f2b-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = dir.join("secret");
+        std::fs::write(&secret, "1:a\n").unwrap();
+        let from_files = all
+            .replace(
+                "password = p",
+                &format!("password_file = {}", secret.display()),
+            )
+            .replace(
+                "bot_token = 1:a",
+                &format!("bot_token_file = {}", secret.display()),
+            );
+        let cfg = Config::parse(&from_files).unwrap();
+        assert!(!cfg.inline_secrets);
+        std::fs::remove_dir_all(&dir).unwrap();
+        // every listed setting is accepted where it belongs
+        for (section, keys) in SECTIONS {
+            for key in keys {
+                assert!(known_keys(&section.replace("<name>", "x"))
+                    .unwrap()
+                    .contains(key));
+            }
+        }
+    }
+
+    #[test]
+    fn urls_are_scheme_host_and_port_only() {
+        let ok = |url: &str| check_url(url, true, "t");
+        assert_eq!(ok("http://[::1]:8080/").unwrap(), "http://[::1]:8080");
+        assert!(ok("http://[::1]").is_ok());
+        assert!(ok("http://localhost:65535").is_ok());
+        assert!(ok("https://[2001:db8::1]:443").is_ok());
+        assert!(ok("https://router.example.net").is_ok());
+        for bad in [
+            "http://[::1]evil.example",
+            "http://[::1]:80evil",
+            "http://[::1",
+            "http://[]",
+            "http://[evil.example]",
+            "http://127.0.0.1:80:90",
+            "http://127.0.0.1:",
+            "http://127.0.0.1:0",
+            "http://127.0.0.1:65536",
+            "http://127.0.0.1:+80",
+            "http://:80",
+            "https://a[b]",
+            "https://user@192.0.2.1",
+            "https://192.0.2.1/path",
+            "https://192.0.2.1?x=1",
+        ] {
+            let e = ok(bad)
+                .err()
+                .unwrap_or_else(|| panic!("{} was accepted", bad));
+            assert!(e.contains("scheme://host[:port]"), "{}: {}", bad, e);
+        }
+        // plain http only to this host
+        assert!(ok("http://[::1]:8080").is_ok());
+        assert!(ok("http://127.0.0.1").is_ok());
+        let e = ok("http://192.0.2.1").err().unwrap();
+        assert!(e.contains("must be https"), "{}", e);
+        assert!(check_url("http://192.0.2.1", false, "t").is_ok());
+    }
+
+    #[test]
+    fn secret_files_are_listed() {
+        let dir = std::env::temp_dir().join(format!("hik-f2b-secrets-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let router = dir.join("router");
+        let nvr = dir.join("nvr");
+        let token = dir.join("token");
+        std::fs::write(&router, "r\n").unwrap();
+        std::fs::write(&nvr, "n").unwrap();
+        std::fs::write(&token, "1:a").unwrap();
+        let text = format!(
+            "[mikrotik]\nurl = https://192.0.2.1\nuser = f2b\npassword_file = {r}\n\
+             ca_file = public\n\
+             [nvr:one]\nurl = http://192.0.2.10\nuser = f2b\npassword_file = {n}\n\
+             [nvr:two]\nurl = http://192.0.2.11\nuser = f2b\npassword_file = {n}\n\
+             [telegram]\nbot_token_file = {t}\nchat_id = 5\n",
+            r = router.display(),
+            n = nvr.display(),
+            t = token.display()
+        );
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(
+            cfg.secret_files,
+            vec![router.clone(), nvr.clone(), token.clone()]
+        );
+        assert!(!cfg.inline_secrets);
+        // a switched-off [telegram] section reads no file
+        let off = text.replace("[telegram]\n", "[telegram]\nenabled = false\n");
+        assert_eq!(Config::parse(&off).unwrap().secret_files, vec![router, nvr]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |m: u32| {
+                std::fs::set_permissions(&token, std::fs::Permissions::from_mode(m)).unwrap();
+                readable_by_others(&token)
+            };
+            assert_eq!(mode(0o600), None);
+            assert_eq!(mode(0o400), None);
+            assert_eq!(mode(0o640), Some(0o640), "readable by the group");
+            assert_eq!(mode(0o604), Some(0o604), "readable by others");
+            assert_eq!(mode(0o644), Some(0o644));
+            assert_eq!(mode(0o602), None, "writable is not readable");
+        }
+        assert_eq!(readable_by_others(&dir.join("missing")), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn edit_distances() {
+        assert_eq!(edit_distance("ignore_ip", "ignoreip"), 1);
+        assert_eq!(edit_distance("dryrun", "dry_run"), 1);
+        assert_eq!(edit_distance("bantimes", "bantime"), 1);
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+        assert_eq!(edit_distance("url", "url"), 0);
     }
 
     #[test]

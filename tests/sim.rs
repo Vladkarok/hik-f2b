@@ -26,7 +26,9 @@
 //!   without a router.
 //! - `Clock`: as `Firewall`, plus device clock steps: forward and backward,
 //!   below and above the thresholds the engine treats as a jump, a DST
-//!   change, an RTC reset to 2000-01-01 and its correction.
+//!   change, an RTC reset to 2000-01-01 and its correction, and the end of
+//!   DST on an NVR that cannot be reached for an hour while failed logins
+//!   are logged (they are read only after the step).
 //!
 //! Every scenario starts with failed logins already in the logs (some within
 //! `lookback` before the first start), may start with an NVR unreachable, and
@@ -63,6 +65,14 @@
 //!   engine read at that poll (the fake's skew); several entries share a
 //!   device time only after a device clock went back, and then at most as
 //!   many are counted as were logged.
+//! - `count/shift` (all): a failed login is counted at a host time that
+//!   differs from its true host time by at most what the engine allows:
+//!   `CLOCK_JUMP` for each change of the NVR's offset the engine stored
+//!   between the entry's logging and its count, plus how far the device
+//!   clock was from the stored offset when the entry was logged (a step
+//!   between two polls that is undone before the next one cannot be seen).
+//!   An offset change larger than `CLOCK_JUMP`, in either direction, must be
+//!   a resync, after which nothing logged before it is counted.
 //! - `liveness` (all but `Clock`): after the settle phase, every address
 //!   that is never exempt and had `maxretry` failed logins that the engine
 //!   must have read within `findtime` of the first of them has been banned
@@ -83,7 +93,9 @@
 //!   an address that is already listed.
 //! - `health/model` (all): the health notices of each cycle are exactly the
 //!   ones the documented policy gives for what the engine observed (failed
-//!   and successful polls, ban attempts, firewall checks, the rate limit):
+//!   and successful polls, ban attempts, firewall checks, the rate limit,
+//!   listed addresses that still reach an NVR well after their ban, which
+//!   is over once none has for `alert_after` while every NVR is read):
 //!   alert once after `alert_after`, reminder after 24 h, one recovery or
 //!   "unknown" when an alerted problem ends, nothing for a short one, state
 //!   lost on restart. `health/condition` (all): an unreachable firewall is
@@ -106,7 +118,8 @@
 mod fake;
 
 use fake::{Entry, Fake, Harness, Opts, SKEW};
-use hik_f2b::state::{State, MAX_PENDING, MAX_SEEN, MAX_TRACKED};
+use hik_f2b::engine::{fail_limits, CLOCK_JUMP};
+use hik_f2b::state::{State, MAX_BANNED, MAX_FAIL_TIMES, MAX_PENDING, MAX_SEEN};
 use hik_f2b::util;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::Ipv4Addr;
@@ -362,10 +375,23 @@ struct NvrSim {
     name: String,
     mode: Mode,
     skew: i64,
+    /// Times the offset the engine stores for this NVR changed.
+    offset_changes: usize,
     started: bool,
     last_flood: i64,
     /// Host times of its entries, in the order written (ascending).
     times: Vec<i64>,
+}
+
+/// What `count/shift` needs of a failed login logged after the start.
+#[derive(Clone, Copy)]
+struct Logged {
+    /// True host time.
+    host: i64,
+    /// The offset the engine had stored for the NVR when it was logged.
+    stored: Option<i64>,
+    /// `NvrSim::offset_changes` when it was logged.
+    changes: usize,
 }
 
 /// One generated log entry.
@@ -449,6 +475,8 @@ impl Health {
 enum Line {
     Counted(usize, Ipv4Addr, i64),
     Ban(Ipv4Addr, Ban),
+    /// Already listed, but still reached the NVR well after its ban.
+    Bypass(Ipv4Addr),
     Transport(Ipv4Addr),
     Refused(Ipv4Addr),
     CheckFailed,
@@ -529,6 +557,9 @@ fn classify(line: &str) -> Line {
     if let Some((first, rest)) = text.split_once(' ') {
         if let Ok(ip) = first.trim_end_matches(':').parse::<Ipv4Addr>() {
             if rest.starts_with("is already in ") {
+                if rest.contains(" but still reached the NVR") {
+                    return Line::Bypass(ip);
+                }
                 return Line::Ban(ip, Ban::Listed);
             }
             if rest.starts_with("the ban could not be applied") {
@@ -576,9 +607,9 @@ struct Sim {
     by_ip: HashMap<Ipv4Addr, Vec<usize>>,
     unsorted: bool,
     cycles: Vec<Cycle>,
-    /// The true host times of the failed logins logged after the start, by
-    /// (nvr, address, device time).
-    generated: HashMap<(usize, Ipv4Addr, i64), Vec<i64>>,
+    /// The failed logins logged after the start, by (nvr, address, device
+    /// time).
+    generated: HashMap<(usize, Ipv4Addr, i64), Vec<Logged>>,
     /// Failed logins counted, by (nvr, address, device time).
     counted: HashMap<(usize, Ipv4Addr, i64), u32>,
     /// Per address, the largest shift of a counted failed login: the host
@@ -588,6 +619,9 @@ struct Sim {
     bans: Vec<(i64, Ipv4Addr, Ban)>,
     dropped: HashSet<Ipv4Addr>,
     health: Health,
+    /// When a listed address last reached an NVR well after its ban (see
+    /// `health/model`).
+    last_bypass: Option<i64>,
     /// Addresses the liveness check had a due ban or report for.
     musts: usize,
     trace: Vec<String>,
@@ -615,6 +649,7 @@ impl Sim {
                 name: format!("nvr{}", n + 1),
                 mode: Mode::Ok,
                 skew: SKEW,
+                offset_changes: 0,
                 started: false,
                 last_flood: i64::MIN / 2,
                 times: Vec::new(),
@@ -643,6 +678,7 @@ impl Sim {
             bans: Vec::new(),
             dropped: HashSet::new(),
             health: Health::default(),
+            last_bypass: None,
             musts: 0,
             trace: Vec::new(),
         }
@@ -700,10 +736,22 @@ impl Sim {
         if let Some(ip) = ip {
             self.by_ip.entry(ip).or_default().push(index);
             if after_start {
+                let stored = self
+                    .h
+                    .engine
+                    .state
+                    .nvr
+                    .get(&self.nvr[n].name)
+                    .and_then(|st| st.offset);
+                let logged = Logged {
+                    host,
+                    stored,
+                    changes: self.nvr[n].offset_changes,
+                };
                 self.generated
                     .entry((n, ip, device))
                     .or_default()
-                    .push(host);
+                    .push(logged);
             }
         }
     }
@@ -891,10 +939,7 @@ impl Sim {
                 Ok(())
             }
             Kind::Flood => self.flood(),
-            Kind::Clock => {
-                self.clock();
-                Ok(())
-            }
+            Kind::Clock => self.clock(),
         }
     }
 
@@ -997,6 +1042,7 @@ impl Sim {
         self.instance += 1;
         self.configs.push(self.nets.clone());
         self.health = Health::default();
+        self.last_bypass = None;
         self.h.engine.startup_check(self.host as u64);
         self.startup_lines()
     }
@@ -1056,8 +1102,11 @@ impl Sim {
         Ok(())
     }
 
-    fn clock(&mut self) {
+    fn clock(&mut self) -> Result<(), String> {
         let n = self.rng.below(self.p.nvrs as u64) as usize;
+        if self.rng.chance(20) {
+            return self.outage_then_dst_end(n);
+        }
         let skew = self.nvr[n].skew;
         let lookback = self.p.lookback;
         let r = self.rng.below(100);
@@ -1076,10 +1125,53 @@ impl Sim {
             // the real-time clock is reset to 2000-01-01
             util::parse_ts("2000-01-01T00:00:00").unwrap() - (self.host + skew)
         };
+        self.step_clock(n, delta);
+        Ok(())
+    }
+
+    fn step_clock(&mut self, n: usize, delta: i64) {
         self.nvr[n].skew += delta;
         self.fake(n).lock().unwrap().skew = self.nvr[n].skew;
         let text = format!("{} clock {:+}s", self.nvr[n].name, delta);
         self.note(text);
+    }
+
+    /// An NVR that cannot be reached for about an hour, failed logins
+    /// logged on it meanwhile, then the end of DST (-3600 s) before it can
+    /// be read again. With `findtime` long enough, its read position trails
+    /// the clock by more than an hour, so only the offset shows the step.
+    fn outage_then_dst_end(&mut self, n: usize) -> Result<(), String> {
+        let was = self.nvr[n].mode;
+        self.set_nvr(n, Mode::Down);
+        let address = self.rng.pick(&PERSISTENT);
+        let count = self.p.maxretry as i64 + 1;
+        for i in 0..count {
+            let at = self.host + 10 + 5 * i;
+            self.write(n, at, address, FAIL, address.parse().ok());
+        }
+        let text = format!(
+            "fail {} {:?} x{} during the outage",
+            self.nvr[n].name, address, count
+        );
+        self.note(text);
+        let outage = self.rng.range(3600, 4100);
+        let end = self.host + outage;
+        while self.host + 300 < end {
+            self.host += 300;
+            self.note("poll after 300s".to_string());
+            self.cycle()?;
+        }
+        self.host = end;
+        self.step_clock(n, -3600);
+        self.set_nvr(
+            n,
+            if was == Mode::Down {
+                Mode::Down
+            } else {
+                Mode::Ok
+            },
+        );
+        Ok(())
     }
 
     fn settle(&mut self) -> Result<(), String> {
@@ -1134,8 +1226,14 @@ impl Sim {
         self.expire_router();
         let router = Arc::clone(&self.h.fake);
         let queries = router.lock().unwrap().rule_queries.len();
+        let offsets = self.offsets();
         self.h.set_host(self.host);
         self.h.engine.cycle_at(self.host as u64);
+        for (n, (before, after)) in offsets.iter().zip(self.offsets()).enumerate() {
+            if *before != after {
+                self.nvr[n].offset_changes += 1;
+            }
+        }
         let lines = util::captured_log();
         let (puts, sent, checked) = {
             let mut f = router.lock().unwrap();
@@ -1177,6 +1275,22 @@ impl Sim {
                 Line::Counted(n, ip, ts) => {
                     self.on_count(n, ip, ts)?;
                     events.push(format!("{}+1", ip));
+                }
+                Line::Bypass(ip) => {
+                    if !self.listed(&ip.to_string()) {
+                        return Err(format!(
+                            "[health/condition] {} reached the NVR \"already listed\", but the \
+                             router does not list it",
+                            ip
+                        ));
+                    }
+                    self.on_ban(ip, Ban::Listed)?;
+                    cycle.ban_pass = true;
+                    self.health.pass("firewall");
+                    self.health.pass("ban-refused");
+                    self.health.fail("ban-bypassed", self.host);
+                    self.last_bypass = Some(self.host);
+                    events.push(format!("bypass {}", ip));
                 }
                 Line::Ban(ip, kind) => {
                     self.on_ban(ip, kind)?;
@@ -1241,12 +1355,19 @@ impl Sim {
                 Err(_) => return Err(format!("[router] a ban request for {:?}", address)),
             };
             self.on_request(ip, "ban request")?;
-            if outcome != "refused" && outcome != "down" {
+            if !["refused", "down", "status"].contains(&outcome) {
                 cycle.router_pass = true;
             }
         }
         if !limited && !cycle.transport {
             self.health.pass("rate-limit");
+        }
+        let all_read = cycle.nvr_ok.iter().all(|ok| *ok);
+        if let Some(last) = self.last_bypass {
+            if all_read && self.host - last >= self.p.alert_after {
+                self.health.pass("ban-bypassed");
+                self.last_bypass = None;
+            }
         }
         if !cycle.pending_after {
             self.health.withdraw("ban-refused");
@@ -1309,6 +1430,21 @@ impl Sim {
         self.check_state()
     }
 
+    /// The offset the engine stores for each NVR.
+    fn offsets(&self) -> Vec<Option<i64>> {
+        self.nvr
+            .iter()
+            .map(|n| {
+                self.h
+                    .engine
+                    .state
+                    .nvr
+                    .get(&n.name)
+                    .and_then(|st| st.offset)
+            })
+            .collect()
+    }
+
     fn on_count(&mut self, n: usize, ip: Ipv4Addr, ts: i64) -> Result<(), String> {
         if exempt(&self.nets, ip) {
             return Err(format!(
@@ -1329,6 +1465,35 @@ impl Sim {
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let logged = hosts.len();
+        // count/shift: by the entry it can best be (several can share a
+        // device time after a clock went back)
+        let changes = self.nvr[n].offset_changes;
+        let excess = hosts
+            .iter()
+            .map(|g| {
+                let shift = ts - g.host;
+                let at_logging = device - g.host;
+                let allowed = match g.stored {
+                    Some(stored) => {
+                        (at_logging - stored).abs()
+                            + CLOCK_JUMP * (changes - g.changes).max(1) as i64
+                    }
+                    None => i64::MAX,
+                };
+                shift.abs().saturating_sub(allowed)
+            })
+            .min();
+        if let Some(excess) = excess.filter(|e| *e > 0) {
+            return Err(format!(
+                "[count/shift] the failed login of {} at {} (device time) on {} was counted at \
+                 {}, {} s further from its true host time than the engine allows",
+                ip,
+                util::fmt_ts(device),
+                self.nvr[n].name,
+                util::fmt_ts(ts),
+                excess
+            ));
+        }
         if counted > logged {
             let before = self
                 .gens
@@ -1352,7 +1517,7 @@ impl Sim {
         }
         // Several entries can share a device time after the clock went back;
         // the largest shift of them is the safe one to assume.
-        let shift = hosts.iter().map(|host| ts - host).max().unwrap_or(0);
+        let shift = hosts.iter().map(|g| ts - g.host).max().unwrap_or(0);
         let largest = self.shift.entry(ip).or_insert(0);
         *largest = (*largest).max(shift);
         Ok(())
@@ -1445,9 +1610,12 @@ impl Sim {
         if State::parse(&state.serialize()) != *state {
             return Err("[state] the state does not load back from its file format".to_string());
         }
-        let per_address = (self.p.maxretry * 4).max(16);
+        let (per_address, addresses) = fail_limits(self.p.maxretry);
+        let times: usize = state.fails.values().map(Vec::len).sum();
         let caps = [
-            ("tracked addresses", state.fails.len(), MAX_TRACKED),
+            ("tracked addresses", state.fails.len(), addresses),
+            ("failure times", times, MAX_FAIL_TIMES),
+            ("remembered bans", state.banned.len(), MAX_BANNED),
             ("waiting bans", state.pending.len(), MAX_PENDING),
             ("recent bans", state.recent_bans.len(), self.p.max_per_hour),
             (
@@ -1685,8 +1853,9 @@ fn run_class(class: Class) {
     let replay = env("HIK_F2B_SIM_SEED").is_some();
     let seeds = seeds(class);
     let mut failures = Vec::new();
-    // cycles, accepted, listed, reported, alerts, liveness, shifted
-    let mut stats = [0usize; 7];
+    // cycles, accepted, listed, reported, alerts, liveness, shifted, bypass
+    // alerts
+    let mut stats = [0usize; 8];
     for &seed in &seeds {
         let mut sim = Sim::new(seed);
         let result = match catch_unwind(AssertUnwindSafe(|| sim.run())) {
@@ -1709,6 +1878,11 @@ fn run_class(class: Class) {
             alerts,
             sim.musts,
             sim.shift.values().filter(|s| **s > 0).count(),
+            sim.cycles
+                .iter()
+                .flat_map(|c| &c.notices)
+                .filter(|n| *n == "alert ban-bypassed")
+                .count(),
         ];
         for (total, n) in stats.iter_mut().zip(seen) {
             *total += n;
@@ -1721,7 +1895,8 @@ fn run_class(class: Class) {
     }
     let summary = format!(
         "sim {:?}: {} seed(s), {} cycles, {:.1} s, {} violation(s); bans {}, already listed {}, \
-         reports {}, health alerts {}, addresses due for liveness {}, addresses with a shift {}",
+         reports {}, health alerts {} (ban-bypassed {}), addresses due for liveness {}, \
+         addresses with a shift {}",
         class,
         seeds.len(),
         stats[0],
@@ -1731,6 +1906,7 @@ fn run_class(class: Class) {
         stats[2],
         stats[3],
         stats[4],
+        stats[7],
         stats[5],
         stats[6]
     );

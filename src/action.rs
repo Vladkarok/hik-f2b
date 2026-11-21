@@ -43,13 +43,21 @@ impl std::fmt::Display for BanTime {
     }
 }
 
-/// Why a ban was not applied. The difference matters to the caller: a
-/// transport failure means the firewall is unreachable (or hangs), so trying
-/// further addresses in the same cycle would only stall polling; a refusal
-/// concerns this one request.
+/// Why a ban was not applied. The difference matters to the caller: only a
+/// refusal concerns this one address. Every other error would fail the same
+/// way for every further address, so the caller stops trying until the next
+/// cycle (and a firewall that hangs would only stall polling).
 #[derive(Debug, Clone, PartialEq)]
 pub enum BanError {
+    /// The firewall cannot be reached, or does not answer in time.
     Transport(String),
+    /// The firewall does not accept our login (HTTP 401 or 403).
+    Login(String),
+    /// The firewall answers, but with an error or an answer that is not
+    /// what was asked for, which says nothing about this address (HTTP 5xx,
+    /// a page from a proxy).
+    Router(String),
+    /// The firewall refuses to add this address.
     Refused(String),
 }
 
@@ -57,6 +65,8 @@ impl std::fmt::Display for BanError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             BanError::Transport(m) => write!(f, "cannot reach the firewall: {}", m),
+            BanError::Login(m) => write!(f, "the firewall refuses our login: {}", m),
+            BanError::Router(m) => write!(f, "the firewall answers with an error: {}", m),
             BanError::Refused(m) => write!(f, "refused: {}", m),
         }
     }
@@ -91,9 +101,31 @@ pub trait Firewall {
     fn describe(&self) -> String;
 }
 
+/// Why a notification was not sent.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NotifyError {
+    /// The messenger is unreachable or refused the message.
+    Failed(String),
+    /// The messenger asks to wait this many seconds before the next
+    /// message (Telegram: HTTP 429). The messenger works; it is not a failed
+    /// attempt.
+    RateLimited(u64),
+}
+
+impl std::fmt::Display for NotifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotifyError::Failed(m) => f.write_str(m),
+            NotifyError::RateLimited(s) => {
+                write!(f, "too many messages, asked to wait {} s", s)
+            }
+        }
+    }
+}
+
 pub trait Notifier {
     /// Sends one message. Errors must not contain secrets.
-    fn send(&self, text: &str) -> Result<(), String>;
+    fn send(&self, text: &str) -> Result<(), NotifyError>;
 }
 
 /// The values a notification template can refer to.

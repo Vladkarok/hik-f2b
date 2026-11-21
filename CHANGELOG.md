@@ -8,6 +8,132 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 
 ## [Unreleased]
 
+## [0.3.3] - YYYY-MM-DD
+
+### Fixed
+
+- `bantime` accepted timed bans of up to 365 days, but RouterOS accepts an
+  address-list timeout of at most 35w3d13h13m56s (21474836 seconds, about
+  248 days) and refuses a longer one. Such a config passed `--check` and
+  `--test-ban` (which always bans for 60 seconds), and then every real ban
+  failed. A longer `bantime` is now a config error that names the limit and
+  points to `bantime = permanent`. The limit is the same in notify-only
+  mode.
+- The end of DST (or any step back of more than 15 minutes) on an NVR that
+  had logged nothing new for a while went unnoticed: its clock stayed ahead
+  of the newest entry read, and a change of the clock difference counted as
+  a jump only forward. Failed logins logged before the step and read after
+  it, for example after the NVR could not be reached for an hour, were
+  converted with the new difference: an hour later than they happened, so
+  they were counted as more recent than they were (and could trigger a ban
+  together with newer ones) or skipped as being in the future. A change of
+  more than 15 minutes in either direction now resyncs, as a forward jump
+  did. Found by the simulation test; not seen on real devices.
+- The warning that an address already in the address-list still reached
+  the NVR (the only sign of a drop rule that exists but does not block) did
+  not appear while the attack went on: every such sighting restarted the
+  time of the ban, and the warning needs the ban to be more than two polls
+  and a minute old. The time of the ban is now kept.
+- The drop-rule check counted a rule that RouterOS marks invalid, which it
+  does when, for example, the interface list the rule names is removed.
+  Such a rule blocks nothing. The check now leaves out rules that are
+  disabled or invalid, and its result says how many it left out and why
+  (`; left out: 1 invalid`).
+- With `check_rule = false` the router check accepted any answer with
+  HTTP 200, and a ban accepted any answer with HTTP 2xx, such as a page
+  from a proxy in front of the router. Both now need the JSON that RouterOS
+  sends; anything else is a router error.
+- Every error answer to a ban was a refused ban. With bans waiting, a
+  wrong router password, HTTP 500 or an error page from a proxy cost one request per
+  waiting ban in every poll (two for HTTP 500), and a wrong password raised
+  two alerts at once (`firewall` and `ban-refused`). A refused login
+  (HTTP 401 or 403) and an error that says nothing about the address
+  (HTTP 5xx, other unexpected answers) now end the attempts for this poll
+  after one request, like an unreachable router, and raise one alert under
+  `firewall`. Only HTTP 400 for an address that is not listed is still a
+  refused ban of that address.
+- A stop (SIGTERM, SIGINT) took effect only between polls, and the state
+  was saved only after a whole poll, while Podman and Docker kill a
+  container 10 seconds after the stop. A stop during a long poll (an NVR
+  or a router that does not answer costs 25 seconds a request) lost what
+  that poll had read and counted. hik-f2b now stops between the steps of a
+  poll (each NVR, each ban, the firewall check, each notification) and
+  saves the state before it exits. The Quadlet unit and the Compose file
+  give it 60 seconds to do so (`--stop-timeout=60`, `stop_grace_period: 60s`),
+  which covers the longest step it cannot interrupt: a ban to a router
+  that does not answer and the lookup after it.
+- At startup, a router that could not be reached was asked twice in a row,
+  for the size of the address-list and for the firewall check, each
+  waiting for the timeout. The size is now asked only of a router that
+  answered the check.
+- A state file that could not be used (larger than 16 MiB, damaged,
+  unreadable or of another version) was replaced by an empty state without
+  a word, and the next save overwrote it, although it may hold the only
+  record of bans that still wait. hik-f2b now logs a WARNING that says why,
+  renames the file to `<state_file>.unusable-<Unix time>` and starts fresh;
+  if the file cannot be renamed, it does not start. Lines that cannot be
+  used are counted in one WARNING.
+- The limit of 100,000 remembered bans applied only when the state file
+  was read, not when a ban was added. It now applies there too; the ban
+  that ends first is forgotten first. The failed-login times of all
+  addresses together are now limited to 200,000: with a large `maxretry`
+  (above 5) fewer addresses are tracked, so that memory stays bounded.
+- The state was turned into text three times per poll and held as two
+  copies in memory. It is now written to the file line by line, only when
+  it changed, which a hash of it tells.
+- When the notification queue was full (100 waiting), new ban messages and
+  health alerts were dropped without a log line. Each poll that drops some
+  now logs one WARNING that counts them.
+- When Telegram came back after an outage, the whole queue was sent at
+  once and ran into Telegram's limit (HTTP 429), which counted as a failed
+  attempt, as if Telegram were down. hik-f2b now waits as long as the 429
+  answer says (`retry_after`) before it sends the next message, and the
+  wait costs no attempt.
+- Health alerts left out a URL only when it stood alone after a space. A
+  URL in brackets or quotes, or after `url=`, reached the chat. Every URL is
+  now replaced by `<url>` wherever it stands; an address with a port outside
+  a URL (the operator's own device, in a connection error) stays.
+- A URL such as `http://[::1]evil.example` counted as a local address, so
+  plain http was allowed for it. A URL is now accepted only as
+  `scheme://host` with an optional port from 1 to 65535 and nothing after
+  it.
+- `--hours` above 8760 said that it must be a positive number; it now names
+  the range 1 to 8760.
+
+### Changed
+
+- A setting that hik-f2b does not know is now an error that names the line,
+  the section and, when a known setting is close, the setting probably
+  meant. Before, it was ignored without a word: a typo such as `ignore_ip`
+  or `dryrun` left an address unprotected by `ignoreip` or turned a dry run
+  into live bans. A setting given twice in one section is an error too
+  (before, the second line replaced the first, so of two `ignoreip` lines
+  only the last one applied), and so is an empty `state_file` (before, every
+  save of the state failed). **A config with a stray or repeated setting
+  that used to start no longer starts:** run `--check` with the new version
+  before you update, and remove or correct the line it names.
+- `--dump` exits non-zero when an NVR cannot be read, and prints that
+  error to stderr instead of stdout.
+- Options that cannot work together are an error instead of being ignored:
+  more than one of `--check`, `--dump`, `--test-ban`, `--test-notify` and
+  `--country`; `--hours` or `--raw` without `--dump`; `--once` or
+  `--dry-run` with one of those five. `--help` says so and describes the
+  exit status.
+- The startup warning about secrets that other users can read now also
+  looks at the files named by `password_file` and `bot_token_file`, and
+  counts a file that its group can read, not only one that every user can
+  read.
+
+### Added
+
+- A health alert `ban-bypassed`: banned addresses keep reaching an NVR well
+  after their ban, so the drop rule does not block them. It follows the
+  rules of the other alerts (after `alert_after`, a daily reminder, a
+  message when it is over). It is over once no banned address has come back
+  for `alert_after` while every NVR could be read.
+
+<!-- second group -->
+
 ## [0.3.2] - 2026-11-20
 
 ### Fixed
@@ -192,7 +318,8 @@ be built from source.
   a sandboxed systemd unit, unit and end-to-end tests, CI, and documentation
   in English and Ukrainian.
 
-[Unreleased]: https://github.com/Vladkarok/hik-f2b/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/Vladkarok/hik-f2b/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/Vladkarok/hik-f2b/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/Vladkarok/hik-f2b/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/Vladkarok/hik-f2b/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Vladkarok/hik-f2b/compare/1e9edea...v0.3.0

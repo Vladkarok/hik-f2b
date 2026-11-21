@@ -19,6 +19,12 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   failed. A longer `bantime` is now a config error that names the limit and
   points to `bantime = permanent`. The limit is the same in notify-only
   mode.
+- A URL such as `http://[::1]evil.example` counted as a local address, so
+  plain http was allowed for it. A URL is now accepted only as
+  `scheme://host` with an optional port from 1 to 65535 and nothing after
+  it.
+- `--hours` above 8760 said that it must be a positive number; it now names
+  the range 1 to 8760.
 
 ### Changed
 
@@ -32,6 +38,18 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   save of the state failed). **A config with a stray or repeated setting
   that used to start no longer starts:** run `--check` with the new version
   before you update, and remove or correct the line it names.
+
+- `--dump` exits non-zero when an NVR cannot be read, and prints that
+  error to stderr instead of stdout.
+- Options that cannot work together are an error instead of being ignored:
+  more than one of `--check`, `--dump`, `--test-ban`, `--test-notify` and
+  `--country`; `--hours` or `--raw` without `--dump`; `--once` or
+  `--dry-run` with one of those five. `--help` says so and describes the
+  exit status.
+- The startup warning about secrets that other users can read now also
+  looks at the files named by `password_file` and `bot_token_file`, and
+  counts a file that its group can read, not only one that every user can
+  read.
 
 <!-- second group -->
 

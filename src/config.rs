@@ -206,6 +206,9 @@ pub struct Config {
     /// True when a password or token is written in the config itself
     /// rather than read from a separate secret file.
     pub inline_secrets: bool,
+    /// The secret files the config names (`password_file`,
+    /// `bot_token_file`) and that were read.
+    pub secret_files: Vec<PathBuf>,
     /// `None` = notify-only mode: nothing is banned.
     pub mikrotik: Option<MikrotikCfg>,
     pub nvrs: Vec<NvrCfg>,
@@ -436,19 +439,35 @@ pub fn check_url(url: &str, secret_bearing: bool, what: &str) -> Result<String, 
     } else {
         return Err(format!("{}: url must start with http:// or https://", what));
     };
-    let ok = !rest.is_empty()
-        && rest.len() <= 255
-        && rest
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || ".-:[]".contains(c));
-    if !ok {
-        return Err(format!("{}: url must be just scheme://host[:port]", what));
+    let bad = || format!("{}: url must be just scheme://host[:port]", what);
+    if rest.is_empty() || rest.len() > 255 {
+        return Err(bad());
     }
-    let host = if let Some(v6) = rest.strip_prefix('[') {
-        v6.split(']').next().unwrap_or("")
+    // `[v6]` or a name or IPv4 address, then nothing or `:port`.
+    let (host, port, host_ok) = if let Some(v6) = rest.strip_prefix('[') {
+        let (host, port) = v6.split_once(']').ok_or_else(bad)?;
+        let ok = host.contains(':')
+            && host
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() || c == ':' || c == '.');
+        (host, port, ok)
     } else {
-        rest.split(':').next().unwrap_or("")
+        let (host, port) = rest.find(':').map_or((rest, ""), |i| rest.split_at(i));
+        let ok = host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
+        (host, port, ok)
     };
+    let port_ok = port.is_empty()
+        || port.strip_prefix(':').is_some_and(|p| {
+            !p.is_empty()
+                && p.len() <= 5
+                && p.bytes().all(|b| b.is_ascii_digit())
+                && p.parse::<u32>().is_ok_and(|n| (1..=65535).contains(&n))
+        });
+    if host.is_empty() || !host_ok || !port_ok {
+        return Err(bad());
+    }
     let local = host == "localhost" || host == "127.0.0.1" || host == "::1";
     if secret_bearing && !https && !local {
         return Err(format!(
@@ -590,6 +609,30 @@ impl Config {
             );
         }
 
+        let mut secret_files: Vec<PathBuf> = Vec::new();
+        let used = ini
+            .get("mikrotik")
+            .map(|m| (m, "password_file"))
+            .into_iter()
+            .chain(
+                ini.iter()
+                    .filter(|(name, _)| name.starts_with("nvr:"))
+                    .map(|(_, sec)| (sec, "password_file")),
+            )
+            .chain(
+                ini.get("telegram")
+                    .filter(|_| telegram.is_some())
+                    .map(|t| (t, "bot_token_file")),
+            );
+        for (sec, key) in used {
+            if let Some(path) = sec.get(key) {
+                let path = PathBuf::from(path);
+                if !secret_files.contains(&path) {
+                    secret_files.push(path);
+                }
+            }
+        }
+
         Ok(Config {
             poll_interval: duration(g, "poll_interval", 30, 5, 3600)?,
             maxretry: number(g, "maxretry", 5, 1, 1000)? as usize,
@@ -615,6 +658,7 @@ impl Config {
             inline_secrets: ini.values().any(|sec| {
                 sec.values.contains_key("password") || sec.values.contains_key("bot_token")
             }),
+            secret_files,
             mikrotik,
             nvrs,
             telegram,
@@ -687,18 +731,21 @@ impl Config {
     }
 }
 
-/// True when other local users can read the file (it may hold passwords).
+/// The permission bits of a file that its group or other users can read
+/// (it may hold passwords); `None` when only its owner can, or when that
+/// cannot be told.
 #[cfg(unix)]
-pub fn world_readable(path: &Path) -> bool {
+pub fn readable_by_others(path: &Path) -> Option<u32> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
-        .map(|m| m.permissions().mode() & 0o007 != 0)
-        .unwrap_or(false)
+        .ok()
+        .map(|m| m.permissions().mode() & 0o7777)
+        .filter(|mode| mode & 0o044 != 0)
 }
 
 #[cfg(not(unix))]
-pub fn world_readable(_path: &Path) -> bool {
-    false
+pub fn readable_by_others(_path: &Path) -> Option<u32> {
+    None
 }
 
 #[cfg(test)]
@@ -1162,6 +1209,91 @@ mod tests {
                     .contains(key));
             }
         }
+    }
+
+    #[test]
+    fn urls_are_scheme_host_and_port_only() {
+        let ok = |url: &str| check_url(url, true, "t");
+        assert_eq!(ok("http://[::1]:8080/").unwrap(), "http://[::1]:8080");
+        assert!(ok("http://[::1]").is_ok());
+        assert!(ok("http://localhost:65535").is_ok());
+        assert!(ok("https://[2001:db8::1]:443").is_ok());
+        assert!(ok("https://router.example.net").is_ok());
+        for bad in [
+            "http://[::1]evil.example",
+            "http://[::1]:80evil",
+            "http://[::1",
+            "http://[]",
+            "http://[evil.example]",
+            "http://127.0.0.1:80:90",
+            "http://127.0.0.1:",
+            "http://127.0.0.1:0",
+            "http://127.0.0.1:65536",
+            "http://127.0.0.1:+80",
+            "http://:80",
+            "https://a[b]",
+            "https://user@192.0.2.1",
+            "https://192.0.2.1/path",
+            "https://192.0.2.1?x=1",
+        ] {
+            let e = ok(bad)
+                .err()
+                .unwrap_or_else(|| panic!("{} was accepted", bad));
+            assert!(e.contains("scheme://host[:port]"), "{}: {}", bad, e);
+        }
+        // plain http only to this host
+        assert!(ok("http://[::1]:8080").is_ok());
+        assert!(ok("http://127.0.0.1").is_ok());
+        let e = ok("http://192.0.2.1").err().unwrap();
+        assert!(e.contains("must be https"), "{}", e);
+        assert!(check_url("http://192.0.2.1", false, "t").is_ok());
+    }
+
+    #[test]
+    fn secret_files_are_listed() {
+        let dir = std::env::temp_dir().join(format!("hik-f2b-secrets-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let router = dir.join("router");
+        let nvr = dir.join("nvr");
+        let token = dir.join("token");
+        std::fs::write(&router, "r\n").unwrap();
+        std::fs::write(&nvr, "n").unwrap();
+        std::fs::write(&token, "1:a").unwrap();
+        let text = format!(
+            "[mikrotik]\nurl = https://192.0.2.1\nuser = f2b\npassword_file = {r}\n\
+             ca_file = public\n\
+             [nvr:one]\nurl = http://192.0.2.10\nuser = f2b\npassword_file = {n}\n\
+             [nvr:two]\nurl = http://192.0.2.11\nuser = f2b\npassword_file = {n}\n\
+             [telegram]\nbot_token_file = {t}\nchat_id = 5\n",
+            r = router.display(),
+            n = nvr.display(),
+            t = token.display()
+        );
+        let cfg = Config::parse(&text).unwrap();
+        assert_eq!(
+            cfg.secret_files,
+            vec![router.clone(), nvr.clone(), token.clone()]
+        );
+        assert!(!cfg.inline_secrets);
+        // a switched-off [telegram] section reads no file
+        let off = text.replace("[telegram]\n", "[telegram]\nenabled = false\n");
+        assert_eq!(Config::parse(&off).unwrap().secret_files, vec![router, nvr]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |m: u32| {
+                std::fs::set_permissions(&token, std::fs::Permissions::from_mode(m)).unwrap();
+                readable_by_others(&token)
+            };
+            assert_eq!(mode(0o600), None);
+            assert_eq!(mode(0o400), None);
+            assert_eq!(mode(0o640), Some(0o640), "readable by the group");
+            assert_eq!(mode(0o604), Some(0o604), "readable by others");
+            assert_eq!(mode(0o644), Some(0o644));
+            assert_eq!(mode(0o602), None, "writable is not readable");
+        }
+        assert_eq!(readable_by_others(&dir.join("missing")), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

@@ -300,6 +300,11 @@ report a problem.
 accepts a ban. A router user whose group has no `write` policy passes
 `--check`, but every ban fails. To try the write access, run `--test-ban`.
 
+`--dump` prints what it reads from each NVR. An NVR that cannot be read gets
+an `ERROR:` line on stderr, and `--dump` then exits non-zero. Use one of
+`--check`, `--dump`, `--test-ban`, `--test-notify` and `--country` at a time;
+`hik-f2b --help` lists which options work together.
+
 If the `--dump` output is not as expected:
 
 - If failed logins are listed without `MATCH`, look at their `metaId`. Then
@@ -429,8 +434,9 @@ need.
 Failed logins are counted across all configured NVRs together.
 
 Every password or token can be given as `<name>_file = /path` (preferred) or
-inline as `<name> = value`. If the config holds an inline secret and other
-users can read it, hik-f2b logs a warning at startup.
+inline as `<name> = value`. hik-f2b logs a warning at startup if the config
+holds an inline secret and its group or other users can read it. It also
+warns about each secret file that its group or other users can read.
 
 `ca_file` in the `[mikrotik]` section is required when the router URL is
 https. It is either the path of the CA certificate that signed the router's
@@ -877,7 +883,8 @@ login is whatever they typed). It is built accordingly:
   challenge is never answered, even when the NVR offers both. The router's
   REST API uses Basic authentication, which is why it must be https. Secrets
   can come from files (`*_file`) or be written in the config; a warning is
-  logged when a config with inline secrets is readable by other users. Secrets
+  logged when a config with inline secrets, or a secret file, is readable by
+  its group or other users. Secrets
   are never logged, and the Telegram token is removed from error messages.
   Health alerts quote error messages without the URLs in them.
 - **Country database.** The `.mmdb` file is untrusted input too. The reader

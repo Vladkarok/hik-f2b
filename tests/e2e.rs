@@ -1938,6 +1938,49 @@ fn check_command_reports_each_item_and_changes_nothing() {
     assert_eq!(h.fake.lock().unwrap().router_requests, 0);
 }
 
+#[test]
+fn dump_fails_when_an_nvr_cannot_be_read() {
+    let h = Harness::build(Opts {
+        second_nvr: true,
+        ..Default::default()
+    });
+    h.add("09:30:00", ATTACKER);
+    h.fake2.as_ref().unwrap().lock().unwrap().nvr_down = true;
+    let ini = h.dir.join("hik-f2b.ini");
+    std::fs::write(&ini, &h.ini).unwrap();
+    let run = |args: &[&str]| {
+        std::process::Command::new(env!("CARGO_BIN_EXE_hik-f2b"))
+            .arg("--config")
+            .arg(&ini)
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let out = run(&["--dump", "--hours", "2"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{}\n{}", stdout, stderr);
+    // what could be read is still printed, the error goes to stderr
+    assert!(stdout.contains("=== nvr1"), "{}", stdout);
+    assert!(stdout.contains("MATCH"), "{}", stdout);
+    assert!(!stdout.contains("ERROR"), "{}", stdout);
+    assert!(stderr.contains("ERROR: nvr2: "), "{}", stderr);
+    assert!(
+        stderr.contains("hik-f2b: 1 of 2 NVR(s) could not be read"),
+        "{}",
+        stderr
+    );
+    h.fake2.as_ref().unwrap().lock().unwrap().nvr_down = false;
+    let out = run(&["--dump", "--hours", "2"]);
+    assert_eq!(out.status.code(), Some(0));
+    // options that exclude each other
+    let out = run(&["--check", "--dump"]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("--check and --dump cannot be used together")
+    );
+}
+
 /// The log line of `--check` for one NVR, after a few entries.
 fn check_log_line(newest_first: bool, entries: &[&str]) -> (String, u32) {
     let mut h = Harness::raw(false);

@@ -16,7 +16,7 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   It stops at the first failed step (`--keep-going` runs them all), prints
   a summary with the time each step took, and finds cargo in
   `~/.cargo/bin` when it is not on PATH.
-- `.github/workflows/sim.yml` runs the simulation test with 1500 seeds per
+- `.github/workflows/sim.yml` runs the simulation test with 4000 seeds per
   class in release mode every Sunday, or by hand with
   `gh workflow run sim.yml -f seeds=N -f start=S`. Without a start, the
   seeds come from the run number, so that no run repeats the seeds of

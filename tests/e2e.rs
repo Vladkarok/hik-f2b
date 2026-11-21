@@ -413,7 +413,7 @@ fn state_survives_a_restart() {
     h.cycle("10:02:00");
     let path = h.dir.join("state");
     h.engine.state.save(&path).unwrap();
-    let restored = State::load(&path);
+    let restored = State::load(&path).unwrap();
     assert_eq!(restored, h.engine.state);
     assert_eq!(restored.fails[&attacker()].len(), 4);
 }
@@ -977,6 +977,69 @@ fn pending_bans_oldest_first() {
     h.cycle("10:04:00");
     assert_eq!(h.banned(), vec!["198.51.100.3"]);
     assert_eq!(h.engine.state.pending.len(), 2);
+}
+
+/// `MAX_BANNED` holds also where bans are added, not only when the state
+/// file is read: the address whose end is nearest is forgotten first.
+#[test]
+fn remembered_bans_are_bounded() {
+    use hik_f2b::state::MAX_BANNED;
+    let mut h = Harness::new(false);
+    let now = h.host as u64;
+    let address = |i: usize| std::net::Ipv4Addr::from(0x0B00_0000u32 + i as u32);
+    for i in 0..MAX_BANNED {
+        // address(0) has the nearest end
+        let until = if i == 0 { now + 1000 } else { now + 2000 };
+        h.engine.state.banned.insert(address(i), until);
+    }
+    h.burst("10:01", ATTACKER, 5);
+    h.cycle("10:02:00");
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    assert_eq!(h.engine.state.banned.len(), MAX_BANNED);
+    assert!(h.engine.state.banned.contains_key(&attacker()));
+    assert!(!h.engine.state.banned.contains_key(&address(0)));
+}
+
+/// The failure times of all addresses together are bounded: with a large
+/// `maxretry` more times are kept per address, so fewer addresses are
+/// tracked. A state from a run with a smaller `maxretry` is cut down at
+/// the start.
+#[test]
+fn failure_times_are_bounded_in_total() {
+    use hik_f2b::engine::fail_limits;
+    use hik_f2b::state::MAX_FAIL_TIMES;
+    assert_eq!(fail_limits(5), (20, 10_000));
+    assert_eq!(fail_limits(100), (400, 500));
+    assert_eq!(fail_limits(1000), (4000, 50));
+    let mut h = Harness::with(Opts {
+        general: "maxretry = 100",
+        ..Default::default()
+    });
+    let address = |i: usize| std::net::Ipv4Addr::from(0x0B00_0000u32 + i as u32);
+    let now = h.host;
+    for i in 0..500 {
+        h.engine
+            .state
+            .fails
+            .insert(address(i), vec![now - 600 + i as i64]);
+    }
+    h.add("10:00:40", ATTACKER);
+    h.cycle("10:01:00");
+    assert_eq!(h.engine.state.fails.len(), 500);
+    assert_eq!(h.fails(ATTACKER), 1);
+    assert!(
+        !h.engine.state.fails.contains_key(&address(0)),
+        "the oldest goes"
+    );
+    // more than this config allows, from the state file
+    for i in 0..700 {
+        h.engine.state.fails.insert(address(i), vec![now - 60; 450]);
+    }
+    h.restart();
+    let total: usize = h.engine.state.fails.values().map(Vec::len).sum();
+    assert_eq!(h.engine.state.fails.len(), 500);
+    assert!(h.engine.state.fails.values().all(|t| t.len() <= 400));
+    assert!(total <= MAX_FAIL_TIMES);
 }
 
 /// C11b: the rate limit survives a restart.

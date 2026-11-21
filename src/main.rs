@@ -278,7 +278,7 @@ fn run() -> Result<(), String> {
     let poll_interval = cfg.poll_interval;
     let daemon = !(args.dump || args.test_ban.is_some() || args.test_notify || args.check);
     let state = if daemon {
-        State::load(&state_file)
+        State::load(&state_file)?
     } else {
         State::default()
     };
@@ -393,10 +393,12 @@ fn run() -> Result<(), String> {
     // Also in a dry run: that is when the setup is being checked.
     engine.startup_check(util::unix_now());
 
-    let mut saved = engine.state.serialize();
+    // A hash of what was saved: the state is written out (line by line) only
+    // when it changed, and never held as a second copy in memory.
+    let mut saved = engine.state.digest();
     while !stop.load(Ordering::Relaxed) {
         engine.cycle();
-        let current = engine.state.serialize();
+        let current = engine.state.digest();
         if current != saved {
             match engine.state.save(&state_file) {
                 Ok(()) => saved = current,

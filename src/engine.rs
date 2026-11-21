@@ -17,7 +17,9 @@ use crate::country::{self, Code};
 use crate::health::{Alerts, Check, CheckLine, Kind, Notice, Status};
 use crate::mikrotik::Mikrotik;
 use crate::nvr::{Event, Nvr, NvrError, Search};
-use crate::state::{NvrState, Pending, State, MAX_PENDING, MAX_SEEN, MAX_TRACKED};
+use crate::state::{
+    NvrState, Pending, State, MAX_BANNED, MAX_FAIL_TIMES, MAX_PENDING, MAX_SEEN, MAX_TRACKED,
+};
 use crate::telegram::Telegram;
 use crate::util;
 use std::collections::HashMap;
@@ -495,6 +497,50 @@ fn read_log(
     Ok(Polled { fresh, offset })
 }
 
+/// How many failure times are kept per address, and for how many addresses
+/// at most: the newest `4 * maxretry` (at least 16) times, for as many
+/// addresses as `MAX_FAIL_TIMES` allows, at most `MAX_TRACKED`.
+pub fn fail_limits(maxretry: usize) -> (usize, usize) {
+    let per_address = maxretry.saturating_mul(4).max(16);
+    let addresses = (MAX_FAIL_TIMES / per_address).clamp(1, MAX_TRACKED);
+    (per_address, addresses)
+}
+
+/// Forgets the addresses whose last failure is the oldest until at most
+/// `keep` are tracked.
+fn forget_oldest(state: &mut State, keep: usize) {
+    if state.fails.len() <= keep {
+        return;
+    }
+    let mut by_age: Vec<(i64, Ipv4Addr)> = state
+        .fails
+        .iter()
+        .map(|(ip, times)| (times.iter().copied().max().unwrap_or(0), *ip))
+        .collect();
+    by_age.sort_unstable();
+    let extra = state.fails.len() - keep;
+    for (_, ip) in by_age.into_iter().take(extra) {
+        state.fails.remove(&ip);
+    }
+}
+
+/// Remembers that `ip` is handled until `until` (see `State::banned`). With
+/// `MAX_BANNED` addresses remembered, the one whose end is nearest is
+/// forgotten first: it would be the next to expire anyway.
+fn remember_ban(state: &mut State, ip: Ipv4Addr, until: u64) {
+    if !state.banned.contains_key(&ip) && state.banned.len() >= MAX_BANNED {
+        let first = state
+            .banned
+            .iter()
+            .min_by_key(|(ip, until)| (**until, **ip))
+            .map(|(ip, _)| *ip);
+        if let Some(first) = first {
+            state.banned.remove(&first);
+        }
+    }
+    state.banned.insert(ip, until);
+}
+
 /// Counts one failure at host time `ts`. Returns the ban to apply when the
 /// limit is reached.
 fn register(
@@ -547,23 +593,16 @@ fn register(
         );
         return None;
     }
-    if !state.fails.contains_key(&ip) && state.fails.len() >= MAX_TRACKED {
+    let (cap, addresses) = fail_limits(cfg.maxretry);
+    if !state.fails.contains_key(&ip) && state.fails.len() >= addresses {
         // Forget the address whose last failure is the oldest.
-        let oldest = state
-            .fails
-            .iter()
-            .min_by_key(|(_, times)| times.iter().copied().max().unwrap_or(0))
-            .map(|(ip, _)| *ip);
-        if let Some(oldest) = oldest {
-            state.fails.remove(&oldest);
-        }
+        forget_oldest(state, addresses - 1);
     }
     let times = state.fails.entry(ip).or_default();
     times.push(ts);
     times.sort_unstable();
     let horizon = host_now.saturating_sub(cfg.findtime);
     times.retain(|t| *t >= horizon);
-    let cap = cfg.maxretry.saturating_mul(4).max(16);
     if times.len() > cap {
         let extra = times.len() - cap;
         times.drain(..extra);
@@ -638,8 +677,17 @@ impl Engine {
             country_failure: None,
             last_bypass: None,
         };
-        // The state may come from a run with another `ignoreip`.
+        // The state may come from a run with another `ignoreip`, or with a
+        // `maxretry` that kept more failure times.
         engine.drop_exempt();
+        let (cap, addresses) = fail_limits(engine.cfg.maxretry);
+        for times in engine.state.fails.values_mut() {
+            if times.len() > cap {
+                let extra = times.len() - cap;
+                times.drain(..extra);
+            }
+        }
+        forget_oldest(&mut engine.state, addresses);
         Ok(engine)
     }
 
@@ -1178,15 +1226,10 @@ impl Engine {
                     }
                 },
             };
-            if counted {
-                self.state.banned.insert(ip, now.saturating_add(keep));
-            } else {
-                // Already listed: keep the time of the ban this engine
-                // knows, if any (an address listed by hand counts from now).
-                self.state
-                    .banned
-                    .entry(ip)
-                    .or_insert(now.saturating_add(keep));
+            // Already listed: keep the time of the ban this engine knows, if
+            // any (an address listed by hand counts from now).
+            if counted || !self.state.banned.contains_key(&ip) {
+                remember_ban(&mut self.state, ip, now.saturating_add(keep));
             }
             self.state.fails.remove(&ip);
             self.state.pending.remove(&ip);

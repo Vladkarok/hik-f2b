@@ -59,6 +59,22 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 - `--hours` above 8760 said that it must be a positive number; it now names
   the range 1 to 8760.
 
+- A state file that could not be used (larger than 16 MiB, damaged,
+  unreadable or of another version) was replaced by an empty state without
+  a word, and the next save overwrote it, although it may hold the only
+  record of bans that still wait. hik-f2b now logs a WARNING that says why,
+  renames the file to `<state_file>.unusable-<Unix time>` and starts fresh;
+  if the file cannot be renamed, it does not start. Lines that cannot be
+  used are counted in one WARNING.
+- The limit of 100,000 remembered bans applied only when the state file
+  was read, not when a ban was added. It now applies there too; the ban
+  that ends first is forgotten first. The failed-login times of all
+  addresses together are now limited to 200,000: with a large `maxretry`
+  (above 5) fewer addresses are tracked, so that memory stays bounded.
+- The state was turned into text three times per poll and held as two
+  copies in memory. It is now written to the file line by line, only when
+  it changed, which a hash of it tells.
+
 ### Changed
 
 - A setting that hik-f2b does not know is now an error that names the line,

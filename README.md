@@ -452,9 +452,15 @@ address-list is blocked some other way, set it to `false`. Examples: a rule
 that uses the address-list as `dst-address-list`, or blocking on another
 device.
 
-A state file written by an older version (format 1) is ignored: hik-f2b
-starts fresh, watches each NVR log from the current time on, and the hourly
-ban counter starts at zero.
+hik-f2b does not use a state file that was written by an older version
+(format 1), is damaged beyond its first line, cannot be read or is larger
+than 16 MiB. It logs a WARNING that says why and renames the file to
+`<state_file>.unusable-<Unix time>`, because the file may hold the only
+record of bans that still wait. hik-f2b then starts fresh: it watches each
+NVR log from the current time on, and the hourly ban counter starts at zero.
+If the file cannot be renamed, hik-f2b does not start, so that it does not
+overwrite the file. Single lines that cannot be used are left out, with one
+WARNING that counts them.
 
 ### Permanent bans
 
@@ -877,8 +883,11 @@ login is whatever they typed). It is built accordingly:
   counted once, also when a search stops in the middle of a second. Entries
   that 4 searches cannot reach are skipped with an ERROR line that gives
   their time range. At most 10,000 addresses are tracked
-  (the one whose latest failed login is the oldest is forgotten first), and at
-  most 1000 bans
+  (the one whose latest failed login is the oldest is forgotten first), with
+  at most 200,000 failed-login times in all: hik-f2b keeps the newest
+  `4 × maxretry` (at least 16) per address, so with `maxretry` above 5 it
+  tracks fewer addresses. At most 100,000 banned addresses are remembered
+  (the one whose ban ends first is forgotten first), and at most 1000 bans
   wait to be applied (the oldest is dropped). A ban that cannot be applied
   within `bantime` (24 hours for a permanent ban) is dropped.
   `max_bans_per_hour` limits new bans and is kept across restarts; an address

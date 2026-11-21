@@ -118,8 +118,8 @@
 mod fake;
 
 use fake::{Entry, Fake, Harness, Opts, SKEW};
-use hik_f2b::engine::CLOCK_JUMP;
-use hik_f2b::state::{State, MAX_PENDING, MAX_SEEN, MAX_TRACKED};
+use hik_f2b::engine::{fail_limits, CLOCK_JUMP};
+use hik_f2b::state::{State, MAX_BANNED, MAX_FAIL_TIMES, MAX_PENDING, MAX_SEEN};
 use hik_f2b::util;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::Ipv4Addr;
@@ -1610,9 +1610,12 @@ impl Sim {
         if State::parse(&state.serialize()) != *state {
             return Err("[state] the state does not load back from its file format".to_string());
         }
-        let per_address = (self.p.maxretry * 4).max(16);
+        let (per_address, addresses) = fail_limits(self.p.maxretry);
+        let times: usize = state.fails.values().map(Vec::len).sum();
         let caps = [
-            ("tracked addresses", state.fails.len(), MAX_TRACKED),
+            ("tracked addresses", state.fails.len(), addresses),
+            ("failure times", times, MAX_FAIL_TIMES),
+            ("remembered bans", state.banned.len(), MAX_BANNED),
             ("waiting bans", state.pending.len(), MAX_PENDING),
             ("recent bans", state.recent_bans.len(), self.p.max_per_hour),
             (

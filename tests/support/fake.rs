@@ -842,7 +842,7 @@ impl Harness {
     pub fn restart(&mut self) {
         let path = self.dir.join("state");
         self.engine.state.save(&path).unwrap();
-        let restored = State::load(&path);
+        let restored = State::load(&path).unwrap();
         assert_eq!(restored, self.engine.state, "state file round trip");
         self.engine = Engine::new(Config::parse(&self.ini).unwrap(), restored).unwrap();
     }

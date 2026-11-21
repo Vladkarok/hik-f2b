@@ -31,9 +31,12 @@ const MAX_FAILED_POLLS: u32 = 10;
 /// Entries more than this far in the (host) future are not counted.
 const MAX_FUTURE: i64 = 300;
 /// A change of the device-minus-host offset larger than this between two
-/// polls is a clock jump, not drift or a slow request. Well below a DST
-/// change, well above what slow polls of several NVRs add up to.
-const CLOCK_JUMP: i64 = 900;
+/// reads, in either direction, is a clock jump, not drift or a slow
+/// request. Well below a DST change, well above what slow polls of several
+/// NVRs add up to. A smaller change is taken as it is: entries logged before
+/// it and read after it are converted with the new offset, so their host
+/// times can be off by up to this much.
+pub const CLOCK_JUMP: i64 = 900;
 /// With `bantime = permanent` the router keeps the ban for ever, but what
 /// hik-f2b remembers about an address still needs an end: how long a ban
 /// that cannot be applied keeps waiting, and how long a reported address is
@@ -301,9 +304,14 @@ fn poll_nvr(
 ///
 /// - A read without a baseline moves `since` to the newest entry read, or
 ///   on, but never back: the device clock is at or after `since`.
-/// - When the device clock is behind `since` (it went back, by any amount)
-///   or jumped forward, a baseline resyncs: the window starts at the new
-///   time, and what it holds is recorded as seen, not counted.
+/// - When the device clock is behind `since` (it went back, by any amount),
+///   or the offset changed by more than `CLOCK_JUMP` in either direction, a
+///   baseline resyncs: the window starts at the new time, and what it holds
+///   is recorded as seen, not counted. A step back on a quiet NVR leaves the
+///   clock ahead of `since` (which trails it by `findtime + lookback`), so
+///   only the offset shows it; entries logged before it and read after it
+///   (after an outage, say) would otherwise be converted with the wrong
+///   offset.
 /// - A skipped window (`MAX_FAILED_POLLS`) moves `since` without a read.
 ///   If a baseline was due, the offset is cleared (`None`), so the next read
 ///   that works is a baseline.
@@ -339,11 +347,12 @@ fn read_log(
     } else {
         st.offset
             .map(|previous| offset.saturating_sub(previous))
-            .filter(|jump| *jump > CLOCK_JUMP)
+            .filter(|jump| jump.unsigned_abs() > CLOCK_JUMP.unsigned_abs())
             .map(|jump| {
                 format!(
-                    "device clock jumped forward by {} s (to {})",
-                    jump,
+                    "device clock jumped {} by {} s (to {})",
+                    if jump > 0 { "forward" } else { "back" },
+                    jump.unsigned_abs(),
                     util::fmt_ts(now)
                 )
             })
@@ -476,7 +485,8 @@ fn read_log(
     } else {
         st.seen = counter;
     }
-    // Never ahead of the device clock, or a backward jump would go unseen.
+    // Never ahead of the device clock, or a step back to before the newest
+    // entry read, however small, would go unseen.
     st.since = next.min(now);
     // Without a baseline the device clock is at or after `previous`, so the
     // next window never starts before this one (see above).

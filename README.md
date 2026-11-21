@@ -784,12 +784,18 @@ the next poll tries again from its own time.
 
 If an NVR's clock goes back to before the newest log entry that hik-f2b has
 read (a DST change, a reset real-time clock, or a correction of a few
-minutes), or jumps forward by more than 15 minutes, hik-f2b logs a warning,
-records the entries the log holds at that moment as already seen without
-counting them, and reads on from the new time. Failed logins in the short
-window around the change are not counted. A smaller forward correction, or a
-backward one that does not reach the newest entry read, needs nothing of this:
-the entries read before stay known, so none is counted again.
+minutes), or changes by more than 15 minutes in either direction since the
+last read, hik-f2b logs a warning. It then records the entries the log holds
+at that moment as already seen without counting them, and reads on from the
+new time. Failed logins in the short window around the change are not
+counted. This also covers the end of DST on an NVR that logged nothing new
+for a while, or that could not be reached: its clock stays ahead of the
+newest entry read, and only the difference to the host's clock shows the
+change. A change of at most 15 minutes that does not go back to before the
+newest entry read needs nothing of this: the entries read before stay known,
+so none is counted again. Entries logged before such a change and read after
+it are converted with the new difference, so their times can be off by up to
+15 minutes.
 
 If the clock changes while the NVR's log cannot be read, and hik-f2b skips
 the unreadable stretch after 10 polls (see [Limitations](#limitations)), the

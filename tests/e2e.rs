@@ -459,6 +459,55 @@ fn dst_fall_back() {
     assert_eq!(h.banned(), vec![ATTACKER]);
 }
 
+/// DST ends on a quiet NVR while it cannot be reached. Its read position
+/// trails its clock by `findtime + lookback`, so after the step the clock is
+/// still ahead of it, and only the offset (one hour less) shows the step.
+/// Failed logins logged before the step and read after it must not be
+/// converted with the new offset (an hour later than they happened).
+#[test]
+fn dst_end_on_a_quiet_nvr_after_an_outage_is_a_resync() {
+    let mut h = Harness::new(false);
+    util::capture_log();
+    run(&mut h, 3, 30);
+    // the NVR goes away; an attacker is logged at the start of the outage
+    h.fake.lock().unwrap().nvr_down = true;
+    let down = h.host;
+    for i in 0..5 {
+        Harness::add_at(&h.fake, &device(down + 10 + i + SKEW), ATTACKER);
+    }
+    run(&mut h, 13, 300);
+    // an hour later DST has ended, and the NVR is back
+    h.fake.lock().unwrap().skew = SKEW - 3600;
+    h.fake.lock().unwrap().nvr_down = false;
+    h.advance(300);
+    let log = util::captured_log();
+    assert_eq!(
+        logged(&log, "nvr1: device clock jumped back by 3600 s"),
+        1,
+        "{:?}",
+        log
+    );
+    // the old entries are recorded as seen, not counted an hour late
+    assert_eq!(h.fails(ATTACKER), 0);
+    assert!(h.engine.state.pending.is_empty());
+    assert!(h.banned().is_empty());
+    assert_eq!(h.engine.state.nvr["nvr1"].offset, Some(SKEW - 3600));
+    // after the step, failed logins count as usual
+    let now = h.host;
+    for i in 0..5 {
+        Harness::add_at(&h.fake, &device(now + 5 + i + SKEW - 3600), ATTACKER);
+    }
+    h.advance(30);
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    // a change of 15 minutes or less is no jump, in either direction
+    for step in [-900, 900] {
+        let skew = h.fake.lock().unwrap().skew;
+        h.fake.lock().unwrap().skew = skew + step;
+        h.advance(30);
+        assert_eq!(logged(&util::captured_log(), "device clock jumped"), 0);
+    }
+}
+
 /// A device clock that ran 400 s fast is corrected (more than lookback, less
 /// than an hour). Entries from the minutes before the correction come back
 /// into the read window with times only slightly in the future; only the

@@ -26,7 +26,9 @@
 //!   without a router.
 //! - `Clock`: as `Firewall`, plus device clock steps: forward and backward,
 //!   below and above the thresholds the engine treats as a jump, a DST
-//!   change, an RTC reset to 2000-01-01 and its correction.
+//!   change, an RTC reset to 2000-01-01 and its correction, and the end of
+//!   DST on an NVR that cannot be reached for an hour while failed logins
+//!   are logged (they are read only after the step).
 //!
 //! Every scenario starts with failed logins already in the logs (some within
 //! `lookback` before the first start), may start with an NVR unreachable, and
@@ -63,6 +65,14 @@
 //!   engine read at that poll (the fake's skew); several entries share a
 //!   device time only after a device clock went back, and then at most as
 //!   many are counted as were logged.
+//! - `count/shift` (all): a failed login is counted at a host time that
+//!   differs from its true host time by at most what the engine allows:
+//!   `CLOCK_JUMP` for each change of the NVR's offset the engine stored
+//!   between the entry's logging and its count, plus how far the device
+//!   clock was from the stored offset when the entry was logged (a step
+//!   between two polls that is undone before the next one cannot be seen).
+//!   An offset change larger than `CLOCK_JUMP`, in either direction, must be
+//!   a resync, after which nothing logged before it is counted.
 //! - `liveness` (all but `Clock`): after the settle phase, every address
 //!   that is never exempt and had `maxretry` failed logins that the engine
 //!   must have read within `findtime` of the first of them has been banned
@@ -108,6 +118,7 @@
 mod fake;
 
 use fake::{Entry, Fake, Harness, Opts, SKEW};
+use hik_f2b::engine::CLOCK_JUMP;
 use hik_f2b::state::{State, MAX_PENDING, MAX_SEEN, MAX_TRACKED};
 use hik_f2b::util;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -364,10 +375,23 @@ struct NvrSim {
     name: String,
     mode: Mode,
     skew: i64,
+    /// Times the offset the engine stores for this NVR changed.
+    offset_changes: usize,
     started: bool,
     last_flood: i64,
     /// Host times of its entries, in the order written (ascending).
     times: Vec<i64>,
+}
+
+/// What `count/shift` needs of a failed login logged after the start.
+#[derive(Clone, Copy)]
+struct Logged {
+    /// True host time.
+    host: i64,
+    /// The offset the engine had stored for the NVR when it was logged.
+    stored: Option<i64>,
+    /// `NvrSim::offset_changes` when it was logged.
+    changes: usize,
 }
 
 /// One generated log entry.
@@ -583,9 +607,9 @@ struct Sim {
     by_ip: HashMap<Ipv4Addr, Vec<usize>>,
     unsorted: bool,
     cycles: Vec<Cycle>,
-    /// The true host times of the failed logins logged after the start, by
-    /// (nvr, address, device time).
-    generated: HashMap<(usize, Ipv4Addr, i64), Vec<i64>>,
+    /// The failed logins logged after the start, by (nvr, address, device
+    /// time).
+    generated: HashMap<(usize, Ipv4Addr, i64), Vec<Logged>>,
     /// Failed logins counted, by (nvr, address, device time).
     counted: HashMap<(usize, Ipv4Addr, i64), u32>,
     /// Per address, the largest shift of a counted failed login: the host
@@ -625,6 +649,7 @@ impl Sim {
                 name: format!("nvr{}", n + 1),
                 mode: Mode::Ok,
                 skew: SKEW,
+                offset_changes: 0,
                 started: false,
                 last_flood: i64::MIN / 2,
                 times: Vec::new(),
@@ -711,10 +736,22 @@ impl Sim {
         if let Some(ip) = ip {
             self.by_ip.entry(ip).or_default().push(index);
             if after_start {
+                let stored = self
+                    .h
+                    .engine
+                    .state
+                    .nvr
+                    .get(&self.nvr[n].name)
+                    .and_then(|st| st.offset);
+                let logged = Logged {
+                    host,
+                    stored,
+                    changes: self.nvr[n].offset_changes,
+                };
                 self.generated
                     .entry((n, ip, device))
                     .or_default()
-                    .push(host);
+                    .push(logged);
             }
         }
     }
@@ -902,10 +939,7 @@ impl Sim {
                 Ok(())
             }
             Kind::Flood => self.flood(),
-            Kind::Clock => {
-                self.clock();
-                Ok(())
-            }
+            Kind::Clock => self.clock(),
         }
     }
 
@@ -1068,8 +1102,11 @@ impl Sim {
         Ok(())
     }
 
-    fn clock(&mut self) {
+    fn clock(&mut self) -> Result<(), String> {
         let n = self.rng.below(self.p.nvrs as u64) as usize;
+        if self.rng.chance(20) {
+            return self.outage_then_dst_end(n);
+        }
         let skew = self.nvr[n].skew;
         let lookback = self.p.lookback;
         let r = self.rng.below(100);
@@ -1088,10 +1125,53 @@ impl Sim {
             // the real-time clock is reset to 2000-01-01
             util::parse_ts("2000-01-01T00:00:00").unwrap() - (self.host + skew)
         };
+        self.step_clock(n, delta);
+        Ok(())
+    }
+
+    fn step_clock(&mut self, n: usize, delta: i64) {
         self.nvr[n].skew += delta;
         self.fake(n).lock().unwrap().skew = self.nvr[n].skew;
         let text = format!("{} clock {:+}s", self.nvr[n].name, delta);
         self.note(text);
+    }
+
+    /// An NVR that cannot be reached for about an hour, failed logins
+    /// logged on it meanwhile, then the end of DST (-3600 s) before it can
+    /// be read again. With `findtime` long enough, its read position trails
+    /// the clock by more than an hour, so only the offset shows the step.
+    fn outage_then_dst_end(&mut self, n: usize) -> Result<(), String> {
+        let was = self.nvr[n].mode;
+        self.set_nvr(n, Mode::Down);
+        let address = self.rng.pick(&PERSISTENT);
+        let count = self.p.maxretry as i64 + 1;
+        for i in 0..count {
+            let at = self.host + 10 + 5 * i;
+            self.write(n, at, address, FAIL, address.parse().ok());
+        }
+        let text = format!(
+            "fail {} {:?} x{} during the outage",
+            self.nvr[n].name, address, count
+        );
+        self.note(text);
+        let outage = self.rng.range(3600, 4100);
+        let end = self.host + outage;
+        while self.host + 300 < end {
+            self.host += 300;
+            self.note("poll after 300s".to_string());
+            self.cycle()?;
+        }
+        self.host = end;
+        self.step_clock(n, -3600);
+        self.set_nvr(
+            n,
+            if was == Mode::Down {
+                Mode::Down
+            } else {
+                Mode::Ok
+            },
+        );
+        Ok(())
     }
 
     fn settle(&mut self) -> Result<(), String> {
@@ -1146,8 +1226,14 @@ impl Sim {
         self.expire_router();
         let router = Arc::clone(&self.h.fake);
         let queries = router.lock().unwrap().rule_queries.len();
+        let offsets = self.offsets();
         self.h.set_host(self.host);
         self.h.engine.cycle_at(self.host as u64);
+        for (n, (before, after)) in offsets.iter().zip(self.offsets()).enumerate() {
+            if *before != after {
+                self.nvr[n].offset_changes += 1;
+            }
+        }
         let lines = util::captured_log();
         let (puts, sent, checked) = {
             let mut f = router.lock().unwrap();
@@ -1344,6 +1430,21 @@ impl Sim {
         self.check_state()
     }
 
+    /// The offset the engine stores for each NVR.
+    fn offsets(&self) -> Vec<Option<i64>> {
+        self.nvr
+            .iter()
+            .map(|n| {
+                self.h
+                    .engine
+                    .state
+                    .nvr
+                    .get(&n.name)
+                    .and_then(|st| st.offset)
+            })
+            .collect()
+    }
+
     fn on_count(&mut self, n: usize, ip: Ipv4Addr, ts: i64) -> Result<(), String> {
         if exempt(&self.nets, ip) {
             return Err(format!(
@@ -1364,6 +1465,35 @@ impl Sim {
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         let logged = hosts.len();
+        // count/shift: by the entry it can best be (several can share a
+        // device time after a clock went back)
+        let changes = self.nvr[n].offset_changes;
+        let excess = hosts
+            .iter()
+            .map(|g| {
+                let shift = ts - g.host;
+                let at_logging = device - g.host;
+                let allowed = match g.stored {
+                    Some(stored) => {
+                        (at_logging - stored).abs()
+                            + CLOCK_JUMP * (changes - g.changes).max(1) as i64
+                    }
+                    None => i64::MAX,
+                };
+                shift.abs().saturating_sub(allowed)
+            })
+            .min();
+        if let Some(excess) = excess.filter(|e| *e > 0) {
+            return Err(format!(
+                "[count/shift] the failed login of {} at {} (device time) on {} was counted at \
+                 {}, {} s further from its true host time than the engine allows",
+                ip,
+                util::fmt_ts(device),
+                self.nvr[n].name,
+                util::fmt_ts(ts),
+                excess
+            ));
+        }
         if counted > logged {
             let before = self
                 .gens
@@ -1387,7 +1517,7 @@ impl Sim {
         }
         // Several entries can share a device time after the clock went back;
         // the largest shift of them is the safe one to assume.
-        let shift = hosts.iter().map(|host| ts - host).max().unwrap_or(0);
+        let shift = hosts.iter().map(|g| ts - g.host).max().unwrap_or(0);
         let largest = self.shift.entry(ip).or_insert(0);
         *largest = (*largest).max(shift);
         Ok(())

@@ -19,6 +19,16 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   failed. A longer `bantime` is now a config error that names the limit and
   points to `bantime = permanent`. The limit is the same in notify-only
   mode.
+- The end of DST (or any step back of more than 15 minutes) on an NVR that
+  had logged nothing new for a while went unnoticed: its clock stayed ahead
+  of the newest entry read, and a change of the clock difference counted as
+  a jump only forward. Failed logins logged before the step and read after
+  it, for example after the NVR could not be reached for an hour, were
+  converted with the new difference: an hour later than they happened, so
+  they were counted as more recent than they were (and could trigger a ban
+  together with newer ones) or skipped as being in the future. A change of
+  more than 15 minutes in either direction now resyncs, as a forward jump
+  did. Found by the simulation test; not seen on real devices.
 - The warning that an address already in the address-list still reached
   the NVR (the only sign of a drop rule that exists but does not block) did
   not appear while the attack went on: every such sighting restarted the

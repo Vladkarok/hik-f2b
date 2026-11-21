@@ -695,25 +695,31 @@ and always in its log. It watches:
 - **Each NVR:** it cannot be read, because it does not answer or rejects
   hik-f2b's login (for example after a password change). While hik-f2b waits
   `auth_backoff` after a rejected login, the problem counts as ongoing.
-- **The router:** it cannot be reached, refuses the login, or answers with an
-  error. This is seen when a ban fails to reach the router and by a check at
-  startup and every 5 minutes.
+- **The router:** it cannot be reached, refuses the login (HTTP 401 or 403),
+  or answers with an error, such as HTTP 500. An answer that is not the JSON
+  hik-f2b asked for, such as a page from a proxy, counts as an error too.
+  This is seen when a ban fails and by a check at startup and every 5
+  minutes. After such an error hik-f2b tries the other waiting bans at the
+  next poll, not in the same one.
 - **The drop rule:** no enabled rule in `/ip/firewall/raw` or
   `/ip/firewall/filter` has `src-address-list` set to `address_list`. Without
   such a rule the address-list fills up and nothing is blocked. hik-f2b asks
   each table for the rules with that `src-address-list`
-  (`GET /rest/ip/firewall/raw?src-address-list=cctv_ban&.proplist=.id,disabled`,
-  then the same for `filter`). It counts a rule as enabled unless the reply
-  says `"disabled":"true"`: RouterOS 7.18 leaves the `disabled` property out
-  of enabled `raw` rules altogether. The check does not look at the rule's
-  chain, interface or action. So a rule that matches the address-list but
-  accepts the traffic still passes. To turn the check off, set
-  `check_rule = false` in `[mikrotik]`.
+  (`GET /rest/ip/firewall/raw?src-address-list=cctv_ban&.proplist=.id,disabled,invalid`,
+  then the same for `filter`). It counts a rule unless the reply says
+  `"disabled":"true"` or `"invalid":"true"`. RouterOS 7.18 leaves the
+  `disabled` property out of some enabled rules. RouterOS marks a rule
+  invalid when something the rule names no longer exists, for example its
+  interface list; such a rule blocks nothing. The result names the rules
+  left out, for example `; left out: 1 invalid`. The check does not look at
+  the rule's chain, interface or action. So a rule that matches the
+  address-list but accepts the traffic still passes. To turn the check off,
+  set `check_rule = false` in `[mikrotik]`.
 - **The ban rate limit:** addresses are waiting because `max_bans_per_hour` has
   been reached.
 - **Refused bans:** the router answers, but refuses to add an address to the
-  address-list. For example, the router user's group has lost the `write`
-  policy. The checks every 5 minutes only read, so they cannot clear this
+  address-list (HTTP 400), and the address is not listed. For example, the
+  router user's group has lost the `write` policy. The checks every 5 minutes only read, so they cannot clear this
   problem. Only a ban that the router accepts ends it. If every refused ban
   expires or is dropped while the problem is alerted, nothing is left to show
   whether it is over. Then hik-f2b sends one message that says so, sends no
@@ -954,8 +960,8 @@ vulnerability, see [SECURITY.md](SECURITY.md).
   This is known and not fixed yet.
 - Only MD5 Digest authentication is supported towards the NVR.
 - Only MikroTik RouterOS is supported as the firewall.
-- The drop-rule check only looks for an enabled `raw` or `filter` rule with
-  the address-list as `src-address-list`. A rule in the wrong chain, on the
+- The drop-rule check only looks for an enabled, valid `raw` or `filter` rule
+  with the address-list as `src-address-list`. A rule in the wrong chain, on the
   wrong interface or with an action that does not drop still passes it.
 - Health alerts need hik-f2b to be running. A stopped service or a host that
   is down sends nothing. To detect this, watch the service from outside.

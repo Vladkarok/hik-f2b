@@ -738,8 +738,9 @@ impl Engine {
     }
 
     /// The periodic firewall check, at most once per cycle. Skipped when a
-    /// ban attempt in this cycle already found the firewall unreachable:
-    /// that is known, and a second timeout would only delay the next poll.
+    /// ban attempt in this cycle already found the firewall unusable: that
+    /// is known, a second timeout would only delay the next poll, and a read
+    /// that works must not end a problem that writes still show.
     fn periodic_check(&mut self, host_now: u64, unreachable: bool) {
         // A next check further away than the interval can only come from
         // the host clock having gone back.
@@ -966,7 +967,8 @@ impl Engine {
     }
 
     /// Applies waiting bans. Returns true when the firewall turned out to be
-    /// unreachable.
+    /// unusable (unreachable, refusing our login or answering with an
+    /// error), which ends the attempts for this cycle.
     fn flush_pending(&mut self, now: u64) -> bool {
         // A ban time in the future can only come from the host clock having
         // been ahead; keep it as "now" so it still counts for an hour.
@@ -1066,20 +1068,6 @@ impl Engine {
                     )
                 }
                 Some(fw) => match fw.ban(ip, bantime, &comment) {
-                    Err(BanError::Transport(e)) => {
-                        // Every further attempt would wait for the same
-                        // timeout and hold up the next poll.
-                        crate::error!(
-                            "cannot ban {} on {}, will retry next cycle: {}",
-                            ip,
-                            fw.describe(),
-                            e
-                        );
-                        let reason = BanError::Transport(e).to_string();
-                        self.alerts.fail(Check::Firewall, &reason, now);
-                        unreachable = true;
-                        break;
-                    }
                     Err(BanError::Refused(e)) => {
                         crate::error!("cannot ban {} on {}, will retry: {}", ip, fw.describe(), e);
                         // A successful read does not clear this: only a
@@ -1087,6 +1075,23 @@ impl Engine {
                         let reason = format!("{}: {}", ip, e);
                         self.alerts.fail(Check::BanRefused, &reason, now);
                         continue;
+                    }
+                    Err(e) => {
+                        // The firewall cannot be reached, refuses our login
+                        // or answers with an error: every further attempt
+                        // would fail the same way (an unreachable one only
+                        // after the same timeout, holding up the next poll).
+                        // One problem, one alert: the periodic check would
+                        // report the same login or router trouble.
+                        crate::error!(
+                            "cannot ban {} on {}, will retry next cycle: {}",
+                            ip,
+                            fw.describe(),
+                            e
+                        );
+                        self.alerts.fail(Check::Firewall, &e.to_string(), now);
+                        unreachable = true;
+                        break;
                     }
                     Ok(true) => {
                         self.alerts.pass(&Check::Firewall, now);

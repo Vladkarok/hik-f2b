@@ -1241,7 +1241,7 @@ impl Sim {
                 Err(_) => return Err(format!("[router] a ban request for {:?}", address)),
             };
             self.on_request(ip, "ban request")?;
-            if outcome != "refused" && outcome != "down" {
+            if !["refused", "down", "status"].contains(&outcome) {
                 cycle.router_pass = true;
             }
         }

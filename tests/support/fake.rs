@@ -35,6 +35,45 @@ pub struct Entry {
     pub user: Vec<u8>, // inserted into the XML as is (may be XML-escaped, may be broken)
 }
 
+/// A firewall rule on the fake router.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Rule {
+    pub table: &'static str,
+    /// Its `src-address-list`.
+    pub list: String,
+    pub disabled: bool,
+    /// RouterOS marks a rule invalid when, for example, the interface list
+    /// it names is removed; the rule then matches nothing.
+    pub invalid: bool,
+    pub dynamic: bool,
+}
+
+impl Rule {
+    pub fn new(table: &'static str, list: &str, disabled: bool) -> Rule {
+        Rule {
+            table,
+            list: list.to_string(),
+            disabled,
+            invalid: false,
+            dynamic: false,
+        }
+    }
+
+    pub fn invalid(table: &'static str, list: &str) -> Rule {
+        Rule {
+            invalid: true,
+            ..Rule::new(table, list, false)
+        }
+    }
+
+    pub fn dynamic(table: &'static str, list: &str) -> Rule {
+        Rule {
+            dynamic: true,
+            ..Rule::new(table, list, false)
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Fake {
     // --- NVR
@@ -77,8 +116,18 @@ pub struct Fake {
     pub router_requests: u32,
     /// Error detail for a duplicate entry; `None` = today's RouterOS text.
     pub duplicate_text: Option<String>,
-    /// Firewall rules as (table, src-address-list, disabled).
-    pub rules: Vec<(&'static str, String, bool)>,
+    /// Answer every REST request with this HTTP status (401: a wrong
+    /// password, 403, 5xx), in RouterOS's error format.
+    pub rest_status: Option<u16>,
+    /// Answer every PUT with this HTTP status, reads work.
+    pub put_status: Option<u16>,
+    /// Answer every REST request with HTTP 200 and an HTML page, as a proxy
+    /// in front of the router might.
+    pub rest_html: bool,
+    /// Every REST request that reached the router.
+    pub rest_requests: u32,
+    /// Firewall rules.
+    pub rules: Vec<Rule>,
     /// `path?query` of every rule lookup.
     pub rule_queries: Vec<String>,
     /// `query` of every address-list lookup by address.
@@ -86,7 +135,8 @@ pub struct Fake {
     pub identity_requests: u32,
     /// (address, outcome) of every PUT that reached the router: `accepted`,
     /// `duplicate`, `refused`, `refused-listed` (refused, but the address is
-    /// listed) or `down`.
+    /// listed), `down` or `status` (answered with `rest_status` or
+    /// `put_status`).
     pub put_log: Vec<(String, &'static str)>,
     // --- Telegram
     pub tg_sent: Vec<String>,
@@ -230,6 +280,33 @@ fn route(
         if f.router_unreachable {
             return reply(DROP, json, "");
         }
+        f.rest_requests += 1;
+        if f.rest_html {
+            return reply(
+                200,
+                "text/html",
+                "<html><head><title>Proxy</title></head><body>Please log in</body></html>",
+            );
+        }
+        let status = f.rest_status.or(f.put_status.filter(|_| method == "PUT"));
+        if let Some(code) = status {
+            if path.starts_with("/rest/ip/firewall/address-list") && method == "PUT" {
+                let address = between(body, "\"address\":\"", "\"").to_string();
+                f.put_log.push((address, "status"));
+            }
+            let message = match code {
+                401 => "Unauthorized",
+                403 => "Forbidden",
+                404 => "Not Found",
+                503 => "Service Unavailable",
+                _ => "Internal Server Error",
+            };
+            return reply(
+                code,
+                json,
+                format!("{{\"error\":{},\"message\":\"{}\"}}", code, message),
+            );
+        }
         if auth != format!("Basic {}", util::b64(b"f2b:rpass")) {
             return reply(401, json, "{\"error\":401,\"message\":\"Unauthorized\"}");
         }
@@ -240,33 +317,43 @@ fn route(
         let list = param(query, "src-address-list");
         let wanted = param(query, "disabled");
         let proplist = param(query, ".proplist").unwrap_or_default();
-        // As on RouterOS 7.18.1: enabled `raw` rules have no `disabled`
-        // member at all (so a `disabled=false` filter misses them); `filter`
-        // rules always have one.
-        let shown = |t: &str, d: bool| -> Option<&'static str> {
-            match (d, t) {
-                (true, _) => Some("true"),
-                (false, "filter") => Some("false"),
-                (false, _) => None,
+        let asked = |p: &str| proplist.split(',').any(|q| q == p);
+        // As on RouterOS 7.18.1 (`.proplist=.id,disabled,invalid,dynamic`):
+        // `disabled` is `"true"` on a disabled rule, `"false"` on some
+        // enabled rules and missing on others (so a `disabled=false` filter
+        // misses them), in `raw` as in `filter`; `invalid` is `"false"` on an
+        // ordinary rule; a dynamic rule has only `"dynamic":"true"`.
+        let shown = |n: usize, r: &Rule| -> Option<&'static str> {
+            match (r.dynamic, r.disabled) {
+                (true, _) => None,
+                (false, true) => Some("true"),
+                (false, false) if n % 2 == 1 => Some("false"),
+                (false, false) => None,
             }
         };
         let ids: Vec<String> = f
             .rules
             .iter()
             .enumerate()
-            .filter(|(_, (t, l, d))| {
-                *t == table
-                    && list.as_ref().is_none_or(|want| want == l)
+            .filter(|(n, r)| {
+                r.table == table
+                    && list.as_ref().is_none_or(|want| *want == r.list)
                     && wanted
                         .as_ref()
-                        .is_none_or(|want| shown(t, *d) == Some(want.as_str()))
+                        .is_none_or(|want| shown(*n, r) == Some(want.as_str()))
             })
-            .map(|(n, (t, _, d))| {
+            .map(|(n, r)| {
                 let mut member = format!("{{\".id\":\"*{:X}\"", n + 1);
-                if let Some(v) = shown(t, *d) {
-                    if proplist.split(',').any(|p| p == "disabled") {
+                if let Some(v) = shown(n, r) {
+                    if asked("disabled") {
                         member.push_str(&format!(",\"disabled\":\"{}\"", v));
                     }
+                }
+                if !r.dynamic && asked("invalid") {
+                    member.push_str(&format!(",\"invalid\":\"{}\"", r.invalid));
+                }
+                if r.dynamic && asked("dynamic") {
+                    member.push_str(",\"dynamic\":\"true\"");
                 }
                 member.push('}');
                 member
@@ -371,9 +458,15 @@ fn route(
                 return reply(400, json, out);
             }
             f.put_log.push((address.clone(), "accepted"));
-            f.bans.push(address);
+            f.bans.push(address.clone());
             f.ban_bodies.push(body.to_string());
-            return reply(201, json, "{}");
+            // RouterOS answers with the entry it made
+            let out = format!(
+                "{{\".id\":\"*{:X}\",\"address\":\"{}\",\"list\":\"cctv_ban\"}}",
+                f.bans.len(),
+                address
+            );
+            return reply(201, json, out);
         }
     }
     if path == format!("/bot{}/sendMessage", TOKEN) && method == "POST" {
@@ -456,7 +549,7 @@ fn spawn_fake() -> (Arc<Mutex<Fake>>, u16) {
         nvr_auth_ok: true,
         nonce: NONCE.to_string(),
         // the drop rule from the README
-        rules: vec![("raw", "cctv_ban".to_string(), false)],
+        rules: vec![Rule::new("raw", "cctv_ban", false)],
         ..Default::default()
     }));
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

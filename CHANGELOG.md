@@ -19,6 +19,24 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   failed. A longer `bantime` is now a config error that names the limit and
   points to `bantime = permanent`. The limit is the same in notify-only
   mode.
+- The drop-rule check counted a rule that RouterOS marks invalid, which it
+  does when, for example, the interface list the rule names is removed.
+  Such a rule blocks nothing. The check now leaves out rules that are
+  disabled or invalid, and its result says how many it left out and why
+  (`; left out: 1 invalid`).
+- With `check_rule = false` the router check accepted any answer with
+  HTTP 200, and a ban accepted any answer with HTTP 2xx, such as a page
+  from a proxy in front of the router. Both now need the JSON that RouterOS
+  sends; anything else is a router error.
+- Every error answer to a ban was a refused ban. With bans waiting, a
+  wrong router password, HTTP 500 or a proxy page cost one request per
+  waiting ban in every poll (two for HTTP 500), and a wrong password raised
+  two alerts at once (`firewall` and `ban-refused`). A refused login
+  (HTTP 401 or 403) and an error that says nothing about the address
+  (HTTP 5xx, other unexpected answers) now end the attempts for this poll
+  after one request, like an unreachable router, and raise one alert under
+  `firewall`. Only HTTP 400 for an address that is not listed is still a
+  refused ban of that address.
 - A URL such as `http://[::1]evil.example` counted as a local address, so
   plain http was allowed for it. A URL is now accepted only as
   `scheme://host` with an optional port from 1 to 65535 and nothing after

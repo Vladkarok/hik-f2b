@@ -1543,11 +1543,11 @@ fn missing_drop_rule_is_alerted_until_a_rule_is_back() {
     // `,` is percent-encoded by the HTTP client
     assert_eq!(
         queries[0],
-        "/rest/ip/firewall/raw?src-address-list=cctv_ban&.proplist=.id%2Cdisabled"
+        "/rest/ip/firewall/raw?src-address-list=cctv_ban&.proplist=.id%2Cdisabled%2Cinvalid"
     );
     assert_eq!(
         queries[1],
-        "/rest/ip/firewall/filter?src-address-list=cctv_ban&.proplist=.id%2Cdisabled"
+        "/rest/ip/firewall/filter?src-address-list=cctv_ban&.proplist=.id%2Cdisabled%2Cinvalid"
     );
 
     // a disabled rule does not count
@@ -1555,7 +1555,7 @@ fn missing_drop_rule_is_alerted_until_a_rule_is_back() {
         .lock()
         .unwrap()
         .rules
-        .push(("filter", "cctv_ban".to_string(), true));
+        .push(Rule::new("filter", "cctv_ban", true));
     h.advance(300); // 10:20
     assert_eq!(telegram_texts(&h).len(), 1);
     // an enabled one in filter does
@@ -1563,7 +1563,7 @@ fn missing_drop_rule_is_alerted_until_a_rule_is_back() {
         .lock()
         .unwrap()
         .rules
-        .push(("filter", "cctv_ban".to_string(), false));
+        .push(Rule::new("filter", "cctv_ban", false));
     h.advance(300); // 10:25
     let texts = telegram_texts(&h);
     assert_eq!(texts.len(), 2, "{:?}", texts);
@@ -1573,8 +1573,8 @@ fn missing_drop_rule_is_alerted_until_a_rule_is_back() {
     );
 }
 
-/// The rule check against replies shaped like RouterOS 7.18.1's: enabled
-/// `raw` rules have no `disabled` member, `filter` rules always have one.
+/// The rule check against replies shaped like RouterOS 7.18.1's: some
+/// enabled rules have no `disabled` member, others `"disabled":"false"`.
 #[test]
 fn rule_check_reads_the_disabled_member_as_the_router_prints_it() {
     use hik_f2b::action::HealthError;
@@ -1582,7 +1582,7 @@ fn rule_check_reads_the_disabled_member_as_the_router_prints_it() {
     let set = |rules: &[(&'static str, bool)]| {
         h.fake.lock().unwrap().rules = rules
             .iter()
-            .map(|(t, d)| (*t, "cctv_ban".to_string(), *d))
+            .map(|(t, d)| Rule::new(t, "cctv_ban", *d))
             .collect();
     };
     let check = || h.engine.firewall.as_ref().unwrap().check();
@@ -1600,15 +1600,191 @@ fn rule_check_reads_the_disabled_member_as_the_router_prints_it() {
     set(&[("raw", true), ("filter", false), ("filter", true)]);
     assert_eq!(
         check(),
-        Ok("1 enabled rule(s) in /ip/firewall/filter with src-address-list=cctv_ban".to_string())
+        Ok(
+            "1 enabled rule(s) in /ip/firewall/filter with src-address-list=cctv_ban; left out: \
+             2 disabled"
+                .to_string()
+        )
     );
 
     // only disabled rules, in both tables
     set(&[("raw", true), ("filter", true)]);
     assert!(matches!(check(), Err(HealthError::NotEnforced(_))));
     // a rule for another list does not count
-    h.fake.lock().unwrap().rules = vec![("raw", "other".to_string(), false)];
+    h.fake.lock().unwrap().rules = vec![Rule::new("raw", "other", false)];
     assert!(matches!(check(), Err(HealthError::NotEnforced(_))));
+    // the enabled rule with and without `"disabled":"false"`
+    set(&[("raw", true), ("raw", false)]);
+    assert!(check().is_ok());
+    set(&[("raw", false), ("raw", true)]);
+    assert!(check().is_ok());
+}
+
+/// A rule RouterOS marks invalid (its interface list was removed, say)
+/// blocks nothing: it is left out, and the check says so.
+#[test]
+fn invalid_rules_do_not_count() {
+    use hik_f2b::action::HealthError;
+    let mut h = Harness::new(true);
+    let check = |h: &Harness| h.engine.firewall.as_ref().unwrap().check();
+    h.fake.lock().unwrap().rules = vec![Rule::invalid("raw", "cctv_ban")];
+    assert_eq!(
+        check(&h),
+        Err(HealthError::NotEnforced(
+            "no enabled rule in /ip/firewall/raw or /ip/firewall/filter has \
+             src-address-list=cctv_ban; left out: 1 invalid"
+                .to_string()
+        ))
+    );
+    // an invalid rule in raw, a good one in filter
+    h.fake.lock().unwrap().rules = vec![
+        Rule::invalid("raw", "cctv_ban"),
+        Rule::new("raw", "cctv_ban", true),
+        Rule::new("filter", "cctv_ban", false),
+    ];
+    assert_eq!(
+        check(&h),
+        Ok(
+            "1 enabled rule(s) in /ip/firewall/filter with src-address-list=cctv_ban; left \
+            out: 1 disabled, 1 invalid"
+                .to_string()
+        )
+    );
+    // a dynamic rule reports neither property, and counts
+    h.fake.lock().unwrap().rules = vec![Rule::dynamic("raw", "cctv_ban")];
+    assert_eq!(
+        check(&h),
+        Ok("1 enabled rule(s) in /ip/firewall/raw with src-address-list=cctv_ban".to_string())
+    );
+    // the alert names the reason
+    h.fake.lock().unwrap().rules = vec![Rule::invalid("raw", "cctv_ban")];
+    run(&mut h, 3, 300);
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 1, "{:?}", texts);
+    assert!(texts[0].ends_with("left out: 1 invalid"), "{}", texts[0]);
+}
+
+/// An answer that is not the JSON asked for (a proxy's login page, say)
+/// is an error, never "no rule" or "the router answers".
+#[test]
+fn an_answer_that_is_not_json_is_an_error() {
+    use hik_f2b::action::{BanError, BanTime, HealthError};
+    for check_rule in [true, false] {
+        let h = Harness::with(Opts {
+            mikrotik_extra: if check_rule { "" } else { "check_rule = false" },
+            ..Default::default()
+        });
+        h.fake.lock().unwrap().rest_html = true;
+        let fw = h.engine.firewall.as_ref().unwrap();
+        match fw.check() {
+            Err(HealthError::Unusable(e)) => {
+                assert!(
+                    e.starts_with("the firewall answers with an error: "),
+                    "{}",
+                    e
+                );
+                assert!(e.contains("<html>"), "{}", e);
+            }
+            other => panic!("{:?}", other),
+        }
+        match fw.ban(attacker(), BanTime::Seconds(60), "t") {
+            Err(BanError::Router(e)) => assert!(
+                e.starts_with("the answer to the ban is not the JSON object RouterOS sends"),
+                "{}",
+                e
+            ),
+            other => panic!("{:?}", other),
+        }
+    }
+}
+
+/// Error answers that say nothing about one address stop the queue for
+/// the cycle and raise one alert, under `firewall`; only an answer about
+/// the address (HTTP 400) is a refused ban.
+#[test]
+fn router_errors_are_classified_and_bound_the_requests() {
+    // (status, for PUT only, the start of the alert reason)
+    for (status, put_only, reason) in [
+        (401, false, "the firewall refuses our login: HTTP 401: "),
+        (403, false, "the firewall refuses our login: HTTP 403: "),
+        (500, true, "the firewall answers with an error: HTTP 500: "),
+        (503, false, "the firewall answers with an error: HTTP 503: "),
+    ] {
+        let mut h = Harness::new(true);
+        {
+            let mut f = h.fake.lock().unwrap();
+            if put_only {
+                f.put_status = Some(status);
+            } else {
+                f.rest_status = Some(status);
+            }
+        }
+        for n in 1..=5 {
+            h.burst("10:01", &format!("198.51.100.{}", n), 5);
+        }
+        let before = h.fake.lock().unwrap().rest_requests;
+        h.cycle("10:02:00");
+        // one ban request and no lookup, whatever the number waiting; no
+        // periodic check either (it is not due yet)
+        let f = h.fake.lock().unwrap();
+        assert_eq!(f.rest_requests - before, 1, "HTTP {}", status);
+        assert!(f.lookups.is_empty(), "HTTP {}", status);
+        drop(f);
+        assert_eq!(h.engine.state.pending.len(), 5);
+        // a cycle with the periodic check: at most one more request per table
+        let before = h.fake.lock().unwrap().rest_requests;
+        h.cycle("10:05:00");
+        let used = h.fake.lock().unwrap().rest_requests - before;
+        assert!(used <= 3, "HTTP {}: {} requests", status, used);
+        run(&mut h, 15, 30); // 10:12:30
+        let texts = telegram_texts(&h);
+        assert_eq!(texts.len(), 1, "HTTP {}: one alert: {:?}", status, texts);
+        assert!(
+            texts[0].starts_with(&format!(
+                "{}the firewall is not usable for 10 min: {}",
+                WARN, reason
+            )),
+            "{}",
+            texts[0]
+        );
+        assert_eq!(
+            h.engine.alerted_problems(),
+            vec!["firewall"],
+            "HTTP {}",
+            status
+        );
+        // fixed: the bans go through, one recovery
+        {
+            let mut f = h.fake.lock().unwrap();
+            f.rest_status = None;
+            f.put_status = None;
+        }
+        h.advance(30);
+        assert_eq!(h.banned().len(), 5, "HTTP {}", status);
+        let texts = telegram_texts(&h);
+        assert_eq!(texts.len(), 7, "HTTP {}: {:?}", status, texts);
+        assert!(texts[6].starts_with(&format!("{}the firewall is usable again", OK)));
+        assert!(h.engine.alerted_problems().is_empty());
+    }
+}
+
+/// HTTP 400 is about this request: the address is looked up, and an
+/// unlisted one is refused, per address; at most two requests per address.
+#[test]
+fn a_refused_ban_costs_two_requests_per_address() {
+    let mut h = Harness::new(false);
+    h.fake.lock().unwrap().refuse_writes = true;
+    for n in 1..=3 {
+        h.burst("10:01", &format!("198.51.100.{}", n), 5);
+    }
+    let before = h.fake.lock().unwrap().rest_requests;
+    h.cycle("10:02:00");
+    let f = h.fake.lock().unwrap();
+    assert_eq!(f.rest_requests - before, 6);
+    assert_eq!(f.lookups.len(), 3);
+    drop(f);
+    assert_eq!(h.engine.state.pending.len(), 3);
+    assert_eq!(h.engine.alerted_problems(), Vec::<String>::new());
 }
 
 #[test]
@@ -1846,12 +2022,28 @@ fn already_listed_is_recognised_whatever_the_wording() {
 #[test]
 fn refused_ban_of_an_unlisted_address_is_retried() {
     let mut h = Harness::new(false);
-    h.fake.lock().unwrap().router_down = true; // every PUT gets HTTP 500
+    h.fake.lock().unwrap().refuse_writes = true; // every PUT gets HTTP 400
     h.burst("10:01", ATTACKER, 5);
     h.cycle("10:02:00");
     assert!(h.banned().is_empty());
     assert_eq!(h.engine.state.pending.len(), 1);
     assert_eq!(h.fake.lock().unwrap().lookups.len(), 1);
+    h.fake.lock().unwrap().refuse_writes = false;
+    h.advance(30);
+    assert_eq!(h.banned(), vec![ATTACKER]);
+}
+
+/// HTTP 500 says nothing about the address: no lookup, and the next cycle
+/// tries again.
+#[test]
+fn server_error_is_retried_without_a_lookup() {
+    let mut h = Harness::new(false);
+    h.fake.lock().unwrap().router_down = true; // every PUT gets HTTP 500
+    h.burst("10:01", ATTACKER, 5);
+    h.cycle("10:02:00");
+    assert!(h.banned().is_empty());
+    assert_eq!(h.engine.state.pending.len(), 1);
+    assert!(h.fake.lock().unwrap().lookups.is_empty());
 }
 
 #[test]

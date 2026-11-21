@@ -8,7 +8,7 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 
 ## [Unreleased]
 
-## [0.4.0] - YYYY-MM-DD
+## [0.4.0] - 2026-11-21
 
 ### Fixed
 

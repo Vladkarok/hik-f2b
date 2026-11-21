@@ -1116,6 +1116,10 @@ Not yet tried:
   DST on an NVR that could not be reached, and a stop of the Quadlet unit
   or the Compose service in the middle of a poll. Only the tests and the
   simulation make these happen.
+- The log reading changes of 0.4.0 on real NVRs: an NVR that ignores the
+  search position, a paging status with a prefix or without a known value,
+  several challenges in one `WWW-Authenticate` header, a user name with a bare
+  `&`, and a clock set before 1970. Only the tests make these happen.
 - Notify-only mode on real devices.
 - A ban with a country on real devices: only `--country` and `--check` were
   run against a real database file.

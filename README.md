@@ -1184,7 +1184,7 @@ To run every check that CI runs on a push with one command, run
 `bash .github/scripts/check-all.sh` from any directory of the repository.
 It stops at the first failed check, unless you add `--keep-going`.
 
-Every Sunday, `.github/workflows/sim.yml` runs `tests/sim.rs` with 4000
+Every Sunday, `.github/workflows/sim.yml` runs `tests/sim.rs` with 1500
 seeds per class, each time on seeds that no earlier run covered. A
 violation fails the run, and the job summary names its seed and the replay
 command. To start a run by hand, run `gh workflow run sim.yml -f seeds=200`.

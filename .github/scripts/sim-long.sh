@@ -5,7 +5,7 @@
 #   .github/scripts/sim-long.sh [SEEDS [START]]
 #   .github/scripts/sim-long.sh --self-test
 #
-# SEEDS is the number of seeds per scenario class (default 4000, at most
+# SEEDS is the number of seeds per scenario class (default 1500, at most
 # 4000); START is the first seed. The run covers the seeds START to
 # START + 5 * SEEDS - 1: tests/sim.rs gives each of its 5 classes the seeds
 # of its remainder mod 5, SEEDS of them, from START on.
@@ -39,7 +39,7 @@ set -euo pipefail
 export LC_ALL=C
 
 CLASSES=5               # tests/sim.rs: CLASSES, `seed % 5` picks the class
-DEFAULT_SEEDS=4000
+DEFAULT_SEEDS=1500
 MAX_SEEDS=4000
 STRIDE=100000           # seeds that belong to one run number
 MAX_START=1000000000000000

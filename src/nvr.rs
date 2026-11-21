@@ -323,23 +323,90 @@ pub fn parse_page(nvr: &str, raw: &str) -> Result<Page, NvrError> {
     Ok(page)
 }
 
-/// Picks the challenge to answer from all `WWW-Authenticate` headers: the
-/// Digest one if any. Without one the first header is returned, so that
+/// The auth scheme of one challenge and the rest of it.
+fn scheme(challenge: &str) -> (&str, &str) {
+    let challenge = challenge.trim();
+    challenge.split_once([' ', '\t']).unwrap_or((challenge, ""))
+}
+
+/// Splits one `WWW-Authenticate` value into its challenges. RFC 9110
+/// §11.6.1 allows several in one value, `Basic realm="x", Digest …`: a
+/// challenge is a scheme, then either a token68 or `name=value` parameters,
+/// and a comma separates both the challenges and the parameters. A list
+/// element that is a token followed by a space and then not by `=` (or by
+/// nothing) starts a new challenge. Commas inside quoted strings, with their
+/// `\` escapes, are not separators.
+pub fn split_challenges(value: &str) -> Vec<&str> {
+    // byte ranges of the list elements
+    let mut elements = Vec::new();
+    let (mut start, mut quoted, mut escaped) = (0, false, false);
+    for (i, c) in value.char_indices() {
+        if quoted {
+            match c {
+                _ if escaped => escaped = false,
+                '\\' => escaped = true,
+                '"' => quoted = false,
+                _ => {}
+            }
+        } else if c == '"' {
+            quoted = true;
+        } else if c == ',' {
+            elements.push((start, i));
+            start = i + 1;
+        }
+    }
+    elements.push((start, value.len()));
+    let starts_challenge = |element: &str| {
+        let token = element
+            .find(|c: char| !(c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c)))
+            .unwrap_or(element.len());
+        let rest = &element[token..];
+        token > 0
+            && (rest.is_empty()
+                || (rest.starts_with([' ', '\t'])
+                    && !rest.trim_start_matches([' ', '\t']).starts_with('=')))
+    };
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for (from, to) in elements {
+        let element = value[from..to].trim();
+        if element.is_empty() {
+            continue;
+        }
+        match out.last_mut() {
+            Some(last) if !starts_challenge(element) => last.1 = to,
+            _ => out.push((from, to)),
+        }
+    }
+    out.into_iter().map(|(a, b)| value[a..b].trim()).collect()
+}
+
+/// Picks the challenge to answer from all `WWW-Authenticate` headers, each
+/// of which may hold several (`split_challenges`): the first Digest one with
+/// MD5 or no algorithm (RFC 7616 lets a server offer one Digest challenge per
+/// algorithm), else the first Digest one, else the first challenge, so that
 /// `DigestAuth::challenge` refuses it (Basic is never answered).
 pub fn pick_challenge<'a>(headers: &[&'a str]) -> &'a str {
-    headers
+    let all: Vec<&'a str> = headers.iter().flat_map(|h| split_challenges(h)).collect();
+    let digest: Vec<&'a str> = all
         .iter()
-        .find(|h| {
-            h.trim()
-                .get(..6)
-                .is_some_and(|p| p.eq_ignore_ascii_case("digest"))
-        })
-        .or_else(|| headers.first())
         .copied()
+        .filter(|c| scheme(c).0.eq_ignore_ascii_case("digest"))
+        .collect();
+    let md5 = digest.iter().copied().find(|c| {
+        parse_kv(scheme(c).1)
+            .iter()
+            .find(|(k, _)| k == "algorithm")
+            .is_none_or(|(_, v)| v.eq_ignore_ascii_case("MD5"))
+    });
+    md5.or_else(|| digest.first().copied())
+        .or_else(|| all.first().copied())
         .unwrap_or("")
 }
 
 /// Splits `key=value, key="quoted, value"` pairs of an HTTP auth header.
+/// Space around a key and around an unquoted value is dropped (RFC 9110
+/// allows it around `=`); a quoted value is kept as it is, with its `\`
+/// escapes resolved.
 pub fn parse_kv(text: &str) -> Vec<(String, String)> {
     let mut out = Vec::new();
     let mut chars = text.chars().peekable();
@@ -362,8 +429,12 @@ pub fn parse_kv(text: &str) -> Vec<(String, String)> {
             continue;
         }
         chars.next();
+        while matches!(chars.peek(), Some(' ' | '\t')) {
+            chars.next();
+        }
         let mut value = String::new();
-        if chars.peek() == Some(&'"') {
+        let quoted = chars.peek() == Some(&'"');
+        if quoted {
             chars.next();
             while let Some(c) = chars.next() {
                 match c {
@@ -385,7 +456,12 @@ pub fn parse_kv(text: &str) -> Vec<(String, String)> {
                 chars.next();
             }
         }
-        out.push((key.trim().to_ascii_lowercase(), value.trim().to_string()));
+        let value = if quoted {
+            value
+        } else {
+            value.trim().to_string()
+        };
+        out.push((key.trim().to_ascii_lowercase(), value));
     }
     out
 }
@@ -427,9 +503,8 @@ impl DigestAuth {
     /// reversible form even if something in the path asks for it.
     /// Returns whether the server marked our previous nonce as stale.
     pub fn challenge(&mut self, header: &str) -> Result<bool, String> {
-        let header = header.trim();
-        let rest = match header.get(..6) {
-            Some(p) if p.eq_ignore_ascii_case("digest") => header.get(6..).unwrap_or(""),
+        let rest = match scheme(header) {
+            (s, rest) if s.eq_ignore_ascii_case("digest") => rest,
             _ => return Err("the NVR did not offer Digest authentication".to_string()),
         };
         let clean =
@@ -1316,6 +1391,71 @@ mod tests {
         assert_eq!(pick_challenge(&[]), "");
         let mut d = DigestAuth::new("u", "p");
         assert!(d.challenge(pick_challenge(&["Basic realm=\"x\""])).is_err());
+    }
+
+    #[test]
+    fn several_challenges_in_one_header() {
+        // RFC 9110 §11.6.1: challenges and their parameters share the comma;
+        // quoted strings hold commas and escaped quotes
+        let value = r#"Newauth realm="apps", type=1, title="Login to \"apps\"", Basic realm="simple, really", Digest realm = "x, y", qop="auth,auth-int", nonce="n,1", Other abc==, Bare"#;
+        assert_eq!(
+            split_challenges(value),
+            [
+                r#"Newauth realm="apps", type=1, title="Login to \"apps\"""#,
+                r#"Basic realm="simple, really""#,
+                r#"Digest realm = "x, y", qop="auth,auth-int", nonce="n,1""#,
+                "Other abc==",
+                "Bare",
+            ]
+        );
+        assert_eq!(
+            pick_challenge(&[value]),
+            r#"Digest realm = "x, y", qop="auth,auth-int", nonce="n,1""#
+        );
+        let mut d = DigestAuth::new("u", "p");
+        d.challenge(pick_challenge(&[value])).unwrap();
+        assert!(d
+            .header("GET", "/")
+            .contains(r#"realm="x, y", nonce="n,1""#));
+        // Basic in one header, Digest in the next one
+        assert_eq!(
+            pick_challenge(&[r#"Basic realm="x", Newauth"#, r#"Digest nonce="n""#]),
+            r#"Digest nonce="n""#
+        );
+        // one Digest challenge per algorithm (RFC 7616): the MD5 one
+        let both = r#"Digest realm="x", nonce="a", algorithm=SHA-256, Digest realm="x", nonce="b", algorithm=MD5"#;
+        assert_eq!(
+            pick_challenge(&[both]),
+            r#"Digest realm="x", nonce="b", algorithm=MD5"#
+        );
+        let only_sha = r#"Digest realm="x", nonce="a", algorithm=SHA-256"#;
+        assert!(d.challenge(pick_challenge(&[only_sha])).is_err());
+        // unknown schemes only: refused, never answered
+        for value in [r#"Newauth realm="x""#, "Bearer", "Digestx nonce=\"n\"", ""] {
+            assert!(d.challenge(pick_challenge(&[value])).is_err(), "{}", value);
+        }
+        assert!(split_challenges(" , ,").is_empty());
+    }
+
+    #[test]
+    fn quoted_values_keep_their_spaces() {
+        let kv = parse_kv(r#"realm=" r ", nonce = " n", opaque="o ", qop = auth , x="a\"b\\c""#);
+        let get = |k: &str| kv.iter().find(|(key, _)| key == k).unwrap().1.as_str();
+        assert_eq!(get("realm"), " r ");
+        assert_eq!(get("nonce"), " n");
+        assert_eq!(get("opaque"), "o ");
+        assert_eq!(get("qop"), "auth");
+        assert_eq!(get("x"), "a\"b\\c");
+        // the spaces are part of HA1 and are echoed exactly
+        let mut d = DigestAuth::new("u", "p");
+        d.challenge(r#"Digest realm=" r ", nonce=" n ", opaque=" o""#)
+            .unwrap();
+        let h = d.header("GET", "/");
+        let ha1 = util::md5_hex("u: r :p");
+        let ha2 = util::md5_hex("GET:/");
+        let response = util::md5_hex(&format!("{}: n :{}", ha1, ha2));
+        assert!(h.contains(&format!(r#"response="{}""#, response)), "{}", h);
+        assert!(h.contains(r#"realm=" r ", nonce=" n ""#) && h.contains(r#"opaque=" o""#));
     }
 
     #[test]

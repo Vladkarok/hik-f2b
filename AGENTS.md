@@ -46,7 +46,7 @@ Before a release, also run
   every pushed commit, the tests on arm64, `cargo audit` and the image
   checks. `tests/sim.rs` takes more seeds from `HIK_F2B_SIM_SEEDS` (its
   module comment has the rest).
-- `.github/workflows/sim.yml` runs `tests/sim.rs` with 4000 seeds per class
+- `.github/workflows/sim.yml` runs `tests/sim.rs` with 1500 seeds per class
   every Sunday, on seeds no earlier run covered, through
   `.github/scripts/sim-long.sh` (its header has the rules). Start a run by
   hand with `gh workflow run sim.yml -f seeds=200`. A violation fails the

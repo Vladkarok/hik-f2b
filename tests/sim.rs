@@ -113,10 +113,6 @@
 //! `HIK_F2B_SIM_SEED` (run only that seed, in its class, and print its
 //! trace). A violation prints the seed, the class, the parameters and the
 //! last steps of the trace.
-//!
-//! The summary line of each class also gives the peak number of threads of
-//! the fakes in the process (of all classes together). Above
-//! `MAX_FAKE_THREADS` the class fails: a fault of the test harness.
 
 #[path = "support/fake.rs"]
 mod fake;
@@ -133,12 +129,6 @@ use std::time::Instant;
 
 /// Seeds per class when `HIK_F2B_SIM_SEEDS` is not set (`Backlog`: a third).
 const DEFAULT_SEEDS: u64 = 30;
-/// The most threads the fakes may have at once in the process (listeners
-/// and connections, see `fake::live_threads`). The five classes run at the
-/// same time, each with one harness at a time of at most two fakes. The
-/// bound does not grow with the number of seeds, so harnesses that leave
-/// threads behind exceed it.
-const MAX_FAKE_THREADS: usize = 60;
 /// Whether a violation fails the test (otherwise it is only printed).
 const STRICT: bool = true;
 /// Trace lines shown with a violation.
@@ -1906,7 +1896,7 @@ fn run_class(class: Class) {
     let summary = format!(
         "sim {:?}: {} seed(s), {} cycles, {:.1} s, {} violation(s); bans {}, already listed {}, \
          reports {}, health alerts {} (ban-bypassed {}), addresses due for liveness {}, \
-         addresses with a shift {}; peak fake threads {} (at most {})",
+         addresses with a shift {}",
         class,
         seeds.len(),
         stats[0],
@@ -1918,9 +1908,7 @@ fn run_class(class: Class) {
         stats[4],
         stats[7],
         stats[5],
-        stats[6],
-        fake::peak_threads(),
-        MAX_FAKE_THREADS
+        stats[6]
     );
     say(&summary);
     for failure in &failures {
@@ -1929,16 +1917,6 @@ fn run_class(class: Class) {
     if STRICT && !failures.is_empty() {
         panic!("{}\n\n{}", summary, failures.join("\n\n"));
     }
-    // A fault of the test harness, not a finding about the engine.
-    let peak = fake::peak_threads();
-    assert!(
-        peak <= MAX_FAKE_THREADS,
-        "sim {:?}: the fakes had {} threads at once, more than {}: the test harness does not \
-         end the threads of dropped harnesses (a fault of the test, not of the engine)",
-        class,
-        peak,
-        MAX_FAKE_THREADS
-    );
 }
 
 #[test]

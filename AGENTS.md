@@ -5,14 +5,28 @@ what they can. This file holds what they cannot, and how to run them.
 
 ## Checks
 
-Run them from the repository root before you push:
+Run them all with one command before you push:
+
+```bash
+bash .github/scripts/check-all.sh
+```
+
+It works from any directory of the repository. It stops at the first
+failed step; `--keep-going` runs every step and reports all that failed.
+It finds cargo in `~/.cargo/bin` if cargo is not on PATH, and says what is
+missing. The steps, cheapest first, can also be run one by one:
 
 ```bash
 bash .github/scripts/repo-guard.sh
 bash .github/scripts/repo-guard.sh --self-test
 bash .github/scripts/docs-check.sh
-bash .github/scripts/release-check.sh vX.Y.Z ghcr.io/vladkarok/hik-f2b
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
 ```
+
+Before a release, also run
+`bash .github/scripts/release-check.sh vX.Y.Z ghcr.io/vladkarok/hik-f2b`.
 
 - `repo-guard.sh` looks for addresses outside `.github/repo-guard-allow.txt`,
   letters that only Russian uses, and binary files. Its header lists the
@@ -28,10 +42,15 @@ bash .github/scripts/release-check.sh vX.Y.Z ghcr.io/vladkarok/hik-f2b
 - To add your own private strings, name a file outside the repository:
   `git config hikf2b.denylist /path/to/denylist`. The guard header gives the
   format. Never commit that file.
-- CI runs all of this, plus `cargo fmt --check`, `cargo clippy` and
-  `cargo test`, on every push and pull request. Run those three locally
-  too: a Rust toolchain is all they need. `tests/sim.rs` takes more seeds
-  from `HIK_F2B_SIM_SEEDS` (its module comment has the rest).
+- CI runs all of this on every push and pull request, plus the guard on
+  every pushed commit, the tests on arm64, `cargo audit` and the image
+  checks. `tests/sim.rs` takes more seeds from `HIK_F2B_SIM_SEEDS` (its
+  module comment has the rest).
+- `.github/workflows/sim.yml` runs `tests/sim.rs` with 1500 seeds per class
+  every Sunday, on seeds no earlier run covered, through
+  `.github/scripts/sim-long.sh` (its header has the rules). Start a run by
+  hand with `gh workflow run sim.yml -f seeds=200`. A violation fails the
+  run; the job summary names the seed and the replay command.
 
 ## Rules
 

@@ -8,6 +8,22 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 
 ## [Unreleased]
 
+### Added
+
+- `.github/scripts/check-all.sh` runs every check that CI runs on a push in
+  one command, cheapest first: the repository guard and its self-test, the
+  documentation check, `cargo fmt --check`, `cargo clippy` and `cargo test`.
+  It stops at the first failed step (`--keep-going` runs them all), prints
+  a summary with the time each step took, and finds cargo in
+  `~/.cargo/bin` when it is not on PATH.
+- `.github/workflows/sim.yml` runs the simulation test with 1500 seeds per
+  class in release mode every Sunday, or by hand with
+  `gh workflow run sim.yml -f seeds=N -f start=S`. Without a start, the
+  seeds come from the run number, so that no run repeats the seeds of
+  another. A violation fails the run; the job summary lists the seed, the
+  class and the replay command. The steps are in
+  `.github/scripts/sim-long.sh`, which can also be run locally.
+
 ## [0.4.0] - 2026-11-21
 
 ### Fixed

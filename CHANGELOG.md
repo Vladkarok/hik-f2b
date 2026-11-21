@@ -44,7 +44,7 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   from a proxy in front of the router. Both now need the JSON that RouterOS
   sends; anything else is a router error.
 - Every error answer to a ban was a refused ban. With bans waiting, a
-  wrong router password, HTTP 500 or a proxy page cost one request per
+  wrong router password, HTTP 500 or an error page from a proxy cost one request per
   waiting ban in every poll (two for HTTP 500), and a wrong password raised
   two alerts at once (`firewall` and `ban-refused`). A refused login
   (HTTP 401 or 403) and an error that says nothing about the address
@@ -52,13 +52,20 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   after one request, like an unreachable router, and raise one alert under
   `firewall`. Only HTTP 400 for an address that is not listed is still a
   refused ban of that address.
-- A URL such as `http://[::1]evil.example` counted as a local address, so
-  plain http was allowed for it. A URL is now accepted only as
-  `scheme://host` with an optional port from 1 to 65535 and nothing after
-  it.
-- `--hours` above 8760 said that it must be a positive number; it now names
-  the range 1 to 8760.
-
+- A stop (SIGTERM, SIGINT) took effect only between polls, and the state
+  was saved only after a whole poll, while Podman and Docker kill a
+  container 10 seconds after the stop. A stop during a long poll (an NVR
+  or a router that does not answer costs 25 seconds a request) lost what
+  that poll had read and counted. hik-f2b now stops between the steps of a
+  poll (each NVR, each ban, the firewall check, each notification) and
+  saves the state before it exits. The Quadlet unit and the Compose file
+  give it 60 seconds to do so (`StopTimeout=60`, `stop_grace_period: 60s`),
+  which covers the longest step it cannot interrupt: a ban to a router
+  that does not answer and the lookup after it.
+- At startup, a router that could not be reached was asked twice in a row,
+  for the size of the address-list and for the firewall check, each
+  waiting for the timeout. The size is now asked only of a router that
+  answered the check.
 - A state file that could not be used (larger than 16 MiB, damaged,
   unreadable or of another version) was replaced by an empty state without
   a word, and the next save overwrote it, although it may hold the only
@@ -74,6 +81,24 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 - The state was turned into text three times per poll and held as two
   copies in memory. It is now written to the file line by line, only when
   it changed, which a hash of it tells.
+- When the notification queue was full (100 waiting), new ban messages and
+  health alerts were dropped without a log line. Each poll that drops some
+  now logs one WARNING that counts them.
+- When Telegram came back after an outage, the whole queue was sent at
+  once and ran into Telegram's limit (HTTP 429), which counted as a failed
+  attempt, as if Telegram were down. hik-f2b now waits as long as the 429
+  answer says (`retry_after`) before it sends the next message, and the
+  wait costs no attempt.
+- Health alerts left out a URL only when it stood alone after a space. A
+  URL in brackets or quotes, or after `url=`, reached the chat. Every URL is
+  now replaced by `<url>` wherever it stands; an address with a port outside
+  a URL (the operator's own device, in a connection error) stays.
+- A URL such as `http://[::1]evil.example` counted as a local address, so
+  plain http was allowed for it. A URL is now accepted only as
+  `scheme://host` with an optional port from 1 to 65535 and nothing after
+  it.
+- `--hours` above 8760 said that it must be a positive number; it now names
+  the range 1 to 8760.
 
 ### Changed
 
@@ -87,7 +112,6 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   save of the state failed). **A config with a stray or repeated setting
   that used to start no longer starts:** run `--check` with the new version
   before you update, and remove or correct the line it names.
-
 - `--dump` exits non-zero when an NVR cannot be read, and prints that
   error to stderr instead of stdout.
 - Options that cannot work together are an error instead of being ignored:
@@ -99,33 +123,6 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   looks at the files named by `password_file` and `bot_token_file`, and
   counts a file that its group can read, not only one that every user can
   read.
-
-- A stop (SIGTERM, SIGINT) took effect only between polls, and the state
-  was saved only after a whole poll, while Podman and Docker kill a
-  container 10 seconds after the stop. A stop during a long poll (an NVR
-  or a router that does not answer costs 25 seconds a request) lost what
-  that poll had read and counted. hik-f2b now stops between the steps of a
-  poll (each NVR, each ban, the firewall check, each notification) and
-  saves the state before it exits. The Quadlet unit and the Compose file
-  give it 60 seconds to do so (`StopTimeout=60`, `stop_grace_period: 60s`),
-  which covers the longest step it cannot interrupt: a ban to a router
-  that does not answer and the lookup after it.
-- When the notification queue was full (100 waiting), new ban messages and
-  health alerts were dropped without a log line. Each poll that drops some
-  now logs one WARNING that counts them.
-- When Telegram came back after an outage, the whole queue was sent at
-  once and ran into Telegram's limit (HTTP 429), which counted as a failed
-  attempt, as if Telegram were down. hik-f2b now waits as long as the 429
-  answer says (`retry_after`) before it sends the next message, and the
-  wait costs no attempt.
-- Health alerts left out a URL only when it stood alone after a space. A
-  URL in brackets or quotes, or after `url=`, reached the chat. Every URL is
-  now replaced by `<url>` wherever it stands; an address with a port outside
-  a URL (the operator's own device, in a connection error) stays.
-- At startup, a router that could not be reached was asked twice in a row,
-  for the size of the address-list and for the firewall check, each
-  waiting for the timeout. The size is now asked only of a router that
-  answered the check.
 
 ### Added
 

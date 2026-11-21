@@ -156,7 +156,7 @@ image is built natively but has not been tried on real hardware. The deploy
 files use an exact version. To get it, run:
 
 ```bash
-podman pull ghcr.io/vladkarok/hik-f2b:0.3.2
+podman pull ghcr.io/vladkarok/hik-f2b:0.3.3
 ```
 
 For how versions are tagged and how to update, see
@@ -224,7 +224,7 @@ host's architecture. For an image that you built yourself, use
 `localhost/hik-f2b:latest`. Run:
 
 ```bash
-podman create --name hik-f2b-copy ghcr.io/vladkarok/hik-f2b:0.3.2
+podman create --name hik-f2b-copy ghcr.io/vladkarok/hik-f2b:0.3.3
 podman cp hik-f2b-copy:/hik-f2b ./hik-f2b
 podman rm hik-f2b-copy
 ```
@@ -269,7 +269,7 @@ podman run --rm --network host \
   -v ~/.config/hik-f2b:/etc/hik-f2b:ro,Z \
   --secret hik-f2b-router,uid=65532,mode=0400 \
   --secret hik-f2b-nvr,uid=65532,mode=0400 \
-  ghcr.io/vladkarok/hik-f2b:0.3.2 --dump --hours 72
+  ghcr.io/vladkarok/hik-f2b:0.3.3 --dump --hours 72
 ```
 
 To run `--check` in the container, put `--check` in place of
@@ -350,10 +350,10 @@ as these image tags:
 
 | Tag | Meaning |
 | --- | --- |
-| `0.3.2` | Exactly this release. It never changes. Use this one. |
+| `0.3.3` | Exactly this release. It never changes. Use this one. |
 | `0.3` | The newest `0.3.x` release; moves with every bug-fix release. |
 | `latest` | The newest release; moves with every release, including ones that need config changes. |
-| `0.3.2-rc.1` | A release candidate, for trying out before `0.3.2`. Never `latest`, never `0.3`. |
+| `0.3.3-rc.1` | A release candidate, for trying out before `0.3.3`. Never `latest`, never `0.3`. |
 
 Pin an exact version, as the deploy files do. Before 1.0, a new second number
 (`0.3` to `0.4`) may need changes to your config; the changelog says so.
@@ -1077,6 +1077,13 @@ Not yet tried:
   for both.
 - The handling of clock changes from 0.3.2 (a small correction backward, a
   change while the log cannot be read) on real NVRs: only the tests and the
+  simulation make these happen.
+- The changes of 0.3.3 on real devices: a drop rule that RouterOS marks
+  invalid (the replies of a real router showed only `"invalid":"false"`),
+  the answers of a real router to a wrong password, with HTTP 5xx and
+  through a proxy, Telegram's HTTP 429, the `ban-bypassed` alert, the end of
+  DST on an NVR that could not be reached, and a stop of the Quadlet unit
+  or the Compose service in the middle of a poll. Only the tests and the
   simulation make these happen.
 - Notify-only mode on real devices.
 - A ban with a country on real devices: only `--country` and `--check` were

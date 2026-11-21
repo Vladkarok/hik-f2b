@@ -28,7 +28,7 @@ After=network-online.target
 Wants=network-online.target
 
 [Container]
-Image=ghcr.io/vladkarok/hik-f2b:0.3.2
+Image=ghcr.io/vladkarok/hik-f2b:0.3.3
 #Image=localhost/hik-f2b:latest
 # Unattended updates through podman-auto-update.timer are possible but not
 # recommended for a tool that edits the firewall; they also need a moving

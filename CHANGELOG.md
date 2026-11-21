@@ -59,7 +59,7 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   that poll had read and counted. hik-f2b now stops between the steps of a
   poll (each NVR, each ban, the firewall check, each notification) and
   saves the state before it exits. The Quadlet unit and the Compose file
-  give it 60 seconds to do so (`StopTimeout=60`, `stop_grace_period: 60s`),
+  give it 60 seconds to do so (`--stop-timeout=60`, `stop_grace_period: 60s`),
   which covers the longest step it cannot interrupt: a ban to a router
   that does not answer and the lookup after it.
 - At startup, a router that could not be reached was asked twice in a row,

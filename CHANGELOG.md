@@ -31,6 +31,14 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   GitHub) reached the system's limit and could not start the next one; they
   now stop with the test, and `tests/fake_leak.rs` and the simulation check
   that.
+- A long simulation run makes thousands of loopback connections a second.
+  On a Linux host with connection tracking, the kernel's table of them
+  can fill, and the kernel then drops new connections for many seconds:
+  requests to the fakes time out, and the run fails or reports violations
+  that are not there. `sim.yml` now takes loopback out of the tracking, and
+  the simulation fails with that cause if the table fills. A fake that does
+  not stop now says why it may not have (the error of the connection that
+  wakes it, failed accepts, the state of the table).
 
 ## [0.4.0] - 2026-11-21
 

@@ -29,6 +29,11 @@
 # its seed, class and replay command, and, on GitHub Actions, written to the
 # job summary. Exits 1 on a violation or any other failed test.
 #
+# On Linux with connection tracking (any host with Docker, for one), a
+# full run needs about 400,000 entries in the kernel's table, more than its
+# usual size; the test fails when the table fills. Take loopback out of the
+# tracking first, as sim.yml does (two iptables rules, needs root).
+#
 # The release build keeps debug assertions (and overflow checks, which the
 # release profile already has), so that a violation found here replays the
 # same way with the debug build that the replay command uses.

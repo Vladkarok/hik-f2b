@@ -42,9 +42,9 @@ concurrency:
 jobs:
   sim:
     runs-on: ubuntu-24.04
-    # Measured here on 2026-11-21: 1500 seeds per class took 3 minutes for
-    # the test (the Backlog class the longest) and 4 for the job, so the
-    # 4000 of a scheduled run take about 10 minutes. SIM_TIME_LIMIT (minutes,
+    # Measured here on 2026-11-21: 4000 seeds per class took 7.5 to 10.5
+    # minutes for the test (the Backlog class the longest; runners differ
+    # in speed) and 9 to 12 for the job. SIM_TIME_LIMIT (minutes,
     # the test alone) stops the test before the job's timeout, so that the
     # job summary is still written; the build takes a few minutes more.
     timeout-minutes: 90
@@ -56,6 +56,19 @@ jobs:
         with:
           persist-credentials: false
       - run: rustup toolchain install stable --profile minimal
+      - name: Loopback out of connection tracking
+        # The run makes thousands of loopback connections a second, and the
+        # kernel keeps an entry for each in its connection tracking table
+        # for two minutes after it closed: about 400,000 entries, measured
+        # here on 2026-11-21. Runners differ in the size of the table
+        # (262,144 on some, 1,048,576 on others). When it is full, the
+        # kernel drops new connections for many seconds, requests to the
+        # fakes time out, and the run fails or reports false violations.
+        # The test (tests/sim.rs) fails with that cause if the table fills.
+        run: |
+          set -euo pipefail
+          sudo iptables -t raw -I OUTPUT -o lo -j NOTRACK
+          sudo iptables -t raw -I PREROUTING -i lo -j NOTRACK
       - name: Long simulation
         # The inputs reach the script only as environment variables;
         # sim-long.sh accepts each only as a plain number within its bound.

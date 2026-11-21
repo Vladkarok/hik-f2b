@@ -117,6 +117,15 @@
 //! The summary line of each class also gives the peak number of threads of
 //! the fakes in the process (of all classes together). Above
 //! `MAX_FAKE_THREADS` the class fails: a fault of the test harness.
+//! Failed accepts on the fakes' listeners fail the class too.
+//!
+//! On Linux the line also gives the most entries seen in the kernel's
+//! connection tracking table (`fake::conntrack`). Each loopback connection
+//! takes one for two minutes, and a long run makes thousands a second.
+//! When the table is full, the kernel drops new connections: requests to
+//! the fakes time out and the results do not hold. The class then fails
+//! with that cause, a fault of the environment; `sim.yml` takes loopback
+//! out of the tracking.
 
 #[path = "support/fake.rs"]
 mod fake;
@@ -1903,10 +1912,12 @@ fn run_class(class: Class) {
             Ok(()) => {}
         }
     }
+    fake::sample_conntrack();
+    let conntrack = fake::conntrack_peak();
     let summary = format!(
         "sim {:?}: {} seed(s), {} cycles, {:.1} s, {} violation(s); bans {}, already listed {}, \
          reports {}, health alerts {} (ban-bypassed {}), addresses due for liveness {}, \
-         addresses with a shift {}; peak fake threads {} (at most {})",
+         addresses with a shift {}; peak fake threads {} (at most {}){}",
         class,
         seeds.len(),
         stats[0],
@@ -1920,11 +1931,28 @@ fn run_class(class: Class) {
         stats[5],
         stats[6],
         fake::peak_threads(),
-        MAX_FAKE_THREADS
+        MAX_FAKE_THREADS,
+        conntrack
+            .map(|(count, max)| format!("; connection tracking peak {} of {}", count, max))
+            .unwrap_or_default()
     );
     say(&summary);
     for failure in &failures {
         say(failure);
+    }
+    // A fault of the environment, which can also cause the violations.
+    if let Some((count, max)) = conntrack.filter(|(count, max)| count >= max) {
+        panic!(
+            "{}\n\nsim {:?}: the kernel's connection tracking table was full ({} of {} \
+             entries), so it dropped new connections: requests to the fakes timed out and this \
+             run does not hold (a fault of the environment, not of the engine; see sim.yml)\
+             \n\n{}",
+            summary,
+            class,
+            count,
+            max,
+            failures.join("\n\n")
+        );
     }
     if STRICT && !failures.is_empty() {
         panic!("{}\n\n{}", summary, failures.join("\n\n"));
@@ -1938,6 +1966,12 @@ fn run_class(class: Class) {
         class,
         peak,
         MAX_FAKE_THREADS
+    );
+    assert_eq!(
+        fake::accept_errors(),
+        0,
+        "sim {:?}: accepts failed on the fakes' listeners (a fault of the test harness)",
+        class
     );
 }
 

@@ -574,6 +574,11 @@ static LIVE_THREADS: AtomicUsize = AtomicUsize::new(0);
 static PEAK_THREADS: AtomicUsize = AtomicUsize::new(0);
 /// Listening sockets of the fakes that are open.
 static OPEN_LISTENERS: AtomicUsize = AtomicUsize::new(0);
+/// Failed accepts on the fakes' listeners.
+static ACCEPT_ERRORS: AtomicUsize = AtomicUsize::new(0);
+/// The most entries seen in the connection tracking table (`conntrack`),
+/// and its size.
+static CONNTRACK_PEAK: Mutex<Option<(u64, u64)>> = Mutex::new(None);
 /// How long a dropped harness waits for its fakes' threads to end.
 pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -590,6 +595,66 @@ pub fn peak_threads() -> usize {
 /// Open listening sockets of the fakes in this process.
 pub fn open_listeners() -> usize {
     OPEN_LISTENERS.load(Ordering::SeqCst)
+}
+
+/// Failed accepts on the fakes' listeners in this process (each one also
+/// goes into the message of a stop that does not end).
+pub fn accept_errors() -> usize {
+    ACCEPT_ERRORS.load(Ordering::SeqCst)
+}
+
+/// On Linux, the entries in the kernel's connection tracking table and
+/// its size, when the table is in use (`None` otherwise). Every loopback
+/// connection of the tests takes an entry, which stays for two minutes
+/// after the connection closed. When the table is full, the kernel drops
+/// the packets of new connections: a connection to a fake then times out,
+/// although the fake is listening.
+pub fn conntrack() -> Option<(u64, u64)> {
+    if !cfg!(target_os = "linux") {
+        return None;
+    }
+    let read = |name: &str| -> Option<u64> {
+        std::fs::read_to_string(format!("/proc/sys/net/netfilter/{}", name))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    };
+    Some((read("nf_conntrack_count")?, read("nf_conntrack_max")?))
+}
+
+/// Takes a sample of the connection tracking table for `conntrack_peak`
+/// (each dropped harness does).
+pub fn sample_conntrack() {
+    if let Some((count, max)) = conntrack() {
+        let mut peak = CONNTRACK_PEAK.lock().unwrap_or_else(|e| e.into_inner());
+        let most = peak.map_or(0, |(c, _)| c).max(count);
+        *peak = Some((most, max));
+    }
+}
+
+/// The most entries the samples found in the connection tracking table,
+/// and its size (`None` where there is no table).
+pub fn conntrack_peak() -> Option<(u64, u64)> {
+    *CONNTRACK_PEAK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The state of the connection tracking table, for a failure that a full
+/// table can cause (empty where there is no table).
+pub fn conntrack_note() -> String {
+    match conntrack() {
+        Some((count, max)) => format!(
+            "; the kernel's connection tracking table holds {} of {} entries{}",
+            count,
+            max,
+            if count >= max {
+                ": it is full, so the kernel drops new connections (see sim.yml)"
+            } else {
+                ""
+            }
+        ),
+        None => String::new(),
+    }
 }
 
 /// One live fake thread, from before it is spawned until it ends (also by
@@ -642,6 +707,13 @@ struct Threads {
     /// Connection threads not joined yet (finished ones are joined as new
     /// connections arrive).
     handles: Vec<JoinHandle<()>>,
+    /// Failed accepts (or clones of an accepted connection) and the last
+    /// error.
+    accept_errors: usize,
+    last_accept_error: Option<String>,
+    /// The error of the connection that `stop` makes to wake the listener,
+    /// if it failed.
+    wake_error: Option<String>,
 }
 
 type Shared = Arc<(Mutex<Threads>, Condvar)>;
@@ -691,13 +763,28 @@ impl FakeServer {
         let handle = std::thread::spawn(move || {
             let exit = exit;
             let shared = Arc::clone(&exit.0);
-            for stream in listener.0.incoming().flatten() {
+            loop {
+                let accepted = listener.0.accept().and_then(|(stream, _)| {
+                    let clone = stream.try_clone()?;
+                    Ok((stream, clone))
+                });
                 let mut t = lock(&shared);
                 if t.stop {
                     break;
                 }
-                let Ok(clone) = stream.try_clone() else {
-                    continue;
+                let (stream, clone) = match accepted {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        // Kept for the message of a stop that does not end.
+                        // The pause keeps an error that repeats (no file
+                        // descriptors left, say) from spinning.
+                        t.accept_errors += 1;
+                        t.last_accept_error = Some(format!("{} ({:?})", e, e.kind()));
+                        ACCEPT_ERRORS.fetch_add(1, Ordering::SeqCst);
+                        drop(t);
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
                 };
                 t.handles.retain(|h| !h.is_finished());
                 let id = t.next;
@@ -724,21 +811,45 @@ impl FakeServer {
         }
     }
 
+    /// What can explain a thread that has not ended: the errors of the wake
+    /// connection and of accepts.
+    fn errors(t: &Threads) -> String {
+        let mut text = String::new();
+        if let Some(e) = &t.wake_error {
+            text.push_str(&format!(" (the wake connection failed: {})", e));
+        }
+        if t.accept_errors > 0 {
+            text.push_str(&format!(
+                " ({} failed accept(s), the last: {})",
+                t.accept_errors,
+                t.last_accept_error.as_deref().unwrap_or("?")
+            ));
+        }
+        text
+    }
+
     /// Ends the listener thread (and closes its socket), then shuts down
     /// every open connection and waits for its thread, all by `deadline`.
-    /// Returns what is still running if the deadline passes.
+    /// If the deadline passes, returns what is still running and the errors
+    /// that can explain it.
     fn stop(&mut self, deadline: Instant) -> Result<(), String> {
         lock(&self.shared).stop = true;
         // Wake the blocked `accept`: it sees `stop` and returns.
         let addr = (Ipv4Addr::LOCALHOST, self.port).into();
         let left = deadline.saturating_duration_since(Instant::now());
-        let _ = TcpStream::connect_timeout(&addr, left.max(Duration::from_millis(1)));
+        if let Err(e) = TcpStream::connect_timeout(&addr, left.max(Duration::from_millis(1))) {
+            lock(&self.shared).wake_error = Some(format!("{} ({:?})", e, e.kind()));
+        }
         let (_, cv) = &*self.shared;
         let mut t = lock(&self.shared);
         while t.listening {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
-                return Err(format!("the listener of port {} has not ended", self.port));
+                return Err(format!(
+                    "the listener of port {} has not ended{}",
+                    self.port,
+                    FakeServer::errors(&t)
+                ));
             }
             t = cv
                 .wait_timeout(t, left)
@@ -753,8 +864,10 @@ impl FakeServer {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
                 return Err(format!(
-                    "{} connection thread(s) of port {} have not ended",
-                    t.live, self.port
+                    "{} connection thread(s) of port {} have not ended{}",
+                    t.live,
+                    self.port,
+                    FakeServer::errors(&t)
                 ));
             }
             t = cv
@@ -895,6 +1008,7 @@ impl Drop for Harness {
         self.engine.nvrs.clear();
         self.engine.firewall = None;
         self.engine.notifier = None;
+        sample_conntrack();
         let deadline = Instant::now() + STOP_TIMEOUT;
         let stuck: Vec<String> = self
             .servers
@@ -903,9 +1017,10 @@ impl Drop for Harness {
             .collect();
         if !stuck.is_empty() {
             let text = format!(
-                "a dropped harness could not stop its fakes within {:?}: {}",
+                "a dropped harness could not stop its fakes within {:?}: {}{}",
                 STOP_TIMEOUT,
-                stuck.join("; ")
+                stuck.join("; "),
+                conntrack_note()
             );
             if std::thread::panicking() {
                 eprintln!("{}", text);

@@ -5,8 +5,9 @@
 //!
 //! The fakes count their own threads and listeners (`fake::live_threads`,
 //! `fake::open_listeners`), which works on every platform; on Linux the
-//! process's thread count is checked as well. This file holds one test, so
-//! that no other test's fakes run in its process meanwhile.
+//! process's threads and open file descriptors are checked as well, and no
+//! accept may fail. This file holds one test, so that no other test's
+//! fakes run in its process meanwhile.
 
 #[path = "support/fake.rs"]
 mod fake;
@@ -29,6 +30,15 @@ fn os_threads() -> Option<usize> {
         let status = std::fs::read_to_string("/proc/self/status").ok()?;
         let line = status.lines().find(|l| l.starts_with("Threads:"))?;
         line["Threads:".len()..].trim().parse().ok()
+    } else {
+        None
+    }
+}
+
+/// The open file descriptors of this process, where the system tells it.
+fn os_fds() -> Option<usize> {
+    if cfg!(target_os = "linux") {
+        Some(std::fs::read_dir("/proc/self/fd").ok()?.count())
     } else {
         None
     }
@@ -66,6 +76,9 @@ fn dropped_harnesses_release_their_threads_and_listeners() {
     // the engine's log is kept, not printed
     util::capture_log();
     let base = os_threads();
+    // Taken after the first harness, so that what the process opens once
+    // and keeps does not count.
+    let mut base_fds = None;
     for i in 0..HARNESSES {
         let mut h = Harness::with(Opts {
             telegram: i % 2 == 0,
@@ -113,6 +126,9 @@ fn dropped_harnesses_release_their_threads_and_listeners() {
         );
         drop(held);
         let _ = util::captured_log();
+        if i == 0 {
+            base_fds = os_fds();
+        }
     }
     assert!(
         fake::peak_threads() <= MAX_THREADS,
@@ -131,4 +147,12 @@ fn dropped_harnesses_release_their_threads_and_listeners() {
         }
         assert_eq!(now, Some(base), "threads of the process after the drops");
     }
+    // Sockets, state files: a harness leaves no descriptor open.
+    assert_eq!(
+        os_fds(),
+        base_fds,
+        "open file descriptors after the drops (after the first: {:?})",
+        base_fds
+    );
+    assert_eq!(fake::accept_errors(), 0, "failed accepts on the fakes");
 }

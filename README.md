@@ -809,9 +809,10 @@ than 5 minutes in the future (host time).
 
 ## Security design
 
-hik-f2b holds credentials for your NVRs and write access to your router's
-firewall, and it reads text that attackers control (the user name in a failed
-login is whatever they typed). It is built accordingly:
+hik-f2b holds credentials for your NVRs and for a router account that can
+change almost all of the router's configuration (see "Router account" below),
+and it reads text that attackers control (the user name in a failed login is
+whatever they typed). It is built accordingly:
 
 - **Memory safety.** Rust with `unsafe` forbidden in this crate, and integer
   overflow checks kept on in release builds.
@@ -877,6 +878,22 @@ login is whatever they typed). It is built accordingly:
   logged when a config with inline secrets is readable by other users. Secrets
   are never logged, and the Telegram token is removed from error messages.
   Health alerts quote error messages without the URLs in them.
+- **Router account.** RouterOS grants rights by policy, not by menu. The
+  `write` policy from the setup lets the account change almost all of the
+  router's configuration, not only the firewall: for example NAT, routes,
+  addresses, interfaces and DNS. Someone with the router password could open
+  your network to the internet or take it offline. The `read` policy lets the
+  account read the configuration. Passwords and other secrets stay hidden from
+  it, because the group has no `sensitive` policy. These limits apply today:
+  the account can log in only from the host's address
+  (`address=HOST_IP/32`), and the REST API answers only that address
+  (`www-ssl` with `address=HOST_IP/32`). The `api` policy also lets the
+  account use the RouterOS API, which the setup does not limit by address;
+  the account's own address limit applies there too. The group has no
+  `policy` policy, so the account cannot add users or change their rights.
+  It has no `reboot` policy, and no policy to log in over SSH, WinBox, the
+  web interface, FTP, Telnet or the console. Keep the router password as
+  safe as the router's admin password.
 - **Country database.** The `.mmdb` file is untrusted input too. The reader
   (`src/country.rs`) checks every offset, bounds the search-tree walk, the
   nesting, the pointers followed and the number of fields decoded, never

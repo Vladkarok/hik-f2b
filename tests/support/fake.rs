@@ -145,6 +145,9 @@ pub struct Fake {
     pub tg_sent: Vec<String>,
     pub tg_attempts: u32,
     pub tg_fail: bool,
+    /// Accept this many messages in all, then answer HTTP 429 with
+    /// `retry_after` 30, as Telegram does when a chat gets too many.
+    pub tg_accept: Option<usize>,
 }
 
 fn between<'a>(text: &'a str, start: &str, end: &str) -> &'a str {
@@ -477,6 +480,14 @@ fn route(
     }
     if path == format!("/bot{}/sendMessage", TOKEN) && method == "POST" {
         f.tg_attempts += 1;
+        if f.tg_accept.is_some_and(|n| f.tg_sent.len() >= n) {
+            return reply(
+                429,
+                json,
+                "{\"ok\":false,\"error_code\":429,\"description\":\"Too Many Requests: retry \
+                 after 30\",\"parameters\":{\"retry_after\":30}}",
+            );
+        }
         if f.tg_fail {
             let out = format!(
                 "{{\"ok\":false,\"description\":\"boom at /bot{}/x\"}}",

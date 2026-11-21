@@ -110,6 +110,18 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   give it 60 seconds to do so (`StopTimeout=60`, `stop_grace_period: 60s`),
   which covers the longest step it cannot interrupt: a ban to a router
   that does not answer and the lookup after it.
+- When the notification queue was full (100 waiting), new ban messages and
+  health alerts were dropped without a log line. Each poll that drops some
+  now logs one WARNING that counts them.
+- When Telegram came back after an outage, the whole queue was sent at
+  once and ran into Telegram's limit (HTTP 429), which counted as a failed
+  attempt, as if Telegram were down. hik-f2b now waits as long as the 429
+  answer says (`retry_after`) before it sends the next message, and the
+  wait costs no attempt.
+- Health alerts left out a URL only when it stood alone after a space. A
+  URL in brackets or quotes, or after `url=`, reached the chat. Every URL is
+  now replaced by `<url>` wherever it stands; an address with a port outside
+  a URL (the operator's own device, in a connection error) stays.
 - At startup, a router that could not be reached was asked twice in a row,
   for the size of the address-list and for the firewall check, each
   waiting for the timeout. The size is now asked only of a router that

@@ -101,9 +101,31 @@ pub trait Firewall {
     fn describe(&self) -> String;
 }
 
+/// Why a notification was not sent.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NotifyError {
+    /// The messenger is unreachable or refused the message.
+    Failed(String),
+    /// The messenger asks to wait this many seconds before the next
+    /// message (Telegram: HTTP 429). The messenger works; it is not a failed
+    /// attempt.
+    RateLimited(u64),
+}
+
+impl std::fmt::Display for NotifyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            NotifyError::Failed(m) => f.write_str(m),
+            NotifyError::RateLimited(s) => {
+                write!(f, "too many messages, asked to wait {} s", s)
+            }
+        }
+    }
+}
+
 pub trait Notifier {
     /// Sends one message. Errors must not contain secrets.
-    fn send(&self, text: &str) -> Result<(), String>;
+    fn send(&self, text: &str) -> Result<(), NotifyError>;
 }
 
 /// The values a notification template can refer to.

@@ -574,8 +574,12 @@ The text is sent without a parse mode, so nothing in it is read as markup.
 
 A ban is applied before any notification is attempted. Notifications that
 fail are retried on later polls, at most 5 attempts each; at most 100 wait at
-a time, and they are kept in memory only, so a restart loses them. An
-unreachable Telegram costs at most one 10-second timeout per poll.
+a time, and they are kept in memory only, so a restart loses them. When 100
+already wait, a new one is dropped, with one WARNING per poll that counts
+them. An unreachable Telegram costs at most one 10-second timeout per poll.
+When Telegram answers that the chat gets too many messages (HTTP 429), it
+says how long to wait. hik-f2b sends nothing until then; that wait does not
+use up any of the 5 attempts.
 
 ### Country of a banned address
 
@@ -759,7 +763,9 @@ example:
 ```
 
 These texts are fixed; `message` applies to ban messages only. Reasons are
-taken from error messages, cut short, and URLs are left out. Health messages go
+taken from error messages and cut short. Every URL in them is replaced by
+`<url>`, wherever it stands. An address with a port outside a URL, as in a
+connection error, stays: it names your own device. Health messages go
 through the same queue as ban messages, so a Telegram outage costs no more
 than before and never holds up polling or banning. In the log each report is
 one ERROR line (`health alert [nvr:nvr2]: ...`, `health reminder [...]`) and
@@ -917,7 +923,7 @@ login is whatever they typed). It is built accordingly:
   logged when a config with inline secrets, or a secret file, is readable by
   its group or other users. Secrets
   are never logged, and the Telegram token is removed from error messages.
-  Health alerts quote error messages without the URLs in them.
+  Health alerts quote error messages with every URL in them replaced.
 - **Country database.** The `.mmdb` file is untrusted input too. The reader
   (`src/country.rs`) checks every offset, bounds the search-tree walk, the
   nesting, the pointers followed and the number of fields decoded, never

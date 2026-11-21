@@ -373,7 +373,9 @@ fn run() -> Result<(), String> {
             .notifier
             .as_ref()
             .ok_or_else(|| "no [telegram] section in the config".to_string())?;
-        notifier.send("hik-f2b test message: notifications work.")?;
+        notifier
+            .send("hik-f2b test message: notifications work.")
+            .map_err(|e| e.to_string())?;
         println!("ok: test message sent");
         return Ok(());
     }

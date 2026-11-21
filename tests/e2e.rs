@@ -397,11 +397,102 @@ fn telegram_outage_does_not_block_bans_and_is_retried() {
     assert_eq!(h.engine.queued_notifications(), 0);
 }
 
+/// Telegram's rate limit (HTTP 429 with `retry_after`): nothing is sent
+/// until the wait is over, the wait costs no attempt, and the rest of the
+/// queue goes out afterwards.
+#[test]
+fn telegram_rate_limit_is_waited_out() {
+    let mut h = Harness::with(Opts {
+        telegram: true,
+        general: "max_bans_per_hour = 100",
+        ..Default::default()
+    });
+    util::capture_log();
+    h.fake.lock().unwrap().tg_accept = Some(20);
+    for n in 1..=30 {
+        h.burst("10:01", &format!("198.51.100.{}", n), 5);
+    }
+    h.cycle("10:02:00");
+    assert_eq!(h.banned().len(), 30);
+    {
+        let f = h.fake.lock().unwrap();
+        assert_eq!(f.tg_sent.len(), 20);
+        assert_eq!(f.tg_attempts, 21, "the queue stops at the first 429");
+    }
+    assert_eq!(h.engine.queued_notifications(), 10);
+    // within retry_after (30 s): not a single request
+    h.advance(20);
+    assert_eq!(h.fake.lock().unwrap().tg_attempts, 21);
+    // after it: the rest, none dropped
+    h.fake.lock().unwrap().tg_accept = None;
+    h.advance(10);
+    let f = h.fake.lock().unwrap();
+    assert_eq!(f.tg_sent.len(), 30);
+    assert_eq!(f.tg_attempts, 31);
+    drop(f);
+    assert_eq!(h.engine.queued_notifications(), 0);
+    let log = util::captured_log();
+    assert_eq!(
+        logged(&log, "Telegram asks to wait 30 s before the next message"),
+        1
+    );
+    assert_eq!(
+        logged(&log, "notification failed"),
+        0,
+        "a 429 is not an outage"
+    );
+}
+
+/// A full queue drops new notifications, with one WARNING per poll that
+/// counts them.
+#[test]
+fn dropped_notifications_are_logged() {
+    let mut h = Harness::with(Opts {
+        telegram: true,
+        general: "max_bans_per_hour = 200",
+        ..Default::default()
+    });
+    util::capture_log();
+    h.fake.lock().unwrap().tg_fail = true;
+    for n in 1..=105 {
+        let address = if n <= 100 {
+            format!("198.51.100.{}", n)
+        } else {
+            format!("203.0.113.{}", n - 100)
+        };
+        h.burst("10:01", &address, 5);
+    }
+    h.cycle("10:02:00");
+    assert_eq!(h.banned().len(), 105);
+    assert_eq!(h.engine.queued_notifications(), 100);
+    let log = util::captured_log();
+    assert_eq!(
+        logged(
+            &log,
+            "WARNING 5 notification(s) dropped: 100 already wait to be sent"
+        ),
+        1,
+        "{:?}",
+        log.iter()
+            .filter(|l| l.contains("dropped"))
+            .collect::<Vec<_>>()
+    );
+    h.advance(30);
+    assert_eq!(logged(&util::captured_log(), "dropped:"), 0);
+}
+
 #[test]
 fn telegram_errors_never_reveal_the_token() {
     let h = Harness::new(true);
     h.fake.lock().unwrap().tg_fail = true;
-    let err = h.engine.notifier.as_ref().unwrap().send("x").unwrap_err();
+    let err = h
+        .engine
+        .notifier
+        .as_ref()
+        .unwrap()
+        .send("x")
+        .unwrap_err()
+        .to_string();
     assert!(!err.contains(TOKEN), "{}", err);
     assert!(err.contains("<token>"), "{}", err);
 }

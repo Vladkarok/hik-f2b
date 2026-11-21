@@ -8,7 +8,7 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 
 ## [Unreleased]
 
-## [0.3.3] - YYYY-MM-DD
+## [0.4.0] - YYYY-MM-DD
 
 ### Fixed
 
@@ -137,8 +137,11 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   (before, the second line replaced the first, so of two `ignoreip` lines
   only the last one applied), and so is an empty `state_file` (before, every
   save of the state failed). **A config with a stray or repeated setting
-  that used to start no longer starts:** run `--check` with the new version
-  before you update, and remove or correct the line it names.
+  that used to start no longer starts.** Before you update, run the new
+  image with `--check` against your existing config, as step 2 of "Update"
+  in the README shows. It refuses a setting that it does not know or that
+  is given twice, and names the line. Remove or correct that line, then
+  update.
 - `--dump` exits non-zero when an NVR cannot be read, and prints that
   error to stderr instead of stdout.
 - Options that cannot work together are an error instead of being ignored:
@@ -351,8 +354,8 @@ be built from source.
   a sandboxed systemd unit, unit and end-to-end tests, CI, and documentation
   in English and Ukrainian.
 
-[Unreleased]: https://github.com/Vladkarok/hik-f2b/compare/v0.3.3...HEAD
-[0.3.3]: https://github.com/Vladkarok/hik-f2b/compare/v0.3.2...v0.3.3
+[Unreleased]: https://github.com/Vladkarok/hik-f2b/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/Vladkarok/hik-f2b/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/Vladkarok/hik-f2b/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/Vladkarok/hik-f2b/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Vladkarok/hik-f2b/compare/1e9edea...v0.3.0

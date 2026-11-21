@@ -28,11 +28,11 @@ After=network-online.target
 Wants=network-online.target
 
 [Container]
-Image=ghcr.io/vladkarok/hik-f2b:0.3.3
+Image=ghcr.io/vladkarok/hik-f2b:0.4.0
 #Image=localhost/hik-f2b:latest
 # Unattended updates through podman-auto-update.timer are possible but not
 # recommended for a tool that edits the firewall; they also need a moving
-# tag such as 0.3 instead of an exact version.
+# tag such as 0.4 instead of an exact version.
 #AutoUpdate=registry
 ContainerName=hik-f2b
 # The service only makes outgoing connections and listens on nothing.

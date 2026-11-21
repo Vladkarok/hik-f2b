@@ -348,9 +348,10 @@ journalctl --user -u hik-f2b -f
 Під час запуску в журналі видно:
 
 - режим: `mode: ban on MikroTik`, `mode: DRY RUN` або `mode: notify-only`;
-- з роутером — скільки записів зараз в address-list;
 - з роутером — результат перевірки фаєрвола
   (`firewall check ok: ...` або `firewall check failed: ...`);
+- з роутером, який відповів на перевірку, — скільки записів зараз в
+  address-list;
 - із заданим `country_db` — назву бази країн або попередження, що її не
   вдається прочитати.
 

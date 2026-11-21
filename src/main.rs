@@ -8,13 +8,11 @@ use hik_f2b::health::Status;
 use hik_f2b::mikrotik::Mikrotik;
 use hik_f2b::state::State;
 use hik_f2b::telegram::Telegram;
-use hik_f2b::{error, info, util, warn};
+use hik_f2b::{info, util, warn};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 /// The longest look back of `--dump`: one year.
 const MAX_HOURS: i64 = 24 * 365;
@@ -275,7 +273,6 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     let state_file = cfg.state_file.clone();
-    let poll_interval = cfg.poll_interval;
     let daemon = !(args.dump || args.test_ban.is_some() || args.test_notify || args.check);
     let state = if daemon {
         State::load(&state_file)?
@@ -319,15 +316,13 @@ fn run() -> Result<(), String> {
                  to this log"
             );
         }
-        // MikroTik-specific, so done before the client is handed to the
-        // engine as a plain firewall. A failure is reported by the health
-        // check below.
-        if let Some(m) = &mikrotik {
-            if let Ok(n) = m.count() {
-                info!("MikroTik address-list {} has {} entries", m.list, n);
-            }
-        }
     }
+    // MikroTik-specific, so it needs a client of its own: the engine only
+    // knows a plain firewall.
+    let counter = match (&cfg.mikrotik, daemon) {
+        (Some(m), true) => Some(Mikrotik::new(m)?),
+        _ => None,
+    };
     let firewall = mikrotik.map(|m| Box::new(m) as Box<dyn Firewall>);
     let notifier = telegram.map(|t| Box::new(t) as Box<dyn Notifier>);
     let mut engine = Engine::with_parts(cfg, state, firewall, notifier)?;
@@ -383,40 +378,27 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
 
-    let stop = Arc::new(AtomicBool::new(false));
+    // A stop takes effect between the steps of a cycle (see
+    // `Engine::cycle_at`); the state is saved before hik-f2b exits.
+    let stop = engine.stop_flag();
     for signal in [signal_hook::consts::SIGINT, signal_hook::consts::SIGTERM] {
         signal_hook::flag::register(signal, Arc::clone(&stop))
             .map_err(|e| format!("cannot install signal handler: {}", e))?;
     }
 
     engine.startup_country();
-    // Also in a dry run: that is when the setup is being checked.
-    engine.startup_check(util::unix_now());
-
-    // A hash of what was saved: the state is written out (line by line) only
-    // when it changed, and never held as a second copy in memory.
-    let mut saved = engine.state.digest();
-    while !stop.load(Ordering::Relaxed) {
-        engine.cycle();
-        let current = engine.state.digest();
-        if current != saved {
-            match engine.state.save(&state_file) {
-                Ok(()) => saved = current,
-                Err(e) => error!(
-                    "cannot save state to {}: {}",
-                    state_file.display(),
-                    e.kind()
-                ),
-            }
-        }
-        if args.once {
-            break;
-        }
-        let deadline = Instant::now() + Duration::from_secs(poll_interval);
-        while !stop.load(Ordering::Relaxed) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(250));
+    // Also in a dry run: that is when the setup is being checked. The size
+    // of the address-list is asked only of a router that answered it, so an
+    // unreachable one costs one timeout at startup, not two.
+    let answered = engine.startup_check(util::unix_now());
+    if let (true, Some(m)) = (answered, &counter) {
+        match m.count() {
+            Ok(n) => info!("MikroTik address-list {} has {} entries", m.list, n),
+            Err(e) => warn!("cannot count the entries of address-list {}: {}", m.list, e),
         }
     }
+
+    engine.run(&state_file, args.once);
     info!("stopped");
     Ok(())
 }

@@ -100,6 +100,21 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   counts a file that its group can read, not only one that every user can
   read.
 
+- A stop (SIGTERM, SIGINT) took effect only between polls, and the state
+  was saved only after a whole poll, while Podman and Docker kill a
+  container 10 seconds after the stop. A stop during a long poll (an NVR
+  or a router that does not answer costs 25 seconds a request) lost what
+  that poll had read and counted. hik-f2b now stops between the steps of a
+  poll (each NVR, each ban, the firewall check, each notification) and
+  saves the state before it exits. The Quadlet unit and the Compose file
+  give it 60 seconds to do so (`StopTimeout=60`, `stop_grace_period: 60s`),
+  which covers the longest step it cannot interrupt: a ban to a router
+  that does not answer and the lookup after it.
+- At startup, a router that could not be reached was asked twice in a row,
+  for the size of the address-list and for the firewall check, each
+  waiting for the timeout. The size is now asked only of a router that
+  answered the check.
+
 ### Added
 
 - A health alert `ban-bypassed`: banned addresses keep reaching an NVR well

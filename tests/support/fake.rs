@@ -126,6 +126,9 @@ pub struct Fake {
     pub rest_html: bool,
     /// Every REST request that reached the router.
     pub rest_requests: u32,
+    /// Set this flag when a PUT arrives (a stop signal in the middle of a
+    /// cycle).
+    pub stop_on_put: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Firewall rules.
     pub rules: Vec<Rule>,
     /// `path?query` of every rule lookup.
@@ -427,6 +430,9 @@ fn route(
             return reply(200, json, format!("[{}]", list.join(",")));
         }
         if method == "PUT" {
+            if let Some(flag) = &f.stop_on_put {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             let address = between(body, "\"address\":\"", "\"").to_string();
             let listed = f.bans.contains(&address);
             if f.router_down {

@@ -979,6 +979,128 @@ fn pending_bans_oldest_first() {
     assert_eq!(h.engine.state.pending.len(), 2);
 }
 
+/// A stop signal arrives while the first of three bans is sent: the cycle
+/// sends no further ban, no firewall check and no notification, and the
+/// state keeps the bans that wait.
+#[test]
+fn a_stop_ends_the_cycle_after_its_current_step() {
+    let mut h = Harness::new(true);
+    util::capture_log();
+    for n in 1..=3 {
+        h.burst("10:01", &format!("198.51.100.{}", n), 5);
+    }
+    let stop = h.engine.stop_flag();
+    h.fake.lock().unwrap().stop_on_put = Some(stop.clone());
+    h.cycle("10:05:00"); // the firewall check would be due
+    let f = h.fake.lock().unwrap();
+    assert_eq!(f.put_log.len(), 1, "{:?}", f.put_log);
+    assert_eq!(f.rule_queries.len(), 1, "only the first cycle's check");
+    assert_eq!(f.tg_attempts, 0);
+    drop(f);
+    assert_eq!(h.engine.state.pending.len(), 2);
+    assert_eq!(h.engine.state.banned.len(), 1);
+    assert_eq!(h.engine.queued_notifications(), 1);
+    let log = util::captured_log();
+    assert_eq!(
+        logged(&log, "stop requested: the rest of this poll is skipped"),
+        1
+    );
+    // no health problem was claimed to be over because of the stop
+    assert!(h.engine.alerted_problems().is_empty());
+    // a stop before the NVRs are polled: nothing is asked of any device
+    let before = h.fake.lock().unwrap().search_requests;
+    h.advance(30);
+    assert_eq!(h.fake.lock().unwrap().search_requests, before);
+    assert_eq!(h.engine.state.pending.len(), 2);
+}
+
+/// `Engine::run` saves the state of a cycle that a stop cut short, and does
+/// not start another.
+#[test]
+fn a_stop_during_the_service_saves_the_state() {
+    use hik_f2b::state::Pending;
+    let mut h = Harness::new(false);
+    let path = h.dir.join("service-state");
+    let now = util::unix_now() as i64;
+    for n in 1..=3 {
+        h.engine.state.pending.insert(
+            ip(&format!("198.51.100.{}", n)),
+            Pending {
+                ts: now - 10 + n,
+                count: 5,
+                nvr: "nvr1".to_string(),
+                user: "admin".to_string(),
+            },
+        );
+    }
+    let stop = h.engine.stop_flag();
+    h.fake.lock().unwrap().stop_on_put = Some(stop.clone());
+    let started = std::time::Instant::now();
+    h.engine.run(&path, false);
+    assert!(
+        started.elapsed().as_secs() < 20,
+        "no second cycle, no sleep"
+    );
+    let saved = State::load(&path).unwrap();
+    assert_eq!(saved, h.engine.state);
+    assert_eq!(saved.pending.len(), 2);
+    assert_eq!(saved.banned.len(), 1);
+    assert_eq!(saved.recent_bans.len(), 1);
+    assert_eq!(h.fake.lock().unwrap().put_log.len(), 1);
+    // stopped before it starts: no cycle at all
+    let requests = h.fake.lock().unwrap().isapi_requests;
+    h.engine.run(&path, false);
+    assert_eq!(h.fake.lock().unwrap().isapi_requests, requests);
+}
+
+/// At startup a router that does not answer is asked once (the firewall
+/// check), not a second time for the size of the address-list; one that
+/// answers is asked both.
+#[test]
+fn an_unreachable_router_is_asked_once_at_startup() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let connections = Arc::new(AtomicUsize::new(0));
+    let seen = Arc::clone(&connections);
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            seen.fetch_add(1, Ordering::SeqCst);
+            drop(stream);
+        }
+    });
+    let h = Harness::build(Opts::default());
+    let run = |ini: &str| {
+        let path = h.dir.join("startup.ini");
+        std::fs::write(&path, ini).unwrap();
+        std::process::Command::new(env!("CARGO_BIN_EXE_hik-f2b"))
+            .arg("--config")
+            .arg(&path)
+            .arg("--once")
+            .output()
+            .unwrap()
+    };
+    let out = run(&h.ini.replace(
+        &format!("[mikrotik]\nurl = http://127.0.0.1:{}", h.port),
+        &format!("[mikrotik]\nurl = http://127.0.0.1:{}", port),
+    ));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout);
+    assert_eq!(connections.load(Ordering::SeqCst), 1, "{}", stdout);
+    assert!(stdout.contains("firewall check failed"), "{}", stdout);
+    assert!(!stdout.contains("address-list cctv_ban has"), "{}", stdout);
+    // a router that answers: the check, then the count
+    let before = h.fake.lock().unwrap().rest_requests;
+    let out = run(&h.ini);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(0), "{}", stdout);
+    assert!(
+        stdout.contains("MikroTik address-list cctv_ban has 0 entries"),
+        "{}",
+        stdout
+    );
+    assert_eq!(h.fake.lock().unwrap().rest_requests - before, 2);
+}
+
 /// `MAX_BANNED` holds also where bans are added, not only when the state
 /// file is read: the address whose end is nearest is forgotten first.
 #[test]

@@ -48,6 +48,14 @@ ReadOnly=true
 DropCapability=ALL
 NoNewPrivileges=true
 PodmanArgs=--memory=32m --pids-limit=32
+# On a stop, hik-f2b finishes the step of the poll it is in, saves its state
+# and exits. The longest step it cannot interrupt is one ban sent to a router
+# that does not answer: the request and the lookup that may follow it, 25 s
+# each (http::DEFAULT_TIMEOUT in the source). An NVR that does not answer
+# ends its poll after one such request. 60 s covers this and the save;
+# Podman's default of 10 s does not. Keep it below systemd's TimeoutStopSec
+# (90 s by default).
+StopTimeout=60
 
 [Service]
 Restart=always

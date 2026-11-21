@@ -335,9 +335,10 @@ journalctl --user -u hik-f2b -f
 At startup the log shows:
 
 - the mode: `mode: ban on MikroTik`, `mode: DRY RUN` or `mode: notify-only`;
-- with a router, how many entries the address-list has;
 - with a router, the result of the firewall check (`firewall check ok: ...`
   or `firewall check failed: ...`);
+- with a router that answered the check, how many entries the address-list
+  has;
 - with `country_db` set, the name of the country database, or a warning that
   it cannot be read.
 

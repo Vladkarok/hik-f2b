@@ -24,6 +24,10 @@ use crate::telegram::Telegram;
 use crate::util;
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const MAX_QUEUED_NOTIFICATIONS: usize = 100;
 const NOTIFY_ATTEMPTS: u32 = 5;
@@ -121,6 +125,9 @@ pub struct Engine {
     /// Host time a banned address was last seen reaching an NVR well after
     /// its ban (see `Check::Bypassed`); `None` once that problem is over.
     last_bypass: Option<u64>,
+    /// Set (by a signal handler) when the service is to stop. A cycle
+    /// looks at it between its steps (see `cycle_at`).
+    stop: Arc<AtomicBool>,
 }
 
 /// Addresses that can never be a remote attacker, whatever the log says.
@@ -676,6 +683,7 @@ impl Engine {
             next_check: 0,
             country_failure: None,
             last_bypass: None,
+            stop: Arc::new(AtomicBool::new(false)),
         };
         // The state may come from a run with another `ignoreip`, or with a
         // `maxretry` that kept more failure times.
@@ -726,16 +734,65 @@ impl Engine {
         }
     }
 
+    /// The flag that stops the service: set it (from a signal handler) and
+    /// the current cycle ends after its current step, see `cycle_at`.
+    pub fn stop_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.stop)
+    }
+
+    fn stopping(&self) -> bool {
+        self.stop.load(Ordering::Relaxed)
+    }
+
+    /// The service: a cycle every `poll_interval` (or only one, with
+    /// `once`) until the stop flag is set. The state is saved after every
+    /// cycle in which it changed, also after a cycle that a stop cut short,
+    /// so what that cycle learned is not lost.
+    pub fn run(&mut self, state_file: &Path, once: bool) {
+        // A hash of what was saved: the state is written out (line by line)
+        // only when it changed, and never held as a second copy in memory.
+        let mut saved = self.state.digest();
+        while !self.stopping() {
+            self.cycle();
+            let current = self.state.digest();
+            if current != saved {
+                match self.state.save(state_file) {
+                    Ok(()) => saved = current,
+                    Err(e) => crate::error!(
+                        "cannot save state to {}: {}",
+                        state_file.display(),
+                        e.kind()
+                    ),
+                }
+            }
+            if once {
+                break;
+            }
+            let deadline = Instant::now() + Duration::from_secs(self.cfg.poll_interval);
+            while !self.stopping() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+        }
+    }
+
     /// Runs the firewall health check once at startup and logs the result;
     /// the first periodic check follows `HEALTH_CHECK_INTERVAL` later.
-    pub fn startup_check(&mut self, host_now: u64) {
+    /// Returns whether the firewall answered (so that more can be asked of
+    /// it without waiting for a second timeout).
+    pub fn startup_check(&mut self, host_now: u64) -> bool {
         match self.check_firewall(host_now) {
-            None => {}
-            Some(Ok(found)) => crate::info!("firewall check ok: {}", found),
-            Some(Err(e)) => crate::error!(
-                "firewall check failed: {} (bans will keep being retried)",
-                e
-            ),
+            None => false,
+            Some(Ok(found)) => {
+                crate::info!("firewall check ok: {}", found);
+                true
+            }
+            Some(Err(e)) => {
+                crate::error!(
+                    "firewall check failed: {} (bans will keep being retried)",
+                    e
+                );
+                matches!(e, HealthError::NotEnforced(_))
+            }
         }
     }
 
@@ -938,12 +995,22 @@ impl Engine {
 
     /// One full pass: poll every NVR, apply bans, send notifications.
     /// `host_now` is the host's Unix time.
+    ///
+    /// The stop flag is looked at before each step that may wait for a
+    /// device: each NVR's poll, each ban, the firewall check and each
+    /// notification. Once it is set the cycle skips what is left of these;
+    /// what earlier steps learned (read positions, counted failed logins,
+    /// waiting bans) is in the state, which the caller saves.
     pub fn cycle_at(&mut self, host_now: u64) {
         let now = host_i64(host_now);
         let report_once = self.firewall.is_none() || self.cfg.dry_run;
         // Whether every NVR was read in this cycle.
         let mut all_read = true;
         for i in 0..self.nvrs.len() {
+            if self.stopping() {
+                all_read = false;
+                break;
+            }
             let retry_after = self.nvrs[i].retry_after;
             if retry_after > host_now {
                 // A wait longer than auth_backoff can only come from the
@@ -982,12 +1049,20 @@ impl Engine {
                 }
             }
         }
-        let unreachable = self.flush_pending(host_now);
+        let unreachable = self.stopping() || self.flush_pending(host_now);
         self.bypass_over(host_now, all_read);
-        self.periodic_check(host_now, unreachable);
+        if !self.stopping() {
+            self.periodic_check(host_now, unreachable);
+        }
         self.report_health(host_now);
         self.flush_notifications();
         self.cleanup(host_now);
+        if self.stopping() {
+            crate::info!(
+                "stop requested: the rest of this poll is skipped; waiting bans and \
+                 notifications wait for the next start"
+            );
+        }
     }
 
     /// Ends the `Check::Bypassed` problem once no banned address has
@@ -1101,7 +1176,12 @@ impl Engine {
         order.sort_unstable();
         let mut limited = false;
         let mut unreachable = false;
+        let mut stopped = false;
         for (_, ip) in order {
+            if self.stopping() {
+                stopped = true;
+                break;
+            }
             let Some(p) = self.state.pending.get(&ip).cloned() else {
                 continue;
             };
@@ -1267,7 +1347,7 @@ impl Engine {
                 self.cfg.max_bans_per_hour
             );
             self.alerts.fail(Check::RateLimit, &reason, now);
-        } else if !unreachable {
+        } else if !unreachable && !stopped {
             self.alerts.pass(&Check::RateLimit, now);
         }
         if self.state.pending.is_empty() {
@@ -1288,6 +1368,9 @@ impl Engine {
             return;
         };
         while let Some((text, attempts)) = self.notifications.first().cloned() {
+            if self.stop.load(Ordering::Relaxed) {
+                break;
+            }
             match notifier.send(&text) {
                 Ok(()) => {
                     crate::debug!("notification sent");

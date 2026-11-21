@@ -577,9 +577,23 @@ impl Harness {
             COUNTER.fetch_add(1, Ordering::Relaxed)
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        // A setting may appear only once: `general` replaces the defaults
+        // it sets.
+        let set: Vec<String> = opts
+            .general
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .map(|(key, _)| key.trim().to_string())
+            .collect();
+        let defaults: String = ["maxretry = 5", "findtime = 3600", "bantime = 86400"]
+            .iter()
+            .filter(|line| !set.iter().any(|key| line.starts_with(&format!("{} ", key))))
+            .map(|line| format!("{}\n", line))
+            .collect();
         let mut ini = format!(
-            "[general]\nmaxretry = 5\nfindtime = 3600\nbantime = 86400\nstate_file = {}\n{}\n\
+            "[general]\n{}state_file = {}\n{}\n\
              [nvr:nvr1]\nurl = http://127.0.0.1:{port}\nuser = f2b\npassword = secret\n",
+            defaults,
             dir.join("state").display(),
             opts.general,
             port = port

@@ -20,6 +20,19 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   points to `bantime = permanent`. The limit is the same in notify-only
   mode.
 
+### Changed
+
+- A setting that hik-f2b does not know is now an error that names the line,
+  the section and, when a known setting is close, the setting probably
+  meant. Before, it was ignored without a word: a typo such as `ignore_ip`
+  or `dryrun` left an address unprotected by `ignoreip` or turned a dry run
+  into live bans. A setting given twice in one section is an error too
+  (before, the second line replaced the first, so of two `ignoreip` lines
+  only the last one applied), and so is an empty `state_file` (before, every
+  save of the state failed). **A config with a stray or repeated setting
+  that used to start no longer starts:** run `--check` with the new version
+  before you update, and remove or correct the line it names.
+
 <!-- second group -->
 
 ## [0.3.2] - 2026-11-20

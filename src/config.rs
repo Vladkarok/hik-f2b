@@ -7,7 +7,137 @@ use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
-pub type Section = BTreeMap<String, String>;
+/// The settings each section may have. Every setting is read through
+/// `Section::get`, which (in debug builds, so in every test) fails for a
+/// key that is not listed here; so a setting the code reads cannot be
+/// missing from these lists, and `parse_ini` rejects everything else.
+const GENERAL_KEYS: &[&str] = &[
+    "poll_interval",
+    "maxretry",
+    "findtime",
+    "bantime",
+    "lookback",
+    "auth_backoff",
+    "alert_after",
+    "max_bans_per_hour",
+    "state_file",
+    "ignoreip",
+    "meta_id",
+    "log_filter",
+    "dry_run",
+    "country_db",
+];
+const MIKROTIK_KEYS: &[&str] = &[
+    "url",
+    "user",
+    "password",
+    "password_file",
+    "address_list",
+    "ca_file",
+    "check_rule",
+];
+const NVR_KEYS: &[&str] = &["url", "user", "password", "password_file", "ca_file"];
+const TELEGRAM_KEYS: &[&str] = &[
+    "enabled",
+    "api_url",
+    "bot_token",
+    "bot_token_file",
+    "chat_id",
+    "message_thread_id",
+    "topic_id",
+    "silent",
+    "message",
+    "health_alerts",
+];
+/// Each kind of section with its settings, for error messages.
+const SECTIONS: [(&str, &[&str]); 4] = [
+    ("general", GENERAL_KEYS),
+    ("mikrotik", MIKROTIK_KEYS),
+    ("nvr:<name>", NVR_KEYS),
+    ("telegram", TELEGRAM_KEYS),
+];
+
+/// The settings a section of this name may have; `None` for a section that
+/// does not exist.
+fn known_keys(section: &str) -> Option<&'static [&'static str]> {
+    match section {
+        "general" => Some(GENERAL_KEYS),
+        "mikrotik" => Some(MIKROTIK_KEYS),
+        "telegram" => Some(TELEGRAM_KEYS),
+        s if s.starts_with("nvr:") => Some(NVR_KEYS),
+        _ => None,
+    }
+}
+
+/// One section of the config: its settings, each set once, all known.
+pub struct Section {
+    known: &'static [&'static str],
+    values: BTreeMap<String, String>,
+}
+
+impl Section {
+    fn new(known: &'static [&'static str]) -> Section {
+        Section {
+            known,
+            values: BTreeMap::new(),
+        }
+    }
+
+    /// The value of a setting. `key` must be one of the section's known
+    /// settings (see `GENERAL_KEYS`).
+    pub fn get(&self, key: &str) -> Option<&String> {
+        debug_assert!(
+            self.known.contains(&key),
+            "setting {} is read but not in the list of known settings",
+            key
+        );
+        self.values.get(key)
+    }
+}
+
+/// The number of single-character insertions, deletions and substitutions
+/// that turn `a` into `b`.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut row: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let substitute = diagonal + usize::from(ca != *cb);
+            diagonal = row[j + 1];
+            row[j + 1] = substitute.min(row[j] + 1).min(row[j + 1] + 1);
+        }
+    }
+    row[b.len()]
+}
+
+/// The error for a setting `key` that section `section` does not have,
+/// with the setting probably meant: the one known setting of the section
+/// that is closest to it (at most two characters away), or else the kind
+/// of section that has a setting of that name.
+fn unknown_key(line: usize, section: &str, key: &str) -> String {
+    let known = known_keys(section).unwrap_or(&[]);
+    let mut close: Vec<(usize, &str)> = known
+        .iter()
+        .map(|k| (edit_distance(key, k), *k))
+        .filter(|(d, _)| *d <= 2)
+        .collect();
+    close.sort_unstable();
+    let hint = match close.as_slice() {
+        [(d, k), rest @ ..] if rest.first().is_none_or(|(next, _)| next > d) => {
+            format!("; did you mean {}?", k)
+        }
+        _ => match SECTIONS.iter().find(|(_, keys)| keys.contains(&key)) {
+            Some((name, _)) => format!("; {} belongs in a [{}] section", key, name),
+            None => String::new(),
+        },
+    };
+    format!(
+        "line {}: unknown setting {} in [{}]{}",
+        line, key, section, hint
+    )
+}
 
 pub const DEFAULT_IGNORE: &str = "127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16";
 /// Seen on real firmware as `.../Exception/illlegealAccess` (sic).
@@ -117,6 +247,9 @@ impl Net {
     }
 }
 
+/// Reads the INI text. Every section and every setting must be known (a
+/// typo such as `ignore_ip` or `dryrun` would otherwise be ignored, and
+/// fail open), and a setting may appear only once in a section.
 pub fn parse_ini(text: &str) -> Result<BTreeMap<String, Section>, String> {
     let mut out: BTreeMap<String, Section> = BTreeMap::new();
     let mut current: Option<String> = None;
@@ -134,18 +267,32 @@ pub fn parse_ini(text: &str) -> Result<BTreeMap<String, Section>, String> {
             if out.contains_key(&name) {
                 return Err(format!("line {}: section [{}] appears twice", n + 1, name));
             }
-            out.insert(name.clone(), Section::new());
+            let known = known_keys(&name)
+                .ok_or_else(|| format!("line {}: unknown section [{}]", n + 1, name))?;
+            out.insert(name.clone(), Section::new(known));
             current = Some(name);
             continue;
         }
         let (key, value) = line
             .split_once('=')
             .ok_or_else(|| format!("line {}: expected key = value", n + 1))?;
-        let section = current
+        let (name, section) = current
             .as_ref()
-            .and_then(|name| out.get_mut(name))
+            .and_then(|name| out.get_mut(name).map(|section| (name, section)))
             .ok_or_else(|| format!("line {}: key outside of a section", n + 1))?;
-        section.insert(key.trim().to_ascii_lowercase(), value.trim().to_string());
+        let key = key.trim().to_ascii_lowercase();
+        if !section.known.contains(&key.as_str()) {
+            return Err(unknown_key(n + 1, name, &key));
+        }
+        if section.values.contains_key(&key) {
+            return Err(format!(
+                "line {}: {} is set twice in [{}]",
+                n + 1,
+                key,
+                name
+            ));
+        }
+        section.values.insert(key, value.trim().to_string());
     }
     Ok(out)
 }
@@ -357,7 +504,7 @@ impl Config {
 
     pub fn parse(text: &str) -> Result<Config, String> {
         let ini = parse_ini(text)?;
-        let empty = Section::new();
+        let empty = Section::new(GENERAL_KEYS);
         let g = ini.get("general").unwrap_or(&empty);
 
         let mut ignore = Vec::new();
@@ -429,11 +576,18 @@ impl Config {
             _ => None,
         };
 
-        for name in ini.keys() {
-            let known = ["general", "mikrotik", "telegram"].contains(&name.as_str());
-            if !known && !name.starts_with("nvr:") {
-                return Err(format!("unknown section [{}]", name));
-            }
+        // An empty path would put the state file (and its temporary file)
+        // in the working directory, and saving would fail on every poll.
+        let state_file = g
+            .get("state_file")
+            .map(|s| s.as_str())
+            .unwrap_or("/var/lib/hik-f2b/state");
+        if state_file.is_empty() {
+            return Err(
+                "state_file must not be empty (leave it out for the default \
+                 /var/lib/hik-f2b/state)"
+                    .to_string(),
+            );
         }
 
         Ok(Config {
@@ -447,11 +601,7 @@ impl Config {
             auth_backoff: duration(g, "auth_backoff", 900, 60, 86400)?,
             alert_after: duration(g, "alert_after", 600, 60, 7 * 86400)?,
             max_bans_per_hour: number(g, "max_bans_per_hour", 20, 1, 10000)? as usize,
-            state_file: PathBuf::from(
-                g.get("state_file")
-                    .map(|s| s.as_str())
-                    .unwrap_or("/var/lib/hik-f2b/state"),
-            ),
+            state_file: PathBuf::from(state_file),
             ignore,
             meta_id,
             log_filter,
@@ -462,9 +612,9 @@ impl Config {
                 .get("country_db")
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from),
-            inline_secrets: ini
-                .values()
-                .any(|sec| sec.contains_key("password") || sec.contains_key("bot_token")),
+            inline_secrets: ini.values().any(|sec| {
+                sec.values.contains_key("password") || sec.values.contains_key("bot_token")
+            }),
             mikrotik,
             nvrs,
             telegram,
@@ -872,6 +1022,156 @@ mod tests {
             general("bantime = 0").is_err(),
             "0 is not a way to say permanent"
         );
+    }
+
+    #[test]
+    fn unknown_settings_are_errors_with_a_hint() {
+        let err = |text: &str| Config::parse(text).err().unwrap();
+        // the typos that would fail open or be ignored silently
+        for (section, typo, meant) in [
+            ("general", "ignore_ip = 198.51.100.0/24", "ignoreip"),
+            ("general", "dryrun = true", "dry_run"),
+            ("general", "max_retry = 3", "maxretry"),
+            ("general", "BanTimes = 1h", "bantime"),
+            ("mikrotik", "check_rules = false", "check_rule"),
+            ("mikrotik", "passwrd = x", "password"),
+            ("telegram", "health_alert = false", "health_alerts"),
+        ] {
+            let text = match section {
+                "general" => format!("{}[general]\n{}\n", BASE, typo),
+                "mikrotik" => BASE.replace(
+                    "ca_file = public\n",
+                    &format!("ca_file = public\n{}\n", typo),
+                ),
+                _ => format!(
+                    "{}[telegram]\nbot_token = 1:a\nchat_id = 5\n{}\n",
+                    BASE, typo
+                ),
+            };
+            let e = err(&text);
+            let key = typo.split(' ').next().unwrap().to_ascii_lowercase();
+            assert!(
+                e.contains(&format!("unknown setting {} in [{}]", key, section))
+                    && e.ends_with(&format!("did you mean {}?", meant)),
+                "{}",
+                e
+            );
+            assert!(e.starts_with("line "), "{}", e);
+        }
+        // no close setting: no guess, or the section the setting belongs in
+        let e = err(&format!("{}[general]\nwhatever = 1\n", BASE));
+        assert!(
+            e.ends_with("unknown setting whatever in [general]"),
+            "{}",
+            e
+        );
+        let e = err(&format!("{}[general]\nchat_id = 5\n", BASE));
+        assert!(
+            e.ends_with("chat_id belongs in a [telegram] section"),
+            "{}",
+            e
+        );
+        let e = err(&format!(
+            "{}[nvr:two]\nurl = http://192.0.2.11\ndry_run = 1\n",
+            BASE
+        ));
+        assert!(e.contains("unknown setting dry_run in [nvr:two]"), "{}", e);
+        assert!(e.ends_with("belongs in a [general] section"), "{}", e);
+        // also in a section that is switched off
+        let e = err(&format!("{}[telegram]\nenabled = false\nsilnt = 1\n", BASE));
+        assert!(e.ends_with("did you mean silent?"), "{}", e);
+        let e = err(&format!("{}[oops]\nx = 1\n", BASE));
+        assert!(e.ends_with("unknown section [oops]"), "{}", e);
+    }
+
+    #[test]
+    fn a_setting_given_twice_is_an_error() {
+        let e = Config::parse(&format!(
+            "{}[general]\nignoreip = 198.51.100.0/24\nmaxretry = 3\nignoreip = 203.0.113.0/24\n",
+            BASE
+        ))
+        .err()
+        .unwrap();
+        assert!(e.contains("ignoreip is set twice in [general]"), "{}", e);
+        // case does not make it another setting
+        let e = Config::parse(&BASE.replace(
+            "user = f2b\npassword = p\nca_file",
+            "user = f2b\nUSER = x\npassword = p\nca_file",
+        ))
+        .err()
+        .unwrap();
+        assert!(e.contains("user is set twice in [mikrotik]"), "{}", e);
+        // the same setting in two sections is fine
+        assert!(Config::parse(BASE).is_ok());
+    }
+
+    #[test]
+    fn empty_state_file_is_an_error() {
+        let e = general("state_file =").err().unwrap();
+        assert!(e.starts_with("state_file must not be empty"), "{}", e);
+        assert_eq!(
+            Config::parse(BASE).unwrap().state_file,
+            PathBuf::from("/var/lib/hik-f2b/state")
+        );
+        assert_eq!(
+            general("state_file = /tmp/x").unwrap().state_file,
+            PathBuf::from("/tmp/x")
+        );
+    }
+
+    #[test]
+    fn every_setting_the_code_reads_is_known() {
+        // `Section::get` fails on a setting that is not in the lists, so
+        // configs that set every setting (and take every branch that reads
+        // one) prove that the lists cover what the code reads.
+        let all = "[general]\npoll_interval = 30\nmaxretry = 5\nfindtime = 1h\nbantime = 1d\n\
+                   lookback = 120\nauth_backoff = 900\nalert_after = 10m\n\
+                   max_bans_per_hour = 20\nstate_file = /tmp/s\nignoreip = 10.0.0.0/8\n\
+                   meta_id = log.std-cgi.com/Exception\nlog_filter = x\ndry_run = false\n\
+                   country_db = /tmp/c.mmdb\n\
+                   [mikrotik]\nurl = https://192.0.2.1\nuser = f2b\npassword = p\n\
+                   address_list = l\nca_file = public\ncheck_rule = true\n\
+                   [nvr:one]\nurl = https://192.0.2.10\nuser = f2b\npassword = p\nca_file = public\n\
+                   [telegram]\nenabled = true\napi_url = https://api.telegram.org\n\
+                   bot_token = 1:a\nchat_id = 5\nmessage_thread_id = 7\nsilent = false\n\
+                   message = m\nhealth_alerts = true\n";
+        let cfg = Config::parse(all).unwrap();
+        assert!(cfg.inline_secrets);
+        assert!(Config::parse(&all.replace("message_thread_id", "topic_id")).is_ok());
+        let dir = std::env::temp_dir().join(format!("hik-f2b-keys-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let secret = dir.join("secret");
+        std::fs::write(&secret, "1:a\n").unwrap();
+        let from_files = all
+            .replace(
+                "password = p",
+                &format!("password_file = {}", secret.display()),
+            )
+            .replace(
+                "bot_token = 1:a",
+                &format!("bot_token_file = {}", secret.display()),
+            );
+        let cfg = Config::parse(&from_files).unwrap();
+        assert!(!cfg.inline_secrets);
+        std::fs::remove_dir_all(&dir).unwrap();
+        // every listed setting is accepted where it belongs
+        for (section, keys) in SECTIONS {
+            for key in keys {
+                assert!(known_keys(&section.replace("<name>", "x"))
+                    .unwrap()
+                    .contains(key));
+            }
+        }
+    }
+
+    #[test]
+    fn edit_distances() {
+        assert_eq!(edit_distance("ignore_ip", "ignoreip"), 1);
+        assert_eq!(edit_distance("dryrun", "dry_run"), 1);
+        assert_eq!(edit_distance("bantimes", "bantime"), 1);
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+        assert_eq!(edit_distance("url", "url"), 0);
     }
 
     #[test]

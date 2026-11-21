@@ -415,6 +415,13 @@ seconds and are checked after the conversion. The longest timed ban is
 for an address-list entry (35w3d13h13m56s). For a longer ban, use
 `bantime = permanent`. The same limit applies in notify-only mode.
 
+hik-f2b knows every setting in the table above, the settings of the other
+sections described below, and nothing else. A setting it does not know, for
+example a typo such as `ignore_ip` or `dryrun`, is an error. So is a setting
+that appears twice in one section, and an empty `state_file`. hik-f2b then
+does not start. The error names the line and, if a known setting is close,
+the setting you probably meant.
+
 The default `ignoreip` is `127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12,
 192.168.0.0/16`. If you set `ignoreip`, repeat the private ranges you still
 need.

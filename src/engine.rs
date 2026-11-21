@@ -113,6 +113,9 @@ pub struct Engine {
     /// The reason the last country lookup failed, if it did: a failure is
     /// logged when its reason changes, a recovery once.
     country_failure: Option<String>,
+    /// Host time a banned address was last seen reaching an NVR well after
+    /// its ban (see `Check::Bypassed`); `None` once that problem is over.
+    last_bypass: Option<u64>,
 }
 
 /// Addresses that can never be a remote attacker, whatever the log says.
@@ -623,6 +626,7 @@ impl Engine {
             notifications: Vec::new(),
             next_check: 0,
             country_failure: None,
+            last_bypass: None,
         };
         // The state may come from a run with another `ignoreip`.
         engine.drop_exempt();
@@ -879,12 +883,15 @@ impl Engine {
     pub fn cycle_at(&mut self, host_now: u64) {
         let now = host_i64(host_now);
         let report_once = self.firewall.is_none() || self.cfg.dry_run;
+        // Whether every NVR was read in this cycle.
+        let mut all_read = true;
         for i in 0..self.nvrs.len() {
             let retry_after = self.nvrs[i].retry_after;
             if retry_after > host_now {
                 // A wait longer than auth_backoff can only come from the
                 // host clock jumping back; do not wait for years.
                 if retry_after - host_now <= self.cfg.auth_backoff {
+                    all_read = false;
                     continue;
                 }
                 self.nvrs[i].retry_after = 0;
@@ -904,10 +911,12 @@ impl Engine {
                     // problem stays open until the next attempt.
                     let reason = format!("login rejected ({})", e);
                     self.alerts.fail(check, &reason, host_now);
+                    all_read = false;
                 }
                 Err(NvrError::Other(e)) => {
                     crate::warn!("{}: poll failed: {}", self.nvrs[i].name, e);
                     self.alerts.fail(check, &e, host_now);
+                    all_read = false;
                 }
                 Ok(polled) => {
                     self.alerts.pass(&check, host_now);
@@ -916,10 +925,31 @@ impl Engine {
             }
         }
         let unreachable = self.flush_pending(host_now);
+        self.bypass_over(host_now, all_read);
         self.periodic_check(host_now, unreachable);
         self.report_health(host_now);
         self.flush_notifications();
         self.cleanup(host_now);
+    }
+
+    /// Ends the `Check::Bypassed` problem once no banned address has
+    /// reached an NVR for `alert_after`, counted only while every NVR is
+    /// read (an NVR that cannot be read shows nothing either way). An
+    /// attacker that pauses for less than that does not end it; so it is
+    /// alerted when banned addresses keep reaching the NVRs for
+    /// `alert_after` without such a pause.
+    fn bypass_over(&mut self, now: u64, all_read: bool) {
+        let Some(last) = self.last_bypass else {
+            return;
+        };
+        // A last time in the future can only come from the host clock
+        // having gone back: count from now.
+        let last = last.min(now);
+        self.last_bypass = Some(last);
+        if all_read && now - last >= self.cfg.alert_after {
+            self.alerts.pass(&Check::Bypassed, now);
+            self.last_bypass = None;
+        }
     }
 
     /// Counts one NVR's new failures at host time and queues the bans
@@ -1105,20 +1135,32 @@ impl Engine {
                         // The router is the source of truth for bans. A
                         // listed address should not reach the NVR, unless
                         // these failures were logged just before our ban.
+                        // The time of the ban is kept (see below), so an
+                        // attacker that keeps going cannot hide this.
                         let banned_at = self
                             .state
                             .banned
                             .get(&ip)
-                            .map(|until| until.saturating_sub(keep))
-                            .unwrap_or(0);
+                            .map(|until| until.saturating_sub(keep));
                         let grace = self.cfg.poll_interval.saturating_mul(2).saturating_add(60);
-                        if now.saturating_sub(banned_at) > grace {
+                        if now.saturating_sub(banned_at.unwrap_or(0)) > grace {
                             crate::warn!(
                                 "{} is already in {} but still reached the NVR; \
                                  if this repeats, check the firewall drop rule for that list",
                                 ip,
                                 fw.describe()
                             );
+                            let since = match banned_at {
+                                Some(at) => format!(
+                                    "has been in {} for {}",
+                                    fw.describe(),
+                                    crate::health::fmt_duration(now.saturating_sub(at))
+                                ),
+                                None => format!("is in {}", fw.describe()),
+                            };
+                            let reason = format!("{} {} and still reached {}", ip, since, p.nvr);
+                            self.alerts.fail(Check::Bypassed, &reason, now);
+                            self.last_bypass = Some(now);
                         } else {
                             crate::info!("{} is already in {}", ip, fw.describe());
                         }
@@ -1126,7 +1168,16 @@ impl Engine {
                     }
                 },
             };
-            self.state.banned.insert(ip, now.saturating_add(keep));
+            if counted {
+                self.state.banned.insert(ip, now.saturating_add(keep));
+            } else {
+                // Already listed: keep the time of the ban this engine
+                // knows, if any (an address listed by hand counts from now).
+                self.state
+                    .banned
+                    .entry(ip)
+                    .or_insert(now.saturating_add(keep));
+            }
             self.state.fails.remove(&ip);
             self.state.pending.remove(&ip);
             if counted {

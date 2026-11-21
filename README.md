@@ -715,6 +715,15 @@ and always in its log. It watches:
   the rule's chain, interface or action. So a rule that matches the
   address-list but accepts the traffic still passes. To turn the check off,
   set `check_rule = false` in `[mikrotik]`.
+- **Bans that do not block:** an address that has been in the address-list
+  for longer than two polls and a minute still reaches an NVR with
+  `maxretry` failed logins. The drop rule exists but does not block, for
+  example because it names the wrong interface list. Each time, hik-f2b logs
+  a WARNING (`... is already in ... but still reached the NVR`). The problem
+  lasts while such addresses keep coming back with pauses shorter than
+  `alert_after`. It is over once none has come back for `alert_after` while
+  every NVR could be read. hik-f2b cannot tell a fixed rule from an attacker
+  that has given up.
 - **The ban rate limit:** addresses are waiting because `max_bans_per_hour` has
   been reached.
 - **Refused bans:** the router answers, but refuses to add an address to the

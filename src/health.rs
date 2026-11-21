@@ -42,6 +42,11 @@ pub enum Check {
     /// The firewall answers, but refuses to add a ban (for example because
     /// our account may read but not write). Only an accepted ban clears it.
     BanRefused,
+    /// An address that has been banned for a while still reaches an NVR:
+    /// the drop rule exists but does not block. Observed only when such an
+    /// address reaches `maxretry` again; over once none has for
+    /// `alert_after` (see `Engine::bypass_over`).
+    Bypassed,
 }
 
 impl Check {
@@ -53,6 +58,7 @@ impl Check {
             Check::Rule => "firewall-rule".to_string(),
             Check::RateLimit => "rate-limit".to_string(),
             Check::BanRefused => "ban-refused".to_string(),
+            Check::Bypassed => "ban-bypassed".to_string(),
         }
     }
 
@@ -63,6 +69,7 @@ impl Check {
             Check::Rule => "banned addresses are not blocked".to_string(),
             Check::RateLimit => "new bans are held back by max_bans_per_hour".to_string(),
             Check::BanRefused => "the firewall refuses bans".to_string(),
+            Check::Bypassed => "banned addresses still reach an NVR".to_string(),
         }
     }
 
@@ -73,6 +80,7 @@ impl Check {
             Check::Rule => "banned addresses are blocked again".to_string(),
             Check::RateLimit => "bans are no longer held back".to_string(),
             Check::BanRefused => "the firewall accepts bans again".to_string(),
+            Check::Bypassed => "banned addresses no longer reach the NVRs".to_string(),
         }
     }
 
@@ -479,6 +487,7 @@ mod tests {
         assert_eq!(Check::Rule.key(), "firewall-rule");
         assert_eq!(Check::RateLimit.key(), "rate-limit");
         assert_eq!(Check::BanRefused.key(), "ban-refused");
+        assert_eq!(Check::Bypassed.key(), "ban-bypassed");
     }
 
     #[test]

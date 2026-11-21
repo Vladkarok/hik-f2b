@@ -19,6 +19,11 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   failed. A longer `bantime` is now a config error that names the limit and
   points to `bantime = permanent`. The limit is the same in notify-only
   mode.
+- The warning that an address already in the address-list still reached
+  the NVR (the only sign of a drop rule that exists but does not block) did
+  not appear while the attack went on: every such sighting restarted the
+  time of the ban, and the warning needs the ban to be more than two polls
+  and a minute old. The time of the ban is now kept.
 - The drop-rule check counted a rule that RouterOS marks invalid, which it
   does when, for example, the interface list the rule names is removed.
   Such a rule blocks nothing. The check now leaves out rules that are
@@ -68,6 +73,14 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   looks at the files named by `password_file` and `bot_token_file`, and
   counts a file that its group can read, not only one that every user can
   read.
+
+### Added
+
+- A health alert `ban-bypassed`: banned addresses keep reaching an NVR well
+  after their ban, so the drop rule does not block them. It follows the
+  rules of the other alerts (after `alert_after`, a daily reminder, a
+  message when it is over). It is over once no banned address has come back
+  for `alert_after` while every NVR could be read.
 
 <!-- second group -->
 

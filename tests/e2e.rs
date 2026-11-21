@@ -2046,6 +2046,131 @@ fn server_error_is_retried_without_a_lookup() {
     assert!(h.fake.lock().unwrap().lookups.is_empty());
 }
 
+/// The drop rule exists but does not block (wrong interface list, say): a
+/// banned attacker keeps reaching the NVR every `gap` seconds, `attacks`
+/// times, then stops. Returns the harness, the Telegram texts and the
+/// number of "still reached the NVR" warnings.
+fn bypass_run(gap: i64, attacks: i64) -> (Harness, Vec<String>, usize) {
+    let mut h = Harness::new(true);
+    util::capture_log();
+    let burst = |h: &Harness, at: i64| {
+        for i in 0..5 {
+            Harness::add_at(&h.fake, &device(at + SKEW + i), ATTACKER);
+        }
+    };
+    let t0 = h.host;
+    burst(&h, t0 + 60);
+    h.advance(120); // banned
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    let banned = h.host;
+    // the router lists it, the NVR still sees it
+    let bursts: Vec<i64> = (1..=attacks).map(|k| banned + k * gap - 20).collect();
+    let end = bursts.last().copied().unwrap_or(banned) + 1800;
+    let mut next = 0;
+    while h.host < end {
+        let now = h.host + 30;
+        while next < bursts.len() && bursts[next] + 5 <= now {
+            burst(&h, bursts[next]);
+            next += 1;
+        }
+        h.advance(30);
+    }
+    assert!(h.engine.state.pending.is_empty());
+    let warnings = logged(&util::captured_log(), "but still reached the NVR");
+    let texts = telegram_texts(&h);
+    (h, texts, warnings)
+}
+
+#[test]
+fn a_ban_the_router_does_not_enforce_is_warned_and_alerted() {
+    for gap in [30, 60, 300] {
+        let (h, texts, warnings) = bypass_run(gap, 2400 / gap);
+        // every burst after the first two minutes is warned about, however
+        // fast the attacker comes back
+        assert!(
+            warnings as i64 >= 2400 / gap - 120 / gap,
+            "gap {}: {} warnings",
+            gap,
+            warnings
+        );
+        let alerts: Vec<&String> = texts
+            .iter()
+            .filter(|t| t.contains("banned addresses still reach an NVR"))
+            .collect();
+        assert_eq!(alerts.len(), 1, "gap {}: {:?}", gap, texts);
+        assert!(
+            alerts[0].starts_with(&format!(
+                "{}banned addresses still reach an NVR for 10 min: 198.51.100.7 has been in \
+                 MikroTik address-list cctv_ban for ",
+                WARN
+            )),
+            "{}",
+            alerts[0]
+        );
+        assert!(
+            alerts[0].ends_with(" and still reached nvr1"),
+            "{}",
+            alerts[0]
+        );
+        // the attacker stops (the rule is fixed): one recovery, alert_after
+        // after the last one
+        let last = texts.last().unwrap();
+        assert!(
+            last.starts_with(&format!(
+                "{}banned addresses no longer reach the NVRs (after ",
+                OK
+            )),
+            "gap {}: {:?}",
+            gap,
+            texts
+        );
+        assert!(h.engine.alerted_problems().is_empty());
+        // no ban notification for an address already listed
+        assert_eq!(
+            texts
+                .iter()
+                .filter(|t| t.contains("198.51.100.7 banned"))
+                .count(),
+            1
+        );
+    }
+}
+
+/// An attacker that comes back less often than `alert_after` is warned
+/// about each time, but never stays a problem long enough to be alerted.
+#[test]
+fn a_rare_bypass_is_warned_but_not_alerted() {
+    let (h, texts, warnings) = bypass_run(900, 4);
+    assert_eq!(warnings, 4);
+    assert_eq!(texts.len(), 1, "only the ban: {:?}", texts);
+    assert!(h.engine.alerted_problems().is_empty());
+}
+
+/// The time of the original ban is kept while the address keeps coming
+/// back, also across a restart (it is in the state file).
+#[test]
+fn already_listed_keeps_the_time_of_the_ban() {
+    let mut h = Harness::new(false);
+    h.burst("10:01", ATTACKER, 5);
+    h.cycle("10:02:00");
+    let until = h.engine.state.banned[&attacker()];
+    h.burst("10:05", ATTACKER, 5);
+    h.cycle("10:06:00");
+    assert_eq!(h.engine.state.banned[&attacker()], until);
+    h.restart();
+    h.burst("10:08", ATTACKER, 5);
+    h.cycle("10:09:00");
+    assert_eq!(h.engine.state.banned[&attacker()], until);
+    // an address listed by hand counts from the first time it is seen
+    h.fake.lock().unwrap().bans.push("198.51.100.8".to_string());
+    h.burst("10:10", "198.51.100.8", 5);
+    h.cycle("10:11:00");
+    let first = h.engine.state.banned[&ip("198.51.100.8")];
+    h.burst("10:12", "198.51.100.8", 5);
+    h.cycle("10:13:00");
+    assert_eq!(h.engine.state.banned[&ip("198.51.100.8")], first);
+}
+
 #[test]
 fn todays_wording_needs_no_lookup() {
     let mut h = Harness::new(false);

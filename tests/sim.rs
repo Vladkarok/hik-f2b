@@ -83,7 +83,9 @@
 //!   an address that is already listed.
 //! - `health/model` (all): the health notices of each cycle are exactly the
 //!   ones the documented policy gives for what the engine observed (failed
-//!   and successful polls, ban attempts, firewall checks, the rate limit):
+//!   and successful polls, ban attempts, firewall checks, the rate limit,
+//!   listed addresses that still reach an NVR well after their ban, which
+//!   is over once none has for `alert_after` while every NVR is read):
 //!   alert once after `alert_after`, reminder after 24 h, one recovery or
 //!   "unknown" when an alerted problem ends, nothing for a short one, state
 //!   lost on restart. `health/condition` (all): an unreachable firewall is
@@ -449,6 +451,8 @@ impl Health {
 enum Line {
     Counted(usize, Ipv4Addr, i64),
     Ban(Ipv4Addr, Ban),
+    /// Already listed, but still reached the NVR well after its ban.
+    Bypass(Ipv4Addr),
     Transport(Ipv4Addr),
     Refused(Ipv4Addr),
     CheckFailed,
@@ -529,6 +533,9 @@ fn classify(line: &str) -> Line {
     if let Some((first, rest)) = text.split_once(' ') {
         if let Ok(ip) = first.trim_end_matches(':').parse::<Ipv4Addr>() {
             if rest.starts_with("is already in ") {
+                if rest.contains(" but still reached the NVR") {
+                    return Line::Bypass(ip);
+                }
                 return Line::Ban(ip, Ban::Listed);
             }
             if rest.starts_with("the ban could not be applied") {
@@ -588,6 +595,9 @@ struct Sim {
     bans: Vec<(i64, Ipv4Addr, Ban)>,
     dropped: HashSet<Ipv4Addr>,
     health: Health,
+    /// When a listed address last reached an NVR well after its ban (see
+    /// `health/model`).
+    last_bypass: Option<i64>,
     /// Addresses the liveness check had a due ban or report for.
     musts: usize,
     trace: Vec<String>,
@@ -643,6 +653,7 @@ impl Sim {
             bans: Vec::new(),
             dropped: HashSet::new(),
             health: Health::default(),
+            last_bypass: None,
             musts: 0,
             trace: Vec::new(),
         }
@@ -997,6 +1008,7 @@ impl Sim {
         self.instance += 1;
         self.configs.push(self.nets.clone());
         self.health = Health::default();
+        self.last_bypass = None;
         self.h.engine.startup_check(self.host as u64);
         self.startup_lines()
     }
@@ -1178,6 +1190,22 @@ impl Sim {
                     self.on_count(n, ip, ts)?;
                     events.push(format!("{}+1", ip));
                 }
+                Line::Bypass(ip) => {
+                    if !self.listed(&ip.to_string()) {
+                        return Err(format!(
+                            "[health/condition] {} reached the NVR \"already listed\", but the \
+                             router does not list it",
+                            ip
+                        ));
+                    }
+                    self.on_ban(ip, Ban::Listed)?;
+                    cycle.ban_pass = true;
+                    self.health.pass("firewall");
+                    self.health.pass("ban-refused");
+                    self.health.fail("ban-bypassed", self.host);
+                    self.last_bypass = Some(self.host);
+                    events.push(format!("bypass {}", ip));
+                }
                 Line::Ban(ip, kind) => {
                     self.on_ban(ip, kind)?;
                     if kind != Ban::Listed {
@@ -1247,6 +1275,13 @@ impl Sim {
         }
         if !limited && !cycle.transport {
             self.health.pass("rate-limit");
+        }
+        let all_read = cycle.nvr_ok.iter().all(|ok| *ok);
+        if let Some(last) = self.last_bypass {
+            if all_read && self.host - last >= self.p.alert_after {
+                self.health.pass("ban-bypassed");
+                self.last_bypass = None;
+            }
         }
         if !cycle.pending_after {
             self.health.withdraw("ban-refused");
@@ -1685,8 +1720,9 @@ fn run_class(class: Class) {
     let replay = env("HIK_F2B_SIM_SEED").is_some();
     let seeds = seeds(class);
     let mut failures = Vec::new();
-    // cycles, accepted, listed, reported, alerts, liveness, shifted
-    let mut stats = [0usize; 7];
+    // cycles, accepted, listed, reported, alerts, liveness, shifted, bypass
+    // alerts
+    let mut stats = [0usize; 8];
     for &seed in &seeds {
         let mut sim = Sim::new(seed);
         let result = match catch_unwind(AssertUnwindSafe(|| sim.run())) {
@@ -1709,6 +1745,11 @@ fn run_class(class: Class) {
             alerts,
             sim.musts,
             sim.shift.values().filter(|s| **s > 0).count(),
+            sim.cycles
+                .iter()
+                .flat_map(|c| &c.notices)
+                .filter(|n| *n == "alert ban-bypassed")
+                .count(),
         ];
         for (total, n) in stats.iter_mut().zip(seen) {
             *total += n;
@@ -1721,7 +1762,8 @@ fn run_class(class: Class) {
     }
     let summary = format!(
         "sim {:?}: {} seed(s), {} cycles, {:.1} s, {} violation(s); bans {}, already listed {}, \
-         reports {}, health alerts {}, addresses due for liveness {}, addresses with a shift {}",
+         reports {}, health alerts {} (ban-bypassed {}), addresses due for liveness {}, \
+         addresses with a shift {}",
         class,
         seeds.len(),
         stats[0],
@@ -1731,6 +1773,7 @@ fn run_class(class: Class) {
         stats[2],
         stats[3],
         stats[4],
+        stats[7],
         stats[5],
         stats[6]
     );

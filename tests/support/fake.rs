@@ -13,12 +13,14 @@ use hik_f2b::engine::Engine;
 use hik_f2b::nvr::parse_kv;
 use hik_f2b::state::State;
 use hik_f2b::util;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 pub const DAY: &str = "2026-01-10T";
 pub const ATTACKER: &str = "198.51.100.7";
 pub const OWNER: &str = "203.0.113.20";
@@ -559,8 +561,223 @@ fn serve(stream: TcpStream, fake: Arc<Mutex<Fake>>) {
     }
 }
 
+// --- The servers' threads and sockets
+//
+// Each fake runs a listener thread and one thread per connection. A dropped
+// `Harness` stops them all (`FakeServer::stop`) and these counters, which
+// cover every fake in the process, show that it did: `tests/fake_leak.rs`
+// and the summary line of each class in `tests/sim.rs` check them.
+
+/// Live listener and connection threads of the fakes.
+static LIVE_THREADS: AtomicUsize = AtomicUsize::new(0);
+/// The most `LIVE_THREADS` has been.
+static PEAK_THREADS: AtomicUsize = AtomicUsize::new(0);
+/// Listening sockets of the fakes that are open.
+static OPEN_LISTENERS: AtomicUsize = AtomicUsize::new(0);
+/// How long a dropped harness waits for its fakes' threads to end.
+pub const STOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Live listener and connection threads of the fakes in this process.
+pub fn live_threads() -> usize {
+    LIVE_THREADS.load(Ordering::SeqCst)
+}
+
+/// The most live fake threads there have been in this process.
+pub fn peak_threads() -> usize {
+    PEAK_THREADS.load(Ordering::SeqCst)
+}
+
+/// Open listening sockets of the fakes in this process.
+pub fn open_listeners() -> usize {
+    OPEN_LISTENERS.load(Ordering::SeqCst)
+}
+
+/// One live fake thread, from before it is spawned until it ends (also by
+/// a panic, or when the spawn fails and the closure is dropped).
+struct Counted;
+
+impl Counted {
+    fn new() -> Counted {
+        let live = LIVE_THREADS.fetch_add(1, Ordering::SeqCst) + 1;
+        PEAK_THREADS.fetch_max(live, Ordering::SeqCst);
+        Counted
+    }
+}
+
+impl Drop for Counted {
+    fn drop(&mut self) {
+        LIVE_THREADS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// A listening socket, counted while it is open.
+struct Listening(TcpListener);
+
+impl Listening {
+    fn bind() -> Listening {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        OPEN_LISTENERS.fetch_add(1, Ordering::SeqCst);
+        Listening(listener)
+    }
+}
+
+impl Drop for Listening {
+    fn drop(&mut self) {
+        OPEN_LISTENERS.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// What a fake's threads share with its `FakeServer`.
+#[derive(Default)]
+struct Threads {
+    /// Set before the listener is woken to stop.
+    stop: bool,
+    /// The listener thread has not ended yet.
+    listening: bool,
+    /// A clone of each open connection, so that `stop` can shut it down.
+    open: HashMap<u64, TcpStream>,
+    next: u64,
+    /// Connection threads that have not ended yet.
+    live: usize,
+    /// Connection threads not joined yet (finished ones are joined as new
+    /// connections arrive).
+    handles: Vec<JoinHandle<()>>,
+}
+
+type Shared = Arc<(Mutex<Threads>, Condvar)>;
+
+fn lock(shared: &Shared) -> std::sync::MutexGuard<'_, Threads> {
+    shared.0.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Ends with the listener thread: marks it ended and wakes `stop`.
+struct ListenerExit(Shared, Counted);
+
+impl Drop for ListenerExit {
+    fn drop(&mut self) {
+        lock(&self.0).listening = false;
+        self.0 .1.notify_all();
+    }
+}
+
+/// Ends with a connection thread: drops the connection's clone (so the
+/// socket closes as soon as `serve` drops its own) and wakes `stop`.
+struct ConnectionExit(Shared, u64, Counted);
+
+impl Drop for ConnectionExit {
+    fn drop(&mut self) {
+        let mut t = lock(&self.0);
+        t.open.remove(&self.1);
+        t.live -= 1;
+        drop(t);
+        self.0 .1.notify_all();
+    }
+}
+
+/// A fake's listener on its own port; `stop` ends its threads.
+pub struct FakeServer {
+    pub port: u16,
+    shared: Shared,
+    listener: Option<JoinHandle<()>>,
+}
+
+impl FakeServer {
+    fn start(fake: Arc<Mutex<Fake>>) -> FakeServer {
+        let listener = Listening::bind();
+        let port = listener.0.local_addr().unwrap().port();
+        let shared: Shared = Arc::default();
+        lock(&shared).listening = true;
+        let exit = ListenerExit(Arc::clone(&shared), Counted::new());
+        let handle = std::thread::spawn(move || {
+            let exit = exit;
+            let shared = Arc::clone(&exit.0);
+            for stream in listener.0.incoming().flatten() {
+                let mut t = lock(&shared);
+                if t.stop {
+                    break;
+                }
+                let Ok(clone) = stream.try_clone() else {
+                    continue;
+                };
+                t.handles.retain(|h| !h.is_finished());
+                let id = t.next;
+                t.next += 1;
+                t.open.insert(id, clone);
+                t.live += 1;
+                let exit = ConnectionExit(Arc::clone(&shared), id, Counted::new());
+                let fake = Arc::clone(&fake);
+                drop(t);
+                let handle = std::thread::spawn(move || {
+                    let _exit = exit;
+                    serve(stream, fake);
+                });
+                lock(&shared).handles.push(handle);
+            }
+            // the listening socket closes before the thread counts as ended
+            drop(listener);
+            drop(exit);
+        });
+        FakeServer {
+            port,
+            shared,
+            listener: Some(handle),
+        }
+    }
+
+    /// Ends the listener thread (and closes its socket), then shuts down
+    /// every open connection and waits for its thread, all by `deadline`.
+    /// Returns what is still running if the deadline passes.
+    fn stop(&mut self, deadline: Instant) -> Result<(), String> {
+        lock(&self.shared).stop = true;
+        // Wake the blocked `accept`: it sees `stop` and returns.
+        let addr = (Ipv4Addr::LOCALHOST, self.port).into();
+        let left = deadline.saturating_duration_since(Instant::now());
+        let _ = TcpStream::connect_timeout(&addr, left.max(Duration::from_millis(1)));
+        let (_, cv) = &*self.shared;
+        let mut t = lock(&self.shared);
+        while t.listening {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(format!("the listener of port {} has not ended", self.port));
+            }
+            t = cv
+                .wait_timeout(t, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        // No connection is accepted any more.
+        for stream in t.open.values() {
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+        }
+        while t.live > 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(format!(
+                    "{} connection thread(s) of port {} have not ended",
+                    t.live, self.port
+                ));
+            }
+            t = cv
+                .wait_timeout(t, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+        let handles = std::mem::take(&mut t.handles);
+        drop(t);
+        // Every thread is past its last blocking call: these joins return
+        // at once. A thread that panicked has already said so.
+        if let Some(listener) = self.listener.take() {
+            let _ = listener.join();
+        }
+        for handle in handles {
+            let _ = handle.join();
+        }
+        Ok(())
+    }
+}
+
 /// Starts a fake on its own port.
-fn spawn_fake() -> (Arc<Mutex<Fake>>, u16) {
+fn spawn_fake() -> (Arc<Mutex<Fake>>, FakeServer) {
     let fake = Arc::new(Mutex::new(Fake {
         skew: SKEW,
         nvr_auth_ok: true,
@@ -569,16 +786,8 @@ fn spawn_fake() -> (Arc<Mutex<Fake>>, u16) {
         rules: vec![Rule::new("raw", "cctv_ban", false)],
         ..Default::default()
     }));
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let shared = Arc::clone(&fake);
-    std::thread::spawn(move || {
-        for stream in listener.incoming().flatten() {
-            let shared = Arc::clone(&shared);
-            std::thread::spawn(move || serve(stream, shared));
-        }
-    });
-    (fake, port)
+    let server = FakeServer::start(Arc::clone(&fake));
+    (fake, server)
 }
 
 pub fn attacker() -> Ipv4Addr {
@@ -669,18 +878,50 @@ pub struct Harness {
     pub ini: String,
     pub port: u16,
     pub host: i64,
+    /// The fakes' servers, stopped when the harness is dropped.
+    servers: Vec<FakeServer>,
 }
 
 impl Drop for Harness {
+    /// Removes the directory and stops the fakes' servers: their threads
+    /// end and are joined, their sockets close. A thread that has not ended
+    /// within `STOP_TIMEOUT` fails the test (it is left running).
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
+        // The engine's clients close their idle connections, which ends
+        // the threads serving them. `stop` also shuts the connections down
+        // from the server side, but on Windows that does not wake a thread
+        // blocked reading.
+        self.engine.nvrs.clear();
+        self.engine.firewall = None;
+        self.engine.notifier = None;
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        let stuck: Vec<String> = self
+            .servers
+            .iter_mut()
+            .filter_map(|server| server.stop(deadline).err())
+            .collect();
+        if !stuck.is_empty() {
+            let text = format!(
+                "a dropped harness could not stop its fakes within {:?}: {}",
+                STOP_TIMEOUT,
+                stuck.join("; ")
+            );
+            if std::thread::panicking() {
+                eprintln!("{}", text);
+            } else {
+                panic!("{}", text);
+            }
+        }
     }
 }
 
 impl Harness {
     /// A harness whose engine has not polled yet.
     pub fn build(opts: Opts) -> Harness {
-        let (fake, port) = spawn_fake();
+        let (fake, server) = spawn_fake();
+        let port = server.port;
+        let mut servers = vec![server];
         let dir = std::env::temp_dir().join(format!(
             "hik-f2b-test-{}-{}",
             std::process::id(),
@@ -715,11 +956,12 @@ impl Harness {
             ));
         }
         let fake2 = if opts.second_nvr {
-            let (fake2, port2) = spawn_fake();
+            let (fake2, server2) = spawn_fake();
             ini.push_str(&format!(
                 "[nvr:nvr2]\nurl = http://127.0.0.1:{}\nuser = f2b\npassword = secret\n",
-                port2
+                server2.port
             ));
+            servers.push(server2);
             Some(fake2)
         } else {
             None
@@ -740,6 +982,7 @@ impl Harness {
             ini,
             port,
             host: 0,
+            servers,
         };
         h.set_host(host_of("10:00:00"));
         h

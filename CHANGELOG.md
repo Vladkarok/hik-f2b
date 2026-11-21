@@ -24,6 +24,14 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   class and the replay command. The steps are in
   `.github/scripts/sim-long.sh`, which can also be run locally.
 
+### Fixed
+
+- The tests' fake servers kept running after a test ended, each with its
+  listening socket, so a long simulation run (4000 seeds per class on
+  GitHub) reached the system's limit and could not start the next one; they
+  now stop with the test, and `tests/fake_leak.rs` and the simulation check
+  that.
+
 ## [0.4.0] - 2026-11-21
 
 ### Fixed

@@ -453,8 +453,8 @@ that uses the address-list as `dst-address-list`, or blocking on another
 device.
 
 hik-f2b does not use a state file that was written by an older version
-(format 1), is damaged beyond its first line, cannot be read or is larger
-than 16 MiB. It logs a WARNING that says why and renames the file to
+(format 1), whose first line is damaged, that cannot be read or that is
+larger than 16 MiB. It logs a WARNING that says why and renames the file to
 `<state_file>.unusable-<Unix time>`, because the file may hold the only
 record of bans that still wait. hik-f2b then starts fresh: it watches each
 NVR log from the current time on, and the hourly ban counter starts at zero.

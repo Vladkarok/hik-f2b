@@ -1,0 +1,70 @@
+name: Simulation
+
+# A long run of the simulation test (tests/sim.rs): CI runs 30 seeds per
+# scenario class on every push, this runs 1500 per class in release mode,
+# each run on seeds that no earlier run covered. The rules for the seeds
+# and the output are in .github/scripts/sim-long.sh, which can also be run
+# locally. A violation fails the job, so GitHub sends its usual e-mail
+# about a failed run; the job summary lists the seed, the class and the
+# replay command of each violation.
+#
+# To start a run by hand:
+#   gh workflow run sim.yml                      1500 seeds per class
+#   gh workflow run sim.yml -f seeds=200 -f start=1
+
+on:
+  schedule:
+    # Every Sunday. GitHub disables scheduled workflows after 60 days
+    # without repository activity; re-enable this one in the Actions tab if
+    # that happens.
+    - cron: "41 2 * * 0"
+  workflow_dispatch:
+    inputs:
+      seeds:
+        description: "Seeds per scenario class, 1 to 4000 (empty: 1500)"
+        required: false
+        type: string
+        default: ""
+      start:
+        description: "First seed (empty: from the run number, so that the seeds are new)"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  # One run at a time; a run started meanwhile waits.
+  group: sim
+  cancel-in-progress: false
+
+jobs:
+  sim:
+    runs-on: ubuntu-24.04
+    # Estimated from local runs (2000 seeds per class in about 21 minutes,
+    # the Backlog class the longest): 1500 seeds take 20 to 30 minutes here,
+    # the 4000 that the input allows about an hour. SIM_TIME_LIMIT (minutes,
+    # the test alone) stops the test before the job's timeout, so that the
+    # job summary is still written; the build takes a few minutes more.
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - name: Long simulation
+        # The inputs reach the script only as environment variables;
+        # sim-long.sh accepts each only as a plain number within its bound.
+        # On a scheduled run they are empty. GITHUB_RUN_NUMBER, which gives
+        # the start, is set by the runner.
+        env:
+          SIM_SEEDS: ${{ inputs.seeds }}
+          SIM_START: ${{ inputs.start }}
+          SIM_TIME_LIMIT: "75"
+        run: |
+          set -euo pipefail
+          bash .github/scripts/sim-long.sh

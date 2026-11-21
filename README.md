@@ -393,7 +393,7 @@ See [hik-f2b.example.ini](hik-f2b.example.ini). The settings in `[general]`:
 | --- | --- | --- | --- |
 | `maxretry` | 5 | 1–1000 | Failed-login log entries that trigger a ban. |
 | `findtime` | 3600 | 10–2592000 | Window in which they must happen. |
-| `bantime` | 86400 | 60–31536000 or `permanent` | Ban length; the router expires the entry itself. `permanent`: see [Permanent bans](#permanent-bans). |
+| `bantime` | 86400 | 60–21474836 or `permanent` | Ban length; the router expires the entry itself. `permanent`: see [Permanent bans](#permanent-bans). |
 | `ignoreip` | private ranges | | Addresses and networks that are never banned. Setting it replaces the default list. |
 | `max_bans_per_hour` | 20 | 1–10000 | Upper limit on new bans (or reports) per hour. |
 | `poll_interval` | 30 | 5–3600 | Time between log polls. |
@@ -410,8 +410,10 @@ The time settings (`findtime`, `bantime`, `poll_interval`, `lookback`,
 `auth_backoff`, `alert_after`) are in seconds, or a whole number with one suffix: `s`, `m`,
 `h`, `d` or `w` (seconds, minutes, hours, days, weeks), for example `10m`,
 `12h` or `7d`. A plain number is seconds. The limits in the table are in
-seconds and are checked after the conversion, so `365d` is the longest timed
-ban.
+seconds and are checked after the conversion. The longest timed ban is
+21474836 seconds (`248d` in whole days): the longest timeout RouterOS accepts
+for an address-list entry (35w3d13h13m56s). For a longer ban, use
+`bantime = permanent`. The same limit applies in notify-only mode.
 
 The default `ignoreip` is `127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12,
 192.168.0.0/16`. If you set `ignoreip`, repeat the private ranges you still

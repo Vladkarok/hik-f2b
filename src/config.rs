@@ -205,11 +205,22 @@ fn duration(sec: &Section, key: &str, default: u64, min: u64, max: u64) -> Resul
     Ok(value)
 }
 
+/// The longest timeout RouterOS accepts for an address-list entry,
+/// `35w3d13h13m56s`; a longer one fails with "value of timeout is out of
+/// range". It is also the limit in notify-only mode, so that a config works
+/// the same with and without a router.
+pub const MAX_BANTIME: u64 = 21_474_836;
+
 /// `bantime`: a time setting, or `permanent`.
 fn bantime(sec: &Section) -> Result<BanTime, String> {
     match sec.get("bantime") {
         Some(v) if v.eq_ignore_ascii_case("permanent") => Ok(BanTime::Permanent),
-        _ => duration(sec, "bantime", 86400, 60, 365 * 86400)
+        Some(v) if parse_seconds(v).is_some_and(|s| s > MAX_BANTIME) => Err(format!(
+            "bantime must be at most {} seconds (35w3d13h13m56s, about 248 days): RouterOS \
+             accepts no longer timeout; for a longer ban use bantime = permanent",
+            MAX_BANTIME
+        )),
+        _ => duration(sec, "bantime", 86400, 60, MAX_BANTIME)
             .map(BanTime::Seconds)
             .map_err(|e| format!("{} (or the word permanent)", e)),
     }
@@ -787,9 +798,22 @@ mod tests {
     fn time_bounds_apply_after_conversion() {
         assert!(general("bantime = 1m").is_ok());
         assert!(general("bantime = 59s").is_err());
-        assert!(general("bantime = 365d").is_ok());
-        assert!(general("bantime = 366d").is_err());
-        assert!(general("bantime = 53w").is_err());
+        // the longest timeout RouterOS accepts, 35w3d13h13m56s
+        assert_eq!(
+            general("bantime = 21474836").unwrap().bantime,
+            BanTime::Seconds(21_474_836)
+        );
+        assert!(general("bantime = 248d").is_ok());
+        assert!(general("bantime = 35w").is_ok());
+        for long in ["21474837", "249d", "36w", "365d"] {
+            let err = general(&format!("bantime = {}", long)).err().unwrap();
+            assert!(
+                err.contains("at most 21474836 seconds") && err.contains("bantime = permanent"),
+                "{}: {}",
+                long,
+                err
+            );
+        }
         assert!(general("poll_interval = 1h").is_ok());
         assert!(general("poll_interval = 61m").is_err());
         assert!(general("lookback = 2d").is_ok());
@@ -800,7 +824,7 @@ mod tests {
         assert!(general("findtime = 5w").is_err());
         // too large for any integer type: a bounds error, not a panic
         let huge = general("bantime = 99999999999999999999w").err().unwrap();
-        assert!(huge.contains("between 60 and 31536000"), "{}", huge);
+        assert!(huge.contains("at most 21474836"), "{}", huge);
         let big = general("findtime = 3000000000000000000w").err().unwrap();
         assert!(big.contains("findtime must be between"), "{}", big);
     }

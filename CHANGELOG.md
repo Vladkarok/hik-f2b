@@ -8,6 +8,20 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 
 ## [Unreleased]
 
+## [0.3.3] - YYYY-MM-DD
+
+### Fixed
+
+- `bantime` accepted timed bans of up to 365 days, but RouterOS accepts an
+  address-list timeout of at most 35w3d13h13m56s (21474836 seconds, about
+  248 days) and refuses a longer one. Such a config passed `--check` and
+  `--test-ban` (which always bans for 60 seconds), and then every real ban
+  failed. A longer `bantime` is now a config error that names the limit and
+  points to `bantime = permanent`. The limit is the same in notify-only
+  mode.
+
+<!-- second group -->
+
 ## [0.3.2] - 2026-11-20
 
 ### Fixed
@@ -192,7 +206,8 @@ be built from source.
   a sandboxed systemd unit, unit and end-to-end tests, CI, and documentation
   in English and Ukrainian.
 
-[Unreleased]: https://github.com/Vladkarok/hik-f2b/compare/v0.3.2...HEAD
+[Unreleased]: https://github.com/Vladkarok/hik-f2b/compare/v0.3.3...HEAD
+[0.3.3]: https://github.com/Vladkarok/hik-f2b/compare/v0.3.2...v0.3.3
 [0.3.2]: https://github.com/Vladkarok/hik-f2b/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/Vladkarok/hik-f2b/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/Vladkarok/hik-f2b/compare/1e9edea...v0.3.0

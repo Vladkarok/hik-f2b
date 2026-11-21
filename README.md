@@ -817,7 +817,9 @@ login is whatever they typed). It is built accordingly:
   overflow checks kept on in release builds.
 - **Hostile input.** The address is taken only from the entry's address field,
   never from free text or the user name, and must parse as an IP address.
-  `::ffff:a.b.c.d` is treated as the IPv4 address it wraps; other IPv6
+  If the entry has an `<ipAddress>` field (both tested NVRs write one), the
+  address comes from that field only, also when other fields have names that
+  look like an address. `::ffff:a.b.c.d` is treated as the IPv4 address it wraps; other IPv6
   addresses are logged and not counted. User names are cut to 32 characters
   and reduced to printable ASCII before they reach a log line, the router or
   Telegram. Request bodies are built with escaping, Telegram messages are sent
@@ -925,7 +927,8 @@ vulnerability, see [SECURITY.md](SECURITY.md).
   are static entries and survive a reboot.
 - Field names in log search results vary between firmware versions. hik-f2b
   looks for the time, address and user under several field names, but unusual
-  firmware may need a `log_filter` or `meta_id` change.
+  firmware may need a `log_filter` or `meta_id` change. If an entry has
+  `<ipAddress>`, the other address names are not used.
 - A firmware that does not escape `<` in the logged user name: a user name
   with `<` can make its entry unreadable. Such an entry is skipped with a
   WARNING line that names the NVR, and its failed login is not counted. So

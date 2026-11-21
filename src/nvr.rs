@@ -788,7 +788,13 @@ fn attacker_typed(key: &str) -> bool {
     key.contains("user")
 }
 
-/// Field names that may hold the remote address.
+/// The address field of the tested firmware. If an item has it, the address
+/// comes from it alone, wherever it stands, and the other names
+/// `address_key` accepts are not looked at.
+const ADDRESS_KEY: &str = "ipaddress";
+
+/// Field names that may hold the remote address. The ones other than
+/// `ADDRESS_KEY` are guesses for firmware not tested here.
 fn address_key(key: &str) -> bool {
     !attacker_typed(key)
         && (key.starts_with("ip")
@@ -888,8 +894,17 @@ pub fn parse_item(nvr: &str, item: roxmltree::Node) -> Item {
     // mention other addresses (a camera's), and the user name is whatever
     // the attacker typed, so with an empty address field a scan of the text
     // would let anyone get a victim's address banned.
+    //
+    // <ipAddress> wins over the other address names whatever their order,
+    // also when it is empty or "::": another such field may hold the NVR's
+    // own address or a camera's. Without it, the first other address field
+    // that parses is used. Neither can come from the user name: a field
+    // nested in it is never read, and one beside it needs a second
+    // user-name element, which makes the item ambiguous.
     let ip = if ambiguous {
         None
+    } else if decisive.contains(ADDRESS_KEY) {
+        get(ADDRESS_KEY).and_then(parse_addr)
     } else {
         fields
             .iter()
@@ -1301,6 +1316,58 @@ mod tests {
         assert_eq!(pick_challenge(&[]), "");
         let mut d = DigestAuth::new("u", "p");
         assert!(d.challenge(pick_challenge(&["Basic realm=\"x\""])).is_err());
+    }
+
+    #[test]
+    fn ip_address_wins_over_other_address_names() {
+        let at = |fields: &str| {
+            item(&format!(
+                "<searchMatchItem><logDescriptor><metaId>log.x/illegalLogin</metaId>\
+                 <StartDateTime>2026-01-10T10:00:00Z</StartDateTime>{}</logDescriptor>\
+                 </searchMatchItem>",
+                fields
+            ))
+            .ip
+            .map(|a| a.to_string())
+        };
+        let attacker = Some("198.51.100.7".to_string());
+        assert_eq!(
+            at(
+                "<localAddress>192.0.2.1</localAddress><hostIp>192.0.2.2</hostIp>\
+                <userName>admin</userName><ipAddress>198.51.100.7</ipAddress>"
+            ),
+            attacker
+        );
+        assert_eq!(
+            at("<ipAddress>198.51.100.7</ipAddress><remoteHost>192.0.2.2</remoteHost>"),
+            attacker
+        );
+        // no remote address: another address field is not used instead
+        assert_eq!(
+            at("<localAddress>192.0.2.1</localAddress><ipAddress>::</ipAddress>"),
+            None
+        );
+        assert_eq!(
+            at("<hostIp>192.0.2.2</hostIp><ipAddress></ipAddress>"),
+            None
+        );
+        // without <ipAddress>, the other names are still read
+        assert_eq!(
+            at("<remoteHostAddr>198.51.100.7</remoteHostAddr>"),
+            attacker
+        );
+        // markup in the user name cannot supply the preferred field: nested
+        // it is text, beside the user name it makes the item ambiguous
+        assert_eq!(
+            at("<userName>a<ipAddress>203.0.113.9</ipAddress></userName>\
+                <remoteHostAddr>198.51.100.7</remoteHostAddr>"),
+            attacker
+        );
+        let sibling = "<searchMatchItem><metaId>log.x/illegalLogin</metaId>\
+             <StartDateTime>2026-01-10T10:00:00Z</StartDateTime>\
+             <userName>a</userName><ipAddress>203.0.113.9</ipAddress><userName>b</userName>\
+             <remoteHostAddr>198.51.100.7</remoteHostAddr></searchMatchItem>";
+        assert!(matches!(parse(sibling), Item::Ambiguous(ev) if ev.ip.is_none()));
     }
 
     #[test]

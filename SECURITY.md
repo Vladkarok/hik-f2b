@@ -1,8 +1,9 @@
 # Security policy
 
-hik-f2b holds credentials for your NVRs and write access to your router's
-firewall, so bugs here can matter. How it is built to limit that, and what it
-does not protect against, is described in the README under
+hik-f2b holds credentials for your NVRs and for a router account that can
+change almost all of the router's configuration, not only its firewall, so
+bugs here can matter. How it is built to limit that, and what it does not
+protect against, is described in the README under
 [Security design](README.md#security-design).
 
 **Reporting a vulnerability:** please do not open a public issue. Its details

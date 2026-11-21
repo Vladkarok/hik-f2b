@@ -812,7 +812,7 @@ fn broken_items_do_not_blind_the_daemon() {
         b"ad\x01min",
         "illlegealAccess",
     );
-    // an unescaped & breaks the XML document itself
+    // an unescaped & would break the XML document itself: read as text
     Harness::entry_to(
         &fake,
         &at("22"),
@@ -820,13 +820,24 @@ fn broken_items_do_not_blind_the_daemon() {
         b"a & b",
         "illlegealAccess",
     );
+    // an unescaped < cannot be read safely: skipped with a warning
+    Harness::entry_to(&fake, &at("23"), "198.51.100.53", b"a<b", "illlegealAccess");
+    util::capture_log();
     h.cycle("10:02:00");
     assert_eq!(h.banned(), vec![ATTACKER]);
     assert_eq!(h.fails("198.51.100.50"), 1);
     assert_eq!(h.fails("198.51.100.51"), 1);
-    assert_eq!(h.fails("198.51.100.52"), 0, "unparseable item is skipped");
+    assert_eq!(h.fails("198.51.100.52"), 1, "a bare & is text");
+    assert_eq!(h.fails("198.51.100.53"), 0, "unparseable item is skipped");
+    assert_eq!(
+        logged(
+            &util::captured_log(),
+            "WARNING nvr1: 1 log entry could not be parsed and was skipped"
+        ),
+        1
+    );
     // the newest entry that could be read
-    assert_eq!(h.since("nvr1"), at("21"));
+    assert_eq!(h.since("nvr1"), at("22"));
 
     // the next poll still sees the broken entries in its overlap, works,
     // and counts nothing twice
@@ -835,6 +846,7 @@ fn broken_items_do_not_blind_the_daemon() {
     assert_eq!(h.fails("198.51.100.60"), 1);
     assert_eq!(h.fails("198.51.100.50"), 1);
     assert_eq!(h.fails("198.51.100.51"), 1);
+    assert_eq!(h.fails("198.51.100.52"), 1);
     assert_eq!(h.since("nvr1"), format!("{}10:02:10", DAY));
 }
 
@@ -968,11 +980,184 @@ fn identical_page_stops_paging() {
     h.add("10:01:10", OWNER);
     let before = h.fake.lock().unwrap().search_requests;
     h.cycle("10:02:00");
-    assert_eq!(h.fake.lock().unwrap().search_requests - before, 2);
+    // the page, the same page again (the search is not complete), and a
+    // search of the time before that second, which holds nothing
+    assert_eq!(h.fake.lock().unwrap().search_requests - before, 3);
     assert_eq!(h.fails(OWNER), 1);
     h.cycle("10:02:30");
     assert_eq!(h.fails(OWNER), 1);
     assert!(h.banned().is_empty());
+}
+
+/// An NVR that ignores the search position and lists newest first: its
+/// first page holds the newest entries only. The search is not complete,
+/// so the older part is read with narrower searches in the same poll.
+#[test]
+fn ignored_position_newest_first_reads_the_older_part() {
+    let mut h = Harness::new(false);
+    {
+        let mut f = h.fake.lock().unwrap();
+        f.stuck_paging = true;
+        f.newest_first = true;
+    }
+    // the oldest, then more than a page of newer entries (ignoreip)
+    h.burst("10:01", ATTACKER, 5);
+    let start = util::parse_ts(&format!("{}10:02:00", DAY)).unwrap();
+    for n in 0..100 {
+        Harness::add_at(&h.fake, &device(start + n), "192.168.1.50");
+    }
+    h.cycle("10:04:00");
+    assert_eq!(h.fails(ATTACKER), 0, "banned, so no longer counted");
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    assert_eq!(h.since("nvr1"), format!("{}10:03:39", DAY));
+    // the next polls count nothing twice
+    run(&mut h, 3, 30);
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    assert!(h.engine.state.fails.is_empty());
+}
+
+/// A paging status with a namespace prefix is read; a page without one is
+/// not taken for the last page.
+#[test]
+fn paging_status_with_prefix_or_missing() {
+    let mut h = Harness::new(false);
+    let item = |second: u32| {
+        format!(
+            "<searchMatchItem><logDescriptor><metaId>log.hikvision.com/Exception/illlegealAccess\
+             </metaId><StartDateTime>{}10:01:{}Z</StartDateTime><userName>admin</userName>\
+             <ipAddress>{}</ipAddress></logDescriptor></searchMatchItem>\n",
+            DAY, second, ATTACKER
+        )
+    };
+    let page = |status: &str, items: &[u32]| {
+        let body: String = items.iter().map(|s| item(*s)).collect();
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>\n<hik:CMSearchResult \
+             xmlns:hik=\"http://www.hikvision.com/ver20/XMLSchema\">{}<hik:matchList>\n{}\
+             </hik:matchList></hik:CMSearchResult>",
+            status, body
+        )
+        .into_bytes()
+    };
+    {
+        let mut f = h.fake.lock().unwrap();
+        f.raw_pages.push_back(page(
+            "<hik:responseStatusStrg version=\"2.0\">MORE</hik:responseStatusStrg>",
+            &[10, 11],
+        ));
+        f.raw_pages.push_back(page("", &[12, 13]));
+        f.search_requests = 0;
+    }
+    util::capture_log();
+    let search = h.engine.nvrs[0]
+        .search(
+            util::parse_ts(&format!("{}10:00:00", DAY)).unwrap(),
+            util::parse_ts(&format!("{}10:05:00", DAY)).unwrap(),
+            "",
+            None,
+        )
+        .unwrap();
+    // the third page is the fake's own: no entries, which ends the search
+    assert_eq!(h.fake.lock().unwrap().search_requests, 3);
+    assert_eq!((search.events.len(), search.truncated), (4, false));
+    assert_eq!(search.page_size, Some(2));
+    assert_eq!(
+        logged(
+            &util::captured_log(),
+            "WARNING nvr1: a result page had no paging status"
+        ),
+        1
+    );
+}
+
+/// A last page that takes a search past `MAX_EVENTS` (5000) is cut to it,
+/// and the search counts as not complete.
+#[test]
+fn last_page_is_cut_to_the_entry_cap() {
+    let mut h = Harness::new(false);
+    let page = |status: &str| {
+        let body =
+            "<searchMatchItem><ipAddress>192.0.2.1</ipAddress></searchMatchItem>".repeat(2600);
+        format!(
+            "<CMSearchResult><responseStatusStrg>{}</responseStatusStrg><matchList>{}\
+             </matchList></CMSearchResult>",
+            status, body
+        )
+        .into_bytes()
+    };
+    {
+        let mut f = h.fake.lock().unwrap();
+        f.raw_pages.push_back(page("MORE"));
+        f.raw_pages.push_back(page("OK"));
+    }
+    let search = h.engine.nvrs[0].search(0, 1, "", None).unwrap();
+    assert_eq!((search.events.len(), search.truncated), (5000, true));
+}
+
+/// A device clock before 1970 (a reset clock battery) cannot be held by the
+/// state file: the NVR is not read until its clock is set, and its state
+/// is kept as it was.
+#[test]
+fn clock_before_1970_is_refused_and_the_state_survives() {
+    let mut h = Harness::new(false);
+    let before = h.engine.state.nvr["nvr1"].clone();
+    // the device shows 1969-12-31T23:00:00 now, 23:00:30 at the next poll
+    let skew = -h.host - 3600;
+    h.fake.lock().unwrap().skew = skew;
+    util::capture_log();
+    h.advance(30);
+    assert_eq!(
+        logged(
+            &util::captured_log(),
+            "device time \"1969-12-31T23:00:30+02:00\" cannot be used: not a date, or before 1970"
+        ),
+        1
+    );
+    assert_eq!(h.engine.state.nvr["nvr1"], before);
+    h.restart(); // checks the state file round trip
+    assert_eq!(h.engine.state.nvr["nvr1"], before);
+    // the clock is set again: the log is read on
+    h.fake.lock().unwrap().skew = SKEW;
+    h.burst("10:01", ATTACKER, 5);
+    h.cycle("10:02:00");
+    assert_eq!(h.banned(), vec![ATTACKER]);
+
+    // the same on the very first poll: the NVR stays unknown
+    let mut h = Harness::raw(false);
+    let skew = -h.host - 3600;
+    h.fake.lock().unwrap().skew = skew;
+    h.tick();
+    assert!(!h.engine.state.nvr.contains_key("nvr1"));
+    h.restart();
+    assert!(h.engine.state.nvr.is_empty());
+}
+
+/// An NVR that ignores the search position and lists oldest first, with
+/// more than a page in one second: the cursor moves on by a second per poll
+/// instead of staying on that second, and what follows is counted.
+#[test]
+fn ignored_position_oldest_first_moves_on() {
+    let mut h = Harness::with(Opts {
+        general: "lookback = 10",
+        ..Default::default()
+    });
+    h.fake.lock().unwrap().stuck_paging = true;
+    for _ in 0..70 {
+        h.add("10:01:10", "192.168.1.50");
+    }
+    for second in 30..35 {
+        h.add(&format!("10:01:{}", second), ATTACKER);
+    }
+    h.cycle("10:02:00");
+    assert_eq!(h.since("nvr1"), format!("{}10:01:10", DAY));
+    for _ in 0..30 {
+        h.advance(30);
+        if !h.banned().is_empty() {
+            break;
+        }
+    }
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    assert!(h.since("nvr1") > format!("{}10:01:20", DAY));
 }
 
 // ------------------------------------------------------------------ digest

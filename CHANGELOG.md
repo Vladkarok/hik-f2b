@@ -99,6 +99,28 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   it.
 - `--hours` above 8760 said that it must be a positive number; it now names
   the range 1 to 8760.
+- An NVR that ignores the search position no longer has its search taken
+  for complete. If it lists newest first, the older entries of the poll
+  window are now read in the same poll; before, they were lost. If it lists
+  oldest first with more than a page in one second, the read position now
+  moves on instead of staying on that second.
+- A last result page that takes one search past 5000 entries is cut to that
+  cap, and the search counts as incomplete.
+- The paging status is recognised with a namespace prefix or attributes. A
+  missing, unknown or repeated status is no longer read as "last page":
+  hik-f2b reads on until a page is empty, and logs a WARNING.
+- A user name with a bare `&` (on firmware that does not escape it) no
+  longer makes its entry unreadable; the failed login is counted.
+- If a log entry has `<ipAddress>`, the address is taken from that field.
+  Before, another address-like field (such as the NVR's own address) could
+  be used when it came first.
+- Digest authentication: a realm, nonce or opaque with leading or trailing
+  spaces no longer causes a refused login. Several challenges in one
+  `WWW-Authenticate` header (`Basic …, Digest …`) are understood, and the
+  MD5 Digest challenge is chosen when an NVR offers several.
+- Dates that do not exist (such as 2026-02-31) are no longer read as times.
+  An NVR whose clock is set before 1970 is reported with a clear error and
+  is not read until its clock is set; its state survives a restart.
 
 ### Changed
 
@@ -123,6 +145,12 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   looks at the files named by `password_file` and `bot_token_file`, and
   counts a file that its group can read, not only one that every user can
   read.
+- The container image is built from a base image pinned by digest. `tests/`
+  is no longer copied into the build.
+- CI pins cargo-audit (0.22.2) and sets timeouts for every job.
+- README and SECURITY.md say what the router account can do: the `write`
+  policy covers almost the whole router configuration, not only the
+  firewall. They also say what limits it.
 
 ### Added
 
@@ -131,8 +159,8 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   rules of the other alerts (after `alert_after`, a daily reminder, a
   message when it is over). It is over once no banned address has come back
   for `alert_after` while every NVR could be read.
-
-<!-- second group -->
+- README Limitations: on firmware that does not escape `<` in the logged
+  user name, an entry with `<` is skipped with a WARNING and not counted.
 
 ## [0.3.2] - 2026-11-20
 

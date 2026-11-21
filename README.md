@@ -858,20 +858,24 @@ than 5 minutes in the future (host time).
 
 ## Security design
 
-hik-f2b holds credentials for your NVRs and write access to your router's
-firewall, and it reads text that attackers control (the user name in a failed
-login is whatever they typed). It is built accordingly:
+hik-f2b holds credentials for your NVRs and for a router account that can
+change almost all of the router's configuration (see "Router account" below),
+and it reads text that attackers control (the user name in a failed login is
+whatever they typed). It is built accordingly:
 
 - **Memory safety.** Rust with `unsafe` forbidden in this crate, and integer
   overflow checks kept on in release builds.
 - **Hostile input.** The address is taken only from the entry's address field,
   never from free text or the user name, and must parse as an IP address.
-  `::ffff:a.b.c.d` is treated as the IPv4 address it wraps; other IPv6
+  If the entry has an `<ipAddress>` field (both tested NVRs write one), the
+  address comes from that field only, also when other fields have names that
+  look like an address. `::ffff:a.b.c.d` is treated as the IPv4 address it wraps; other IPv6
   addresses are logged and not counted. User names are cut to 32 characters
   and reduced to printable ASCII before they reach a log line, the router or
   Telegram. Request bodies are built with escaping, Telegram messages are sent
   without a parse mode, and control characters never reach the log. Invalid
-  UTF-8 and characters that XML forbids are replaced. Each log entry is parsed
+  UTF-8 and characters that XML forbids are replaced, and a bare `&` is read
+  as text. Each log entry is parsed
   on its own: one that cannot be parsed (not well-formed XML, or more markup
   than any real entry has) is skipped with a warning, and the rest of the page
   is still read.
@@ -889,7 +893,10 @@ login is whatever they typed). It is built accordingly:
   with further searches, at most 4 searches per NVR and poll. Each entry is
   counted once, also when a search stops in the middle of a second. Entries
   that 4 searches cannot reach are skipped with an ERROR line that gives
-  their time range. At most 10,000 addresses are tracked
+  their time range. A search that gets the same page twice (the NVR ignores
+  the search position) is handled like one that stopped at the cap. A page
+  without a paging status that hik-f2b knows is never taken for the last
+  page. At most 10,000 addresses are tracked
   (the one whose latest failed login is the oldest is forgotten first), with
   at most 200,000 failed-login times in all: hik-f2b keeps the newest
   `4 × maxretry` (at least 16) per address, so with `maxretry` above 5 it
@@ -924,6 +931,22 @@ login is whatever they typed). It is built accordingly:
   its group or other users. Secrets
   are never logged, and the Telegram token is removed from error messages.
   Health alerts quote error messages with every URL in them replaced.
+- **Router account.** RouterOS grants rights by policy, not by menu. The
+  `write` policy from the setup lets the account change almost all of the
+  router's configuration, not only the firewall: for example NAT, routes,
+  addresses, interfaces and DNS. Someone with the router password could open
+  your network to the internet or take it offline. The `read` policy lets the
+  account read the configuration. Passwords and other secrets stay hidden from
+  it, because the group has no `sensitive` policy. These limits apply today:
+  the account can log in only from the host's address
+  (`address=HOST_IP/32`), and the REST API answers only that address
+  (`www-ssl` with `address=HOST_IP/32`). The `api` policy also lets the
+  account use the RouterOS API, which the setup does not limit by address;
+  the account's own address limit applies there too. The group has no
+  `policy` policy, so the account cannot add users or change their rights.
+  It has no `reboot` policy, and no policy to log in over SSH, WinBox, the
+  web interface, FTP, Telnet or the console. Keep the router password as
+  safe as the router's admin password.
 - **Country database.** The `.mmdb` file is untrusted input too. The reader
   (`src/country.rs`) checks every offset, bounds the search-tree walk, the
   nesting, the pointers followed and the number of fields decoded, never
@@ -974,7 +997,13 @@ vulnerability, see [SECURITY.md](SECURITY.md).
   are static entries and survive a reboot.
 - Field names in log search results vary between firmware versions. hik-f2b
   looks for the time, address and user under several field names, but unusual
-  firmware may need a `log_filter` or `meta_id` change.
+  firmware may need a `log_filter` or `meta_id` change. If an entry has
+  `<ipAddress>`, the other address names are not used.
+- A firmware that does not escape `<` in the logged user name: a user name
+  with `<` can make its entry unreadable. Such an entry is skipped with a
+  WARNING line that names the NVR, and its failed login is not counted. So
+  an attacker on such a firmware could avoid a ban. Both tested firmware
+  versions escape `<`.
 - If the NVR answers but its log cannot be read 10 polls in a row, hik-f2b
   skips the unreadable stretch of the log with an ERROR line; failed logins in
   it are not counted.

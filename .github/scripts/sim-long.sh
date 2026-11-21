@@ -96,34 +96,67 @@ violations() {
     ' "$1"
 }
 
+# The first panic in LOG: its "thread ... panicked at" line and the message
+# lines after it, up to a blank line, the next panic or a line of libtest
+# (at most 8 lines).
+first_panic() {
+    awk '
+        on && (/^$/ || / panicked at / || /^test / || /^---- / || ++lines > 8) { exit }
+        on { print; next }
+        / panicked at / { print; on = 1 }
+    ' "$1"
+}
+
 # verdict STATUS LOG SUMMARY HEADER: writes the end of the console output to
 # stdout and a Markdown summary to SUMMARY. Returns 0 if the run passed.
+#
+# A failure without a violation report (a panic outside the scenarios, a
+# process killed for lack of memory, a time limit) is a failure of the test
+# run itself, not a finding about the engine: the first line of the summary
+# says so, and the first panic message follows.
 verdict() {
     local status=$1 log=$2 summary=$3 header=$4
-    local found n shown passed=true reason=
+    local found n shown passed=true reason= panic
     found=$(violations "$log")
     n=0
     [ -n "$found" ] && n=$(grep -c '' <<<"$found")
     if [ "$n" -gt 0 ]; then
         passed=false
         reason="$n violation(s) found"
-    elif [ "$status" -eq 124 ] || [ "$status" -eq 137 ]; then
+    elif [ "$status" -eq 124 ]; then
         passed=false
-        reason="time limit reached (exit $status): the test was stopped"
+        reason="time limit reached (exit 124): the test was stopped"
+    elif [ "$status" -eq 137 ]; then
+        passed=false
+        reason="the test was killed (exit 137, SIGKILL): by the time limit, or for lack of memory"
+    elif grep -q 'signal: 9, SIGKILL' "$log"; then
+        passed=false
+        reason="the test process was killed (SIGKILL; exit $status), probably for lack of memory"
     elif [ "$status" -ne 0 ]; then
         passed=false
-        reason="the test failed (exit $status) without a violation report; see the panic below"
+        reason="the test failed (exit $status) without a violation report"
     elif ! grep -q "^test result: ok\. $CLASSES passed;" "$log"; then
         passed=false
         reason="the test passed, but not with $CLASSES tests passed; see the log"
     fi
+    panic=$(first_panic "$log")
     {
         if [ "$passed" = true ]; then
             echo "## Long simulation: passed"
-        else
+        elif [ "$n" -gt 0 ]; then
             echo "## Long simulation: FAILED"
             echo
             echo "**$reason**"
+        else
+            echo "## Long simulation: FAILED: the test run itself failed, not a finding about the engine"
+            echo
+            echo "**$reason**"
+            echo
+            echo 'First panic message:'
+            echo
+            echo '~~~~text'
+            echo "${panic:-(no panic in the log)}"
+            echo '~~~~'
         fi
         echo
         echo "$header"
@@ -139,7 +172,13 @@ verdict() {
         echo "sim-long: passed"
         return 0
     fi
-    echo "sim-long: FAILED: $reason"
+    if [ "$n" -eq 0 ]; then
+        echo "sim-long: FAILED: the test run itself failed, not a finding about the engine: $reason"
+        echo "sim-long: first panic message:"
+        sed 's/^/sim-long:   /' <<<"${panic:-(no panic in the log)}"
+    else
+        echo "sim-long: FAILED: $reason"
+    fi
     if [ "$n" -gt 0 ]; then
         shown=0
         while IFS=$'\037' read -r violation seed_line replay; do
@@ -247,6 +286,14 @@ EOF
         "! verdict 0 <(sed 's/ok\. 5 passed/ok. 4 passed/' '$tmp/pass.log') '$tmp/x.md' header >/dev/null"
     check "a time limit fails" "! verdict 124 '$tmp/pass.log' '$tmp/x.md' header >/dev/null"
     check "it says so" "grep -q 'time limit reached' '$tmp/x.md'"
+    check "a time limit is a failure of the run" \
+        "head -n 1 '$tmp/x.md' | grep -q 'the test run itself failed, not a finding about the engine'"
+    check "a kill fails" "! verdict 137 '$tmp/pass.log' '$tmp/x.md' header >/dev/null"
+    check "it says so" "grep -q 'killed (exit 137' '$tmp/x.md' && head -n 1 '$tmp/x.md' | grep -q 'test run itself'"
+    sed '$a\
+process didn'"'"'t exit successfully: `sim` (signal: 9, SIGKILL: kill)' "$tmp/pass.log" >"$tmp/oom.log"
+    check "a test process killed for memory fails" "! verdict 101 '$tmp/oom.log' '$tmp/x.md' header >/dev/null"
+    check "it says so" "grep -q 'lack of memory' '$tmp/x.md' && head -n 1 '$tmp/x.md' | grep -q 'test run itself'"
 
     {
         sed -n '1,4p' "$tmp/pass.out"
@@ -296,6 +343,7 @@ EOF
     check "the end of the log has the replay" \
         "grep -q '^sim-long:   replay: HIK_F2B_SIM_SEED=9 cargo test --test sim -- --nocapture$' '$tmp/fail.end'"
     check "the summary says FAILED" "grep -q '^## Long simulation: FAILED$' '$tmp/fail.md'"
+    check "a violation is not a failure of the run" "! grep -q 'test run itself' '$tmp/fail.md' '$tmp/fail.end'"
     check "the summary has both seeds" "grep -q '^### Seed 4, class Clock$' '$tmp/fail.md' && grep -q '^### Seed 9, class Clock$' '$tmp/fail.md'"
     check "the summary has the replay" "grep -qx 'HIK_F2B_SIM_SEED=4 cargo test --test sim -- --nocapture' '$tmp/fail.md'"
 
@@ -304,6 +352,47 @@ EOF
         "'sim_clock'" >"$tmp/panic.log"
     check "a panic without a report fails" "! verdict 101 '$tmp/panic.log' '$tmp/panic.md' header >/dev/null"
     check "its summary shows the panic" "grep -q 'called .Result::unwrap()' '$tmp/panic.md'"
+
+    # A thread that the system refuses to start, outside the scenarios: the
+    # classes fail without a violation report (as with 4000 seeds per class
+    # before a dropped harness ended its fakes' threads).
+    local spawn='failed to spawn thread: Os { code: 11, kind: WouldBlock, message: "Resource temporarily unavailable" }'
+    {
+        sed -n '1,3p' "$tmp/pass.out"
+        cat <<EOF
+thread '<unnamed>' panicked at library/std/src/thread/functions.rs:131:29:
+$spawn
+note: run with \`RUST_BACKTRACE=1\` environment variable to display a backtrace
+$ts INFO nvr1: first run
+test sim_firewall ... FAILED
+test sim_backlog ... FAILED
+
+failures:
+
+---- sim_firewall stdout ----
+
+thread 'sim_firewall' panicked at tests/support/fake.rs:575:5:
+$spawn
+
+failures:
+    sim_backlog
+    sim_firewall
+
+test result: FAILED. 3 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 120.00s
+
+EOF
+    } | filter_log >"$tmp/spawn.log"
+    check "a failed spawn fails" "! verdict 101 '$tmp/spawn.log' '$tmp/spawn.md' header >'$tmp/spawn.end'"
+    check "it has no violation" "[ -z \"\$(violations '$tmp/spawn.log')\" ]"
+    check "its first line: a failure of the run" \
+        "head -n 1 '$tmp/spawn.md' | grep -qx '## Long simulation: FAILED: the test run itself failed, not a finding about the engine'"
+    check "its reason" "grep -qx '\*\*the test failed (exit 101) without a violation report\*\*' '$tmp/spawn.md'"
+    sed -n '/^First panic message:$/,/^~~~~$/p' "$tmp/spawn.md" | sed -n '4,$p' | sed '$d' >"$tmp/spawn.first"
+    printf '%s\n%s\n%s\n' "thread '<unnamed>' panicked at library/std/src/thread/functions.rs:131:29:" \
+        "$spawn" 'note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace' >"$tmp/spawn.want"
+    check "the first panic message, in the summary" "cmp -s '$tmp/spawn.first' '$tmp/spawn.want'"
+    check "the console says so too" \
+        "grep -qx 'sim-long: FAILED: the test run itself failed, not a finding about the engine: the test failed (exit 101) without a violation report' '$tmp/spawn.end' && grep -qxF 'sim-long:   $spawn' '$tmp/spawn.end'"
 
     if [ "$errors" -gt 0 ]; then
         echo "self-test: $errors check(s) failed" >&2

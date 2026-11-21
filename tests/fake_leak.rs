@@ -15,6 +15,7 @@ use fake::{Harness, Opts, ATTACKER};
 use hik_f2b::util;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::time::{Duration, Instant};
 
 /// Harnesses created and dropped.
 const HARNESSES: usize = 200;
@@ -119,10 +120,15 @@ fn dropped_harnesses_release_their_threads_and_listeners() {
         fake::peak_threads()
     );
     if let Some(base) = base {
-        assert_eq!(
-            os_threads(),
-            Some(base),
-            "threads of the process after the drops"
-        );
+        // A joined thread can still be listed for a moment: the kernel
+        // wakes the join before it has removed the thread. Wait for that,
+        // for at most a few seconds (200 leaked threads would not go away).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut now = os_threads();
+        while now != Some(base) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+            now = os_threads();
+        }
+        assert_eq!(now, Some(base), "threads of the process after the drops");
     }
 }

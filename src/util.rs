@@ -75,10 +75,22 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146097 + doe - 719468
 }
 
-/// Finds the first `YYYY-MM-DD[T ]HH:MM:SS` in the text and returns it as
-/// seconds. NVR timestamps are the device's local wall clock, whatever
-/// suffix they carry; they are only ever compared with each other and with
-/// the device's own clock, so the time zone never matters.
+fn days_in_month(y: i64, m: i64) -> i64 {
+    match m {
+        2 if (y % 4 == 0 && y % 100 != 0) || y % 400 == 0 => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+/// Finds the first `YYYY-MM-DD[T ]HH:MM:SS` in the text that is a real date
+/// from 1970 on and returns it as seconds. NVR timestamps are the device's
+/// local wall clock, whatever suffix they carry; they are only ever compared
+/// with each other and with the device's own clock, so the time zone never
+/// matters. Dates that do not exist (`2026-02-31`) are not times. Neither
+/// are times before 1970: the state file holds no negative time (see
+/// `state::MAX_TIME` for the other end).
 pub fn parse_ts(text: &str) -> Option<i64> {
     let b = text.as_bytes();
     if b.len() < 19 {
@@ -102,10 +114,21 @@ pub fn parse_ts(text: &str) -> Option<i64> {
         };
         let (y, mo, d) = (n(0, 4), n(5, 7), n(8, 10));
         let (h, mi, s) = (n(11, 13), n(14, 16), n(17, 19));
-        if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || s > 60 {
+        if y < 1970
+            || !(1..=12).contains(&mo)
+            || !(1..=days_in_month(y, mo)).contains(&d)
+            || h > 23
+            || mi > 59
+            || s > 60
+        {
             continue;
         }
-        return Some(days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s);
+        let t = days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + s;
+        if t > crate::state::MAX_TIME {
+            // 9999-12-31T23:59:60
+            continue;
+        }
+        return Some(t);
     }
     None
 }
@@ -160,11 +183,47 @@ pub fn is_name(text: &str, max: usize) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
 }
 
-/// Printable ASCII only, at most `max` characters.
+/// Printable ASCII only, at most `max` characters. For text that reaches the
+/// router (address-list comments), HTTP headers, and the user name wherever
+/// it is shown.
 pub fn sanitize(text: &str, max: usize) -> String {
     text.chars()
         .take(max)
         .map(|c| if (' '..='~').contains(&c) { c } else { '?' })
+        .collect()
+}
+
+/// Unicode characters that change how the text around them is shown
+/// without being visible: line and paragraph separators, bidirectional
+/// controls (which can make a line read differently from what it holds) and
+/// zero-width characters.
+fn invisible(c: char) -> bool {
+    matches!(
+        c,
+        '\u{61c}'
+            | '\u{200b}'..='\u{200f}'
+            | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206f}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+    )
+}
+
+/// At most `max` characters for the hik-f2b log or an error message for the
+/// operator: control and invisible characters (`invisible`) become `?`,
+/// other Unicode stays, so a path with Cyrillic letters is shown as it is. Not for text that reaches the router or an HTTP header: use
+/// `sanitize` for that.
+pub fn printable(text: &str, max: usize) -> String {
+    text.chars()
+        .take(max)
+        .map(|c| {
+            if c.is_control() || invisible(c) {
+                '?'
+            } else {
+                c
+            }
+        })
         .collect()
 }
 
@@ -268,6 +327,69 @@ mod tests {
             parse_ts("2026-11-18T20:14:25").unwrap() - parse_ts("2026-11-17T20:14:25").unwrap(),
             86400
         );
+    }
+
+    #[test]
+    fn impossible_and_early_dates_are_not_times() {
+        for text in [
+            "2026-02-29T00:00:00",
+            "2026-02-31T00:00:00",
+            "2026-04-31T00:00:00",
+            "1900-02-29T00:00:00",
+            "2026-00-10T00:00:00",
+            "2026-01-00T00:00:00",
+            "2026-01-10T24:00:00",
+            "1969-12-31T23:59:59",
+            "0000-01-01T00:00:00",
+            "9999-12-31T23:59:60",
+        ] {
+            assert_eq!(parse_ts(text), None, "{}", text);
+        }
+        for (text, shown) in [
+            ("2024-02-29T12:00:00", "2024-02-29T12:00:00Z"),
+            ("2000-02-29T12:00:00", "2000-02-29T12:00:00Z"),
+            ("2026-04-30T23:59:59", "2026-04-30T23:59:59Z"),
+            ("2026-12-31T23:59:59", "2026-12-31T23:59:59Z"),
+            ("9999-12-31T23:59:59", "9999-12-31T23:59:59Z"),
+        ] {
+            assert_eq!(
+                parse_ts(text).map(fmt_ts).as_deref(),
+                Some(shown),
+                "{}",
+                text
+            );
+        }
+        assert_eq!(
+            parse_ts("9999-12-31T23:59:59"),
+            Some(crate::state::MAX_TIME)
+        );
+        // an impossible date is passed over, the next real one is found
+        assert_eq!(
+            parse_ts("2026-02-30T10:00:00 / 2026-03-01T10:00:00").map(fmt_ts),
+            Some("2026-03-01T10:00:00Z".to_string())
+        );
+        // a leap second is the next second
+        assert_eq!(
+            parse_ts("2026-06-30T23:59:60"),
+            parse_ts("2026-07-01T00:00:00")
+        );
+    }
+
+    #[test]
+    fn printable_keeps_unicode_but_not_controls() {
+        let path = "/srv/\u{43a}\u{430}\u{43c}\u{435}\u{440}\u{438}/hik-f2b.ini";
+        assert_eq!(printable(path, 300), path);
+        assert_eq!(sanitize(path, 300), "/srv/??????/hik-f2b.ini");
+        assert_eq!(
+            printable("a\nb\r\u{1b}[2J\u{7f}\u{9b}c\t", 100),
+            "a?b??[2J??c?"
+        );
+        // bidirectional, zero-width and line-separator characters
+        assert_eq!(
+            printable("x\u{202e}y\u{2066}z\u{200b}w\u{2028}v\u{feff}u\u{61c}", 100),
+            "x?y?z?w?v?u?"
+        );
+        assert_eq!(printable("\u{442}\u{442}\u{442}", 2), "\u{442}\u{442}");
     }
 
     #[test]

@@ -40,6 +40,13 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   not stop now says why it may not have (the error of the connection that
   wakes it, failed accepts, the state of the table).
 
+### Security
+
+- The `url` crate, which hik-f2b uses through its HTTP client, is updated
+  from 2.5.8 to 2.5.9 for RUSTSEC-2026-0592 (a stack overflow in
+  `Url::origin()` on nested `blob:` URLs). hik-f2b itself does not call that
+  function, and its URLs come only from the config.
+
 ## [0.4.0] - 2026-11-21
 
 ### Fixed

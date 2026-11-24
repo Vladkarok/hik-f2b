@@ -71,3 +71,20 @@ Before a release, also run
   release candidate on real hardware first.
 - There is no automatic deployment, by design: hik-f2b changes a firewall,
   so an update is a step that a person takes and watches.
+
+## Agent skills
+
+### Issue tracker
+
+Issues and specs are Markdown files under `.scratch/`, which Git ignores.
+See `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+The five default triage roles, written as `Status:` in each issue file. See
+`docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: `GLOSSARY.md` and `docs/adr/` at the repository root. See
+`docs/agents/domain.md`.

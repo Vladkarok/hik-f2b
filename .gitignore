@@ -12,3 +12,6 @@ state.tmp
 
 # Local agent worktrees and tool state.
 /.claude/
+
+# Local issues and specs (docs/agents/issue-tracker.md); never published.
+/.scratch/

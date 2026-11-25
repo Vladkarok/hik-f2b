@@ -3214,3 +3214,390 @@ fn check_reports_the_country_database() {
     assert!(failed.detail.starts_with("cannot read "), "{}", failed);
     assert_eq!(h.fake.lock().unwrap().tg_attempts, 0);
 }
+
+// ------------------------------------------------------ one-shot commands
+
+/// Runs hik-f2b with `ini` as its config and `args`: the exit code, stdout
+/// and stderr.
+fn hik_f2b(h: &Harness, ini: &str, args: &[&str]) -> (Option<i32>, String, String) {
+    let path = h.dir.join("one-shot.ini");
+    std::fs::write(&path, ini).unwrap();
+    // Not readable by others, or a warning about the inline secrets would
+    // come first.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_hik-f2b"))
+        .arg("--config")
+        .arg(&path)
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+/// The URL of `nvr` in the harness's config.
+fn nvr_url(h: &Harness, nvr: &str) -> String {
+    let section = format!("[nvr:{}]\nurl = ", nvr);
+    let at = h.ini.find(&section).unwrap() + section.len();
+    h.ini[at..].lines().next().unwrap().to_string()
+}
+
+/// What `--dump` prints, exactly: entries that match `log_filter` and
+/// others, and an NVR that cannot be read, on stderr.
+#[test]
+fn dump_prints_the_log_of_each_nvr() {
+    let h = Harness::build(Opts {
+        second_nvr: true,
+        ..Default::default()
+    });
+    h.add("09:30:00", ATTACKER);
+    h.add_full("09:40:00", OWNER, "operator", "remoteLogin");
+    h.fake2.as_ref().unwrap().lock().unwrap().nvr_auth_ok = false;
+    let out = hik_f2b(&h, &h.ini, &["--dump", "--hours", "2"]);
+    assert_eq!(
+        out,
+        (
+            Some(1),
+            format!(
+                "=== nvr1 ({})\n\
+                 device time: 2026-01-10T10:00:00Z\n\
+                 2 entries with metaId log.std-cgi.com/Exception in the last 2 h\n\
+                 MATCH  2026-01-10T09:30:00Z  ip=198.51.100.7    user=\"admin\"            \
+                 log.hikvision.com/Exception/illlegealAccess\n\
+                 \x20      2026-01-10T09:40:00Z  ip=203.0.113.20    user=\"operator\"         \
+                 log.hikvision.com/Exception/remoteLogin\n\
+                 === nvr2 ({})\n",
+                nvr_url(&h, "nvr1"),
+                nvr_url(&h, "nvr2")
+            ),
+            "ERROR: nvr2: HTTP 401\nhik-f2b: 1 of 2 NVR(s) could not be read\n".to_string()
+        )
+    );
+    // nothing is banned
+    assert_eq!(h.fake.lock().unwrap().router_requests, 0);
+
+    // with the raw XML of each page
+    let h = Harness::build(Opts {
+        mikrotik: false,
+        ..Default::default()
+    });
+    h.add("09:30:00", ATTACKER);
+    let out = hik_f2b(&h, &h.ini, &["--dump", "--raw", "--hours", "1"]);
+    let xml = [
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" ?>",
+        "<CMSearchResult version=\"1.0\" xmlns=\"http://www.hikvision.com/ver20/XMLSchema\">",
+        "<searchID>{x}</searchID>",
+        "<responseStatus>true</responseStatus>",
+        "<responseStatusStrg>OK</responseStatusStrg>",
+        "<numOfMatches>1</numOfMatches>",
+        "<matchList>",
+        "<searchMatchItem>",
+        "<logDescriptor>",
+        "<metaId>log.hikvision.com/Exception/illlegealAccess</metaId>",
+        "<StartDateTime>2026-01-10T09:30:00Z</StartDateTime>",
+        "<paraType></paraType>",
+        "<userName>admin</userName>",
+        "<ipAddress>198.51.100.7</ipAddress>",
+        "</logDescriptor>",
+        "</searchMatchItem>",
+        "</matchList>",
+        "</CMSearchResult>",
+        "",
+    ]
+    .join("\n");
+    assert_eq!(
+        out,
+        (
+            Some(0),
+            format!(
+                "=== nvr1 ({})\n\
+                 device time: 2026-01-10T10:00:00Z\n\
+                 {}\n\
+                 1 entries with metaId log.std-cgi.com/Exception in the last 1 h\n\
+                 MATCH  2026-01-10T09:30:00Z  ip=198.51.100.7    user=\"admin\"            \
+                 log.hikvision.com/Exception/illlegealAccess\n",
+                nvr_url(&h, "nvr1"),
+                xml
+            ),
+            String::new()
+        )
+    );
+}
+
+/// What `--check` prints, exactly, and its exit status. The device clock
+/// is set to the real host clock here, as the binary compares the two.
+#[test]
+fn check_prints_one_line_per_item() {
+    let mut h = Harness::build(Opts {
+        telegram: true,
+        second_nvr: true,
+        ..Default::default()
+    });
+    h.fake2.as_ref().unwrap().lock().unwrap().nvr_auth_ok = false;
+    let start = util::unix_now() as i64;
+    h.set_host(start);
+    Harness::add_at(&h.fake, &device(start + SKEW - 600), ATTACKER);
+    Harness::add_at(&h.fake, &device(start + SKEW - 300), ATTACKER);
+    let (code, stdout, stderr) = hik_f2b(&h, &h.ini, &["--check"]);
+    let end = util::unix_now() as i64;
+    assert_eq!(
+        (code, stderr.as_str()),
+        (Some(1), "hik-f2b: 1 check(s) failed\n")
+    );
+    // the host clock may have moved on by a second or two
+    let expected = |host: i64| {
+        let ahead = start + SKEW - host;
+        format!(
+            "ok       nvr nvr1: login accepted, device time {} ({}:{:02}:{:02} ahead of the host \
+             clock), log search works\n\
+             ok       nvr nvr1 log: oldest first, page size not known (2 entries read from the \
+             last 24 h)\n\
+             FAILED   nvr nvr2: login rejected (HTTP 401)\n\
+             ok       firewall: 1 enabled rule(s) in /ip/firewall/raw with \
+             src-address-list=cctv_ban\n\
+             ok       telegram: configured, health alerts on; nothing sent (see --test-notify)\n\
+             off      country database: not configured\n",
+            util::fmt_ts(start + SKEW),
+            ahead / 3600,
+            ahead / 60 % 60,
+            ahead % 60
+        )
+    };
+    assert!(
+        (start..=end).any(|host| stdout == expected(host)),
+        "{}\n{}",
+        stdout,
+        expected(start)
+    );
+    // nothing banned or sent
+    assert!(h.banned().is_empty());
+    assert_eq!(h.fake.lock().unwrap().tg_attempts, 0);
+
+    // all well: exit status 0
+    let h = Harness::build(Opts {
+        mikrotik: false,
+        ..Default::default()
+    });
+    let (code, stdout, stderr) = hik_f2b(&h, &h.ini, &["--check"]);
+    assert_eq!((code, stderr.as_str()), (Some(0), ""));
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 5, "{}", stdout);
+    assert!(
+        lines[0]
+            .starts_with("ok       nvr nvr1: login accepted, device time 2026-01-10T10:00:00Z ("),
+        "{}",
+        lines[0]
+    );
+    assert!(
+        lines[0].ends_with(" behind the host clock), log search works"),
+        "{}",
+        lines[0]
+    );
+    assert_eq!(
+        lines[1..],
+        [
+            "ok       nvr nvr1 log: order not known, page size not known (0 entries read from \
+             the last 24 h)",
+            "off      firewall: not configured (notify-only mode)",
+            "off      telegram: not configured",
+            "off      country database: not configured",
+        ]
+    );
+}
+
+/// What `--test-ban` prints and asks of the router, exactly.
+#[test]
+fn test_ban_prints_what_the_router_did() {
+    let h = Harness::build(Opts::default());
+    assert_eq!(
+        hik_f2b(&h, &h.ini, &["--test-ban", "192.0.2.1"]),
+        (
+            Some(0),
+            "ok: 192.0.2.1 added to MikroTik address-list cctv_ban (60 s)\n".to_string(),
+            String::new()
+        )
+    );
+    assert_eq!(h.banned(), vec!["192.0.2.1"]);
+    assert_eq!(
+        h.fake.lock().unwrap().ban_bodies,
+        vec![
+            "{\"list\":\"cctv_ban\",\"address\":\"192.0.2.1\",\"timeout\":\"00:01:00\",\
+             \"comment\":\"hik-f2b test\"}"
+        ]
+    );
+    assert_eq!(
+        hik_f2b(&h, &h.ini, &["--test-ban", "192.0.2.1"]),
+        (
+            Some(0),
+            "ok: 192.0.2.1 is already in MikroTik address-list cctv_ban (60 s)\n".to_string(),
+            String::new()
+        )
+    );
+    h.fake.lock().unwrap().router_down = true;
+    assert_eq!(
+        hik_f2b(&h, &h.ini, &["--test-ban", "192.0.2.2"]),
+        (
+            Some(1),
+            String::new(),
+            "hik-f2b: the firewall answers with an error: HTTP 500: \
+             {\"error\":500,\"message\":\"down\"}\n"
+                .to_string()
+        )
+    );
+    let h = Harness::build(Opts {
+        mikrotik: false,
+        ..Default::default()
+    });
+    assert_eq!(
+        hik_f2b(&h, &h.ini, &["--test-ban", "192.0.2.1"]),
+        (
+            Some(1),
+            String::new(),
+            "hik-f2b: --test-ban needs a firewall, but there is no [mikrotik] section in the \
+             config\n"
+                .to_string()
+        )
+    );
+}
+
+/// What `--test-notify` prints and sends, exactly.
+#[test]
+fn test_notify_prints_whether_the_message_was_sent() {
+    let h = Harness::build(Opts {
+        telegram: true,
+        ..Default::default()
+    });
+    assert_eq!(
+        hik_f2b(&h, &h.ini, &["--test-notify"]),
+        (
+            Some(0),
+            "ok: test message sent\n".to_string(),
+            String::new()
+        )
+    );
+    assert_eq!(
+        h.fake.lock().unwrap().tg_sent,
+        vec![
+            "chat_id=-1001234567890&text=hik-f2b+test+message%3A+notifications+work.&\
+             message_thread_id=42"
+        ]
+    );
+    h.fake.lock().unwrap().tg_fail = true;
+    assert_eq!(
+        hik_f2b(&h, &h.ini, &["--test-notify"]),
+        (
+            Some(1),
+            String::new(),
+            "hik-f2b: HTTP 500: {\"ok\":false,\"description\":\"boom at /bot<token>/x\"}\n"
+                .to_string()
+        )
+    );
+    let h = Harness::build(Opts::default());
+    assert_eq!(
+        hik_f2b(&h, &h.ini, &["--test-notify"]),
+        (
+            Some(1),
+            String::new(),
+            "hik-f2b: no [telegram] section in the config\n".to_string()
+        )
+    );
+}
+
+/// Every command sets up the router, Telegram and NVR clients before it
+/// does anything, in that order: a client that cannot be set up fails
+/// every command the same way. The service logs its start first.
+#[test]
+fn every_command_sets_up_all_clients_first() {
+    let h = Harness::build(Opts {
+        telegram: true,
+        ..Default::default()
+    });
+    let nvr_ca = h.dir.join("missing-ca.pem");
+    let nvr_https = h.ini.replace(
+        &format!("[nvr:nvr1]\nurl = http://127.0.0.1:{}", h.port),
+        &format!(
+            "[nvr:nvr1]\nurl = https://127.0.0.1:{}\nca_file = {}",
+            h.port,
+            nvr_ca.display()
+        ),
+    );
+    assert_ne!(nvr_https, h.ini);
+    let router_ca = h.dir.join("router-ca.pem");
+    let both_https = nvr_https.replace(
+        &format!("[mikrotik]\nurl = http://127.0.0.1:{}", h.port),
+        &format!(
+            "[mikrotik]\nurl = https://127.0.0.1:{}\nca_file = {}",
+            h.port,
+            router_ca.display()
+        ),
+    );
+    assert_ne!(both_https, nvr_https);
+    let nvr_error = format!(
+        "hik-f2b: nvr nvr1: cannot read CA file {}: entity not found\n",
+        nvr_ca.display()
+    );
+    let router_error = format!(
+        "hik-f2b: mikrotik: cannot read CA file {}: entity not found\n",
+        router_ca.display()
+    );
+    for args in [
+        &["--check"][..],
+        &["--dump"],
+        &["--test-ban", "192.0.2.1"],
+        &["--test-notify"],
+    ] {
+        assert_eq!(
+            hik_f2b(&h, &nvr_https, args),
+            (Some(1), String::new(), nvr_error.clone()),
+            "{:?}",
+            args
+        );
+        assert_eq!(
+            hik_f2b(&h, &both_https, args),
+            (Some(1), String::new(), router_error.clone()),
+            "{:?}",
+            args
+        );
+    }
+    // the service: the start is logged, then the NVR client fails
+    let without_time = |stdout: &str| -> Vec<String> {
+        stdout
+            .lines()
+            .map(|line| line.split_once(' ').unwrap().1.to_string())
+            .collect()
+    };
+    let no_state = format!(
+        "INFO no state file at {} yet: starting with an empty state",
+        h.dir.join("state").display()
+    );
+    let (code, stdout, stderr) = hik_f2b(&h, &nvr_https, &["--once"]);
+    assert_eq!((code, stderr), (Some(1), nvr_error));
+    assert_eq!(
+        without_time(&stdout),
+        [
+            no_state.clone(),
+            format!(
+                "INFO hik-f2b {} started: 1 NVR(s), maxretry=5 findtime=3600s bantime=86400s \
+                 telegram=on",
+                env!("CARGO_PKG_VERSION")
+            ),
+            "INFO mode: ban on MikroTik, address-list cctv_ban".to_string(),
+        ]
+    );
+    // ... and a router client that fails comes before the start
+    let (code, stdout, stderr) = hik_f2b(&h, &both_https, &["--once"]);
+    assert_eq!((code, stderr), (Some(1), router_error));
+    assert_eq!(without_time(&stdout), [no_state]);
+    let f = h.fake.lock().unwrap();
+    assert_eq!(
+        (f.isapi_requests, f.rest_requests, f.tg_attempts),
+        (0, 0, 0)
+    );
+}

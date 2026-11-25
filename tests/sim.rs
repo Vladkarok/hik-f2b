@@ -36,6 +36,12 @@
 //! forged entry would have. In the classes with a router, `OWN` is also put
 //! into the address-list by an outside hand now and then.
 //!
+//! In the classes with a router, half of the scenarios have the safe list
+//! `SAFE` (`safe_list`), four in five of them with its accept rule above the
+//! drop rule. Whether a scenario has them is drawn from a generator of its
+//! own, so a seed gives the same events with and without them. The fake
+//! router expires an entry of the safe list when its timeout has passed.
+//!
 //! Every scenario starts with failed logins already in the logs (some within
 //! `lookback` before the first start), may start with an NVR unreachable, and
 //! ends with a settle phase: router and NVRs back, then polls until no ban is
@@ -113,6 +119,22 @@
 //!   fails while the router answers its checks. `own/only` (all): every
 //!   request to remove an address-list entry is for `OWN`, and the router
 //!   removes one only where a removal is logged.
+//! - `safe/only` (all with a router): every write to the safe list is for
+//!   `OWN`, to `SAFE`, and the safe list never holds anything else.
+//!   `safe/off` (all): without `safe_list`, no write to any list but the
+//!   address-list, no request that names another list or reads a whole
+//!   table of rules, no `PATCH`, and no line about a safe list.
+//!   `safe/dry` (`DryRun`): nothing is written to the safe list, and the
+//!   first check that the router answers after each engine start says what
+//!   it would write (one line), no later one. `safe/kept` (`Firewall`,
+//!   `Backlog`, `Clock`): at each firewall check that the router answers,
+//!   one write for `OWN`: an entry that is there is renewed, one that is
+//!   not is added (never a duplicate); while the router refuses writes, it
+//!   is refused with an ERROR. After a check that the router answers and
+//!   that is not refused, `OWN` has one entry, with a timeout that outlives
+//!   three checks. No write in a check that the router does not answer,
+//!   and none between checks. The rule check fails (one line) at each such
+//!   check exactly when the scenario has no accept rule.
 //! - `health/model` (all): the health notices of each cycle are exactly the
 //!   ones the documented policy gives for what the engine observed (failed
 //!   and successful polls, ban attempts, firewall checks, the rate limit,
@@ -120,7 +142,9 @@
 //!   is over once none has for `alert_after` while every NVR is read; none
 //!   is such an address within `STARTUP_GRACE` after an engine start; an own
 //!   address that a check that answered finds listed and cannot remove,
-//!   which is over at the first such check that leaves none listed):
+//!   which is over at the first such check that leaves none listed; with
+//!   the safe list, the missing rule at each check that answered, and a
+//!   write the router refuses, which only a write that works ends):
 //!   alert once after `alert_after`, reminder after 24 h, one recovery or
 //!   "unknown" when an alerted problem ends, nothing for a short one, state
 //!   lost on restart. `health/condition` (all): an unreachable firewall is
@@ -212,6 +236,10 @@ const OWN: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 200);
 const OWN_TEXT: &str = "192.0.2.200";
 /// The user name hik-f2b logs in with (`support/fake.rs`).
 const OWN_USER: &str = "f2b";
+/// The safe list of the scenarios that have one.
+const SAFE: &str = "cctv_safe";
+/// The interval of the periodic firewall check (`health::HEALTH_CHECK_INTERVAL`).
+const CHECK_EVERY: i64 = 300;
 const FAIL: &str = "illlegealAccess";
 const OTHER: &str = "videoLost/30";
 const NOTICES: [(&str, &str); 4] = [
@@ -552,6 +580,15 @@ enum Line {
     OwnStuck(Ipv4Addr),
     /// The look-up of an own address failed.
     OwnAskFailed,
+    /// A line about a safe list: what a dry run would write, an address
+    /// added, a write that failed, a rule check that passed or failed, or
+    /// anything else that names it.
+    SafeDry(Ipv4Addr),
+    SafeAdded(Ipv4Addr),
+    SafeWriteFailed(Ipv4Addr),
+    SafeRuleOk,
+    SafeRuleFailed,
+    SafeOther,
     Other,
 }
 
@@ -614,6 +651,28 @@ fn classify(line: &str) -> Line {
     }
     if text.starts_with("cannot ask ") && text.contains(" whether own address ") {
         return Line::OwnAskFailed;
+    }
+    if let Some(ip) = address_after(text, "cannot write own address ") {
+        return Line::SafeWriteFailed(ip);
+    }
+    if let Some(ip) = address_after(text, "DRY RUN: would keep ") {
+        return Line::SafeDry(ip);
+    }
+    if text.starts_with("safe list check failed: ") {
+        return Line::SafeRuleFailed;
+    }
+    if text.starts_with("safe list check ok: ") {
+        return Line::SafeRuleOk;
+    }
+    if let Some((ip, rest)) = text.split_once(' ') {
+        if rest.starts_with("added to the safe list ") {
+            if let Ok(ip) = ip.parse() {
+                return Line::SafeAdded(ip);
+            }
+        }
+    }
+    if text.contains("safe list") {
+        return Line::SafeOther;
     }
     if let Some(rest) = text.strip_prefix("DRY RUN: ") {
         if let Some((ip, rest)) = rest.split_once(' ') {
@@ -694,6 +753,68 @@ fn ban_notice(body: &str) -> Option<Ipv4Addr> {
     let text = fake::text_of(body);
     let rest = text.strip_prefix("\u{26d4} hik-f2b: ")?;
     rest.split(' ').next()?.parse().ok()
+}
+
+/// What a firewall check did about the safe list, from the lines of one
+/// cycle (or engine start).
+#[derive(Default)]
+struct SafeSeen {
+    dry: usize,
+    added: usize,
+    failed: usize,
+    rule_failed: usize,
+    other: usize,
+}
+
+impl SafeSeen {
+    /// Takes one classified line; `safe/only` for one about another address
+    /// than `OWN`.
+    fn see(&mut self, line: &Line) -> Result<(), String> {
+        let ip = match line {
+            Line::SafeDry(ip) => {
+                self.dry += 1;
+                ip
+            }
+            Line::SafeAdded(ip) => {
+                self.added += 1;
+                ip
+            }
+            Line::SafeWriteFailed(ip) => {
+                self.failed += 1;
+                ip
+            }
+            Line::SafeRuleOk => return Ok(()),
+            Line::SafeRuleFailed => {
+                self.rule_failed += 1;
+                return Ok(());
+            }
+            Line::SafeOther => {
+                self.other += 1;
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        if *ip != OWN {
+            return Err(format!("[safe/only] a line about {} in the safe list", ip));
+        }
+        Ok(())
+    }
+
+    fn any(&self) -> bool {
+        self.dry + self.added + self.failed + self.rule_failed + self.other > 0
+    }
+}
+
+/// The safe list of a scenario that has one.
+struct SafeSim {
+    /// The accept rule is there, above the drop rule.
+    rule: bool,
+    /// When the fake router expires the entry of `OWN`.
+    until: Option<i64>,
+    /// The engine running now has said what a dry run would write.
+    dry_said: bool,
+    /// Writes the router accepted.
+    writes: usize,
 }
 
 /// The lines of one cycle (or engine start) about own addresses.
@@ -809,6 +930,8 @@ struct Sim {
     /// Removals of `OWN` and reports of it in a dry run.
     own_removed: usize,
     own_kept: usize,
+    /// The safe list, if the scenario has one.
+    safe: Option<SafeSim>,
     trace: Vec<String>,
 }
 
@@ -822,14 +945,34 @@ impl Sim {
             nets.push(OWNER_NET.to_string());
         }
         let general: &'static str = Box::leak(p.general(&nets).into_boxed_str());
+        // Drawn apart from the scenario: the same seed gives the same events
+        // with and without a safe list.
+        let mut own_rng = Rng::new(seed ^ 0x5afe_5afe_5afe_5afe);
+        let safe = (class != Class::NotifyOnly && own_rng.chance(50)).then(|| SafeSim {
+            rule: own_rng.chance(80),
+            until: None,
+            dry_said: false,
+            writes: 0,
+        });
         let h = Harness::build(Opts {
             telegram: true,
             mikrotik: class != Class::NotifyOnly,
             second_nvr: p.nvrs == 2,
             general,
+            mikrotik_extra: if safe.is_some() {
+                "safe_list = cctv_safe"
+            } else {
+                ""
+            },
             own: OWN,
             ..Default::default()
         });
+        if safe.as_ref().is_some_and(|s| s.rule) {
+            h.fake.lock().unwrap().rules = vec![
+                fake::Rule::accept("raw", SAFE),
+                fake::Rule::new("raw", "cctv_ban", false),
+            ];
+        }
         let nvr = (0..p.nvrs)
             .map(|n| NvrSim {
                 name: format!("nvr{}", n + 1),
@@ -871,6 +1014,7 @@ impl Sim {
             own_notices: 0,
             own_removed: 0,
             own_kept: 0,
+            safe,
             trace: Vec::new(),
         }
     }
@@ -981,6 +1125,18 @@ impl Sim {
         self.note(text);
         let text = ignore_line(&self.nets);
         self.note(text);
+        if let Some(s) = &self.safe {
+            let text = format!(
+                "safe list {}, {}",
+                SAFE,
+                if s.rule {
+                    "accept rule above the drop rule"
+                } else {
+                    "no accept rule"
+                }
+            );
+            self.note(text);
+        }
         for n in 0..self.p.nvrs {
             let percent = if self.p.class == Class::Backlog {
                 60
@@ -1026,20 +1182,25 @@ impl Sim {
         // as `main.rs` starts the service
         self.h.engine.startup_own();
         let listed = self.listed(OWN_TEXT);
+        self.expire_safe();
+        let safe_before = self.safe_listed();
         self.h.engine.startup_check(self.host as u64);
-        self.startup_lines(listed)?;
+        self.startup_lines(listed, safe_before)?;
         self.note("first poll".to_string());
         self.cycle()
     }
 
     /// The log of an engine start: the firewall check, and the look-up of
     /// the own address that follows it when the router answers.
-    fn startup_lines(&mut self, listed_before: bool) -> Result<(), String> {
+    fn startup_lines(&mut self, listed_before: bool, safe_before: bool) -> Result<(), String> {
         let lines = util::captured_log();
         let mut own = OwnSeen::default();
+        let mut safe = SafeSeen::default();
         own.deletes(&self.h.fake)?;
         for line in &lines {
-            match classify(line) {
+            let line = classify(line);
+            safe.see(&line)?;
+            match line {
                 Line::CheckFailed => {
                     if self.router != Router::Unreachable {
                         return Err(format!(
@@ -1054,7 +1215,164 @@ impl Sim {
             }
         }
         let answered = self.p.class != Class::NotifyOnly && self.router != Router::Unreachable;
+        self.safe_checked(answered, safe_before, &safe)?;
         self.own_swept(answered, listed_before, &own)
+    }
+
+    /// Whether the safe list has an entry for `OWN`.
+    fn safe_listed(&self) -> bool {
+        let f = self.h.fake.lock().unwrap();
+        f.listed.iter().any(|e| e.address == OWN_TEXT)
+    }
+
+    /// Removes the entry of `OWN` from the safe list once its timeout has
+    /// passed, as the router does.
+    fn expire_safe(&mut self) {
+        let now = self.host;
+        if let Some(s) = &mut self.safe {
+            if s.until.is_some_and(|until| until <= now) {
+                s.until = None;
+                self.h
+                    .fake
+                    .lock()
+                    .unwrap()
+                    .listed
+                    .retain(|e| e.list != SAFE);
+            }
+        }
+    }
+
+    /// See `safe/only`, `safe/off`, `safe/dry` and `safe/kept` in the module
+    /// comment: what a firewall check (`answered`: the router answered it),
+    /// or a cycle without one, must have done about the safe list, which
+    /// held an entry for `OWN` before it or not (`had`), given the lines
+    /// `seen` of the engine.
+    fn safe_checked(&mut self, answered: bool, had: bool, seen: &SafeSeen) -> Result<(), String> {
+        let (writes, listed, requests) = {
+            let mut f = self.h.fake.lock().unwrap();
+            (
+                std::mem::take(&mut f.safe_log),
+                f.listed.clone(),
+                std::mem::take(&mut f.rest_log),
+            )
+        };
+        for (list, address, outcome) in &writes {
+            if list != SAFE || address != OWN_TEXT {
+                return Err(format!(
+                    "[safe/only] a write of {} to {} ({})",
+                    address, list, outcome
+                ));
+            }
+        }
+        for entry in &listed {
+            if entry.list != SAFE || entry.address != OWN_TEXT {
+                return Err(format!(
+                    "[safe/only] {} holds {}",
+                    entry.list, entry.address
+                ));
+            }
+        }
+        let dry = self.p.class == Class::DryRun;
+        let router = self.router;
+        let host = self.host;
+        let Some(s) = &mut self.safe else {
+            if !writes.is_empty() || !listed.is_empty() || seen.any() {
+                return Err(format!(
+                    "[safe/off] without a safe list: writes {:?}, entries {:?}, {} line(s)",
+                    writes,
+                    listed,
+                    seen.dry + seen.added + seen.failed + seen.rule_failed + seen.other
+                ));
+            }
+            for request in &requests {
+                let rules = request.contains("/rest/ip/firewall/raw")
+                    || request.contains("/rest/ip/firewall/filter");
+                if request.starts_with("PATCH")
+                    || request.contains(SAFE)
+                    || (rules && !request.contains("src-address-list=cctv_ban"))
+                {
+                    return Err(format!(
+                        "[safe/off] a request without a safe list: {}",
+                        request
+                    ));
+                }
+            }
+            return Ok(());
+        };
+        if seen.other > 0 {
+            return Err(format!(
+                "[safe/kept] {} line(s) about the safe list that say nothing known",
+                seen.other
+            ));
+        }
+        let rule_failed = usize::from(answered && !s.rule);
+        if seen.rule_failed != rule_failed {
+            return Err(format!(
+                "[safe/kept] {} failed rule check(s) logged, expected {} (answered {}, rule {})",
+                seen.rule_failed, rule_failed, answered, s.rule
+            ));
+        }
+        if answered {
+            if s.rule {
+                self.health.pass("safe-list-rule");
+            } else {
+                self.health.fail("safe-list-rule", host);
+            }
+        }
+        if dry {
+            let said = usize::from(answered && !s.dry_said);
+            if !writes.is_empty() || seen.dry != said || seen.failed > 0 {
+                return Err(format!(
+                    "[safe/dry] writes {:?}, {} line(s) of what it would write, expected {} \
+                     (answered {})",
+                    writes, seen.dry, said, answered
+                ));
+            }
+            s.dry_said |= answered;
+            return Ok(());
+        }
+        let expected: Vec<&str> = match (answered, router) {
+            (false, _) => vec![],
+            (true, Router::Refusing) => vec!["refused"],
+            (true, _) if had => vec!["renewed"],
+            (true, _) => vec!["added"],
+        };
+        let outcomes: Vec<&str> = writes.iter().map(|(_, _, o)| *o).collect();
+        let lines = (seen.added, seen.failed);
+        let expected_lines = (
+            usize::from(expected == ["added"]),
+            usize::from(expected == ["refused"]),
+        );
+        if outcomes != expected || lines != expected_lines {
+            return Err(format!(
+                "[safe/kept] writes {:?}, expected {:?}; (added, failed) lines {:?}, expected \
+                 {:?} (answered {}, router {:?}, listed before {})",
+                outcomes, expected, lines, expected_lines, answered, router, had
+            ));
+        }
+        if !answered || router == Router::Refusing {
+            if answered {
+                self.health.fail("safe-list-refused", host);
+            }
+            return Ok(());
+        }
+        self.health.pass("safe-list-refused");
+        s.writes += 1;
+        let entries: Vec<_> = listed.iter().filter(|e| e.address == OWN_TEXT).collect();
+        let timeout = match entries.as_slice() {
+            [entry] => entry.timeout.as_deref().and_then(seconds),
+            _ => None,
+        };
+        match timeout {
+            Some(t) if t >= 3 * CHECK_EVERY => {
+                s.until = Some(host + t);
+                Ok(())
+            }
+            _ => Err(format!(
+                "[safe/kept] after the check, {} holds {:?} for {}",
+                SAFE, entries, OWN_TEXT
+            )),
+        }
     }
 
     /// See `own/removed`, `own/kept` and `own/notify` in the module comment:
@@ -1375,10 +1693,15 @@ impl Sim {
         // what the engine before knew and had still to send is gone
         self.own_reported = false;
         self.own_notices = 0;
+        if let Some(s) = &mut self.safe {
+            s.dry_said = false;
+        }
         self.h.engine.startup_own();
         let listed = self.listed(OWN_TEXT);
+        self.expire_safe();
+        let safe_before = self.safe_listed();
         self.h.engine.startup_check(self.host as u64);
-        self.startup_lines(listed)
+        self.startup_lines(listed, safe_before)
     }
 
     /// Thousands of entries logged while hik-f2b does not poll.
@@ -1558,6 +1881,8 @@ impl Sim {
             self.unsorted = false;
         }
         self.expire_router();
+        self.expire_safe();
+        let safe_before = self.safe_listed();
         let router = Arc::clone(&self.h.fake);
         let queries = router.lock().unwrap().rule_queries.len();
         let offsets = self.offsets();
@@ -1607,10 +1932,12 @@ impl Sim {
         let mut notified = Vec::new();
         let mut events = Vec::new();
         let mut own = OwnSeen::default();
+        let mut safe = SafeSeen::default();
         own.deletes(&router)?;
         for line in &lines {
             let line = classify(line);
             own.see(&line)?;
+            safe.see(&line)?;
             match line {
                 Line::Counted(n, ip, ts) => {
                     self.on_count(n, ip, ts)?;
@@ -1700,6 +2027,12 @@ impl Sim {
                 | Line::OwnDryRun(_)
                 | Line::OwnStuck(_)
                 | Line::OwnAskFailed
+                | Line::SafeDry(_)
+                | Line::SafeAdded(_)
+                | Line::SafeWriteFailed(_)
+                | Line::SafeRuleOk
+                | Line::SafeRuleFailed
+                | Line::SafeOther
                 | Line::Other => {}
             }
         }
@@ -1732,8 +2065,9 @@ impl Sim {
             self.health.pass("firewall");
             self.health.pass("firewall-rule");
         }
-        // the look-up of the own address follows a check that the router
-        // answered
+        // the write of the safe list and the look-up of the own address
+        // follow a check that the router answered
+        self.safe_checked(checked, safe_before, &safe)?;
         self.own_swept(checked, own_listed, &own)?;
         if own.logins > 0 {
             events.push(format!("{} own failed login(s) not counted", own.logins));
@@ -2172,6 +2506,22 @@ impl Sim {
     }
 }
 
+/// `hh:mm:ss` or `NdHH:MM:SS`, as hik-f2b writes a timeout, in seconds.
+fn seconds(text: &str) -> Option<i64> {
+    let (days, hms) = match text.split_once('d') {
+        Some((d, rest)) => (d.parse::<i64>().ok()?, rest),
+        None => (0, text),
+    };
+    let parts: Vec<i64> = hms
+        .split(':')
+        .map(|p| p.parse().ok())
+        .collect::<Option<_>>()?;
+    match parts.as_slice() {
+        [h, m, s] => Some(days * 86400 + h * 3600 + m * 60 + s),
+        _ => None,
+    }
+}
+
 fn env(name: &str) -> Option<u64> {
     std::env::var(name).ok().and_then(|v| v.trim().parse().ok())
 }
@@ -2222,8 +2572,9 @@ fn run_class(class: Class) {
     let seeds = seeds(class);
     let mut failures = Vec::new();
     // cycles, accepted, listed, reported, alerts, liveness, shifted, bypass
-    // alerts, own address removed, own address reported in a dry run
-    let mut stats = [0usize; 10];
+    // alerts, own address removed, own address reported in a dry run,
+    // scenarios with a safe list, writes to it
+    let mut stats = [0usize; 12];
     for &seed in &seeds {
         let mut sim = Sim::new(seed);
         let result = match catch_unwind(AssertUnwindSafe(|| sim.run())) {
@@ -2253,6 +2604,8 @@ fn run_class(class: Class) {
                 .count(),
             sim.own_removed,
             sim.own_kept,
+            usize::from(sim.safe.is_some()),
+            sim.safe.as_ref().map_or(0, |s| s.writes),
         ];
         for (total, n) in stats.iter_mut().zip(seen) {
             *total += n;
@@ -2268,8 +2621,8 @@ fn run_class(class: Class) {
     let summary = format!(
         "sim {:?}: {} seed(s), {} cycles, {:.1} s, {} violation(s); bans {}, already listed {}, \
          reports {}, health alerts {} (ban-bypassed {}), addresses due for liveness {}, \
-         addresses with a shift {}, own address removed {} (reported in a dry run {}); peak \
-         fake threads {} (at most {}){}",
+         addresses with a shift {}, own address removed {} (reported in a dry run {}), safe \
+         list in {} scenario(s) ({} write(s)); peak fake threads {} (at most {}){}",
         class,
         seeds.len(),
         stats[0],
@@ -2284,6 +2637,8 @@ fn run_class(class: Class) {
         stats[6],
         stats[8],
         stats[9],
+        stats[10],
+        stats[11],
         fake::peak_threads(),
         MAX_FAKE_THREADS,
         conntrack

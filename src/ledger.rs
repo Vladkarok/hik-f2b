@@ -62,7 +62,7 @@ pub fn fail_limits(maxretry: usize) -> (usize, usize) {
 }
 
 /// Addresses that can never be a remote attacker, whatever the log says.
-fn never_ban(ip: Ipv4Addr) -> bool {
+pub fn never_ban(ip: Ipv4Addr) -> bool {
     ip.is_loopback()
         || ip.is_unspecified()
         || ip.is_broadcast()

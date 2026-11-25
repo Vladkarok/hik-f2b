@@ -1180,7 +1180,8 @@ decided in `src/reader.rs`, by one log reader per NVR. The reader gets the
 log through the `LogSource` trait, so its unit tests give it a log in
 memory. Which notifications are sent, retried or dropped, and how long
 hik-f2b waits when Telegram asks it to, is decided in `src/outbox.rs`, the
-outbox.
+outbox. Its unit tests give it a `Notifier` that records in memory what it
+is given.
 
 CI also runs `.github/scripts/repo-guard.sh`, which keeps addresses of real
 devices and other private data out of the repository, and

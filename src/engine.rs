@@ -12,6 +12,10 @@
 //! firewall check and each ban attempt went, how the ban loop ended and when
 //! the poll ends; that module decides which health check this opens or ends
 //! and when it is worth an alert.
+//!
+//! Notifications (about bans and from health) are rendered here and handed
+//! to the outbox (`outbox.rs`) as texts; at the end of the poll the outbox
+//! sends what it can.
 
 use crate::action::{render, BanError, BanInfo, Firewall, HealthError, Notifier};
 use crate::config::{Config, DEFAULT_MESSAGE};
@@ -285,14 +289,14 @@ impl Engine {
         }
     }
 
-    /// Logs the health notices that are due and queues them for the chat.
+    /// Logs the health notices that are due and queues them for the chat
+    /// (the outbox keeps nothing without a notifier).
     fn report_health(&mut self, host_now: u64) {
-        let to_chat = self.outbox.notifier.is_some()
-            && self.cfg.telegram.as_ref().is_none_or(|t| t.health_alerts);
+        let to_chat = self.cfg.telegram.as_ref().is_none_or(|t| t.health_alerts);
         for notice in self.health.due(host_now) {
             log_notice(&notice);
             if to_chat {
-                self.outbox.queue_notification(notice.text());
+                self.outbox.queue(notice.text());
             }
         }
     }
@@ -461,7 +465,7 @@ impl Engine {
             self.periodic_check(host_now);
         }
         self.report_health(host_now);
-        self.outbox.flush_notifications(host_now, &self.stop);
+        self.outbox.send(host_now, &self.stop);
         self.cleanup(host_now);
         if self.stopping() {
             crate::info!(
@@ -606,7 +610,7 @@ impl Engine {
             self.state
                 .ledger
                 .outcome(&Rules::of(&self.cfg), ip, now, outcome);
-            if notify && self.outbox.notifier.is_some() {
+            if notify {
                 // The flag only goes to the chat.
                 let country = code
                     .map(|c| format!(" ({} {})", c.flag(), c))
@@ -624,7 +628,7 @@ impl Engine {
                         findtime: self.cfg.findtime,
                     },
                 );
-                self.outbox.queue_notification(text);
+                self.outbox.queue(text);
             }
         }
         self.health
@@ -637,7 +641,7 @@ impl Engine {
 
     /// Notifications waiting to be sent (for tests and diagnostics).
     pub fn queued_notifications(&self) -> usize {
-        self.outbox.notifications.len()
+        self.outbox.waiting()
     }
 }
 

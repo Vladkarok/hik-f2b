@@ -11,6 +11,7 @@
 use hik_f2b::config::Config;
 use hik_f2b::engine::Engine;
 use hik_f2b::nvr::parse_kv;
+use hik_f2b::outbox::Outbox;
 use hik_f2b::state::State;
 use hik_f2b::util;
 use std::collections::{HashMap, VecDeque};
@@ -1007,7 +1008,7 @@ impl Drop for Harness {
         // blocked reading.
         self.engine.readers.clear();
         self.engine.firewall = None;
-        self.engine.outbox.notifier = None;
+        self.engine.outbox = Outbox::new(None);
         sample_conntrack();
         let deadline = Instant::now() + STOP_TIMEOUT;
         let stuck: Vec<String> = self

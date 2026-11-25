@@ -372,8 +372,7 @@ fn run() -> Result<(), String> {
     if args.test_notify {
         let notifier = engine
             .outbox
-            .notifier
-            .as_ref()
+            .notifier()
             .ok_or_else(|| "no [telegram] section in the config".to_string())?;
         notifier
             .send("hik-f2b test message: notifications work.")

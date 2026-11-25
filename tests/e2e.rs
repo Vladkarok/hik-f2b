@@ -492,8 +492,7 @@ fn telegram_errors_never_reveal_the_token() {
     let err = h
         .engine
         .outbox
-        .notifier
-        .as_ref()
+        .notifier()
         .unwrap()
         .send("x")
         .unwrap_err()

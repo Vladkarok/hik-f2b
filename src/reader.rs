@@ -796,8 +796,8 @@ mod tests {
         }
 
         fn with_findtime(findtime: i64) -> Run {
-            // the DEBUG lines are checked too; no other module's tests
-            // reach a DEBUG line
+            // the DEBUG lines are checked too; the outbox's tests turn them
+            // on as well, and no test needs them off
             util::set_verbose(true);
             let cfg = Config::parse(&format!(
                 "[general]\nfindtime = {}\nlookback = {}\nauth_backoff = {}\n\

@@ -42,6 +42,17 @@
 //! own, so a seed gives the same events with and without them. The fake
 //! router expires an entry of the safe list when its timeout has passed.
 //!
+//! Half of the scenarios, in every class, have the host name `NAME` in
+//! `ignoreip`, whose fixed answer (`own::Fixed`) gives one or both of the
+//! addresses `NAMED`, no IPv4 address, or a failed look-up, and changes now
+//! and then during the scenario. Those scenarios also have failed logins from
+//! the `NAMED` addresses and, with a router, those addresses put into the
+//! address-list by hand. Whether a scenario has the name, and all of these
+//! events, are drawn from a generator of their own, so a seed gives the same
+//! other events with and without it. The model learns what the name
+//! resolves to for the engine from the look-ups that reach the fixed
+//! answers, as the fake router shows what the engine asked of it.
+//!
 //! Every scenario starts with failed logins already in the logs (some within
 //! `lookback` before the first start), may start with an NVR unreachable, and
 //! ends with a settle phase: router and NVRs back, then polls until no ban is
@@ -135,6 +146,25 @@
 //!   three checks. No write in a check that the router does not answer,
 //!   and none between checks. The rule check fails (one line) at each such
 //!   check exactly when the scenario has no accept rule.
+//! - `name/exempt` (all): no ban request, report, ban notification or
+//!   counted failed login for an address while the name resolves to it for
+//!   the engine running now: what the last look-up of that engine that found
+//!   an IPv4 address answered. `name/line` (all): a failed login said to be
+//!   exempt for an `ignoreip` name, and a waiting ban or counted failed
+//!   logins dropped for one, are of such an address and name `NAME`; without
+//!   the name, no line names an `ignoreip` name. `name/kept` (all with a
+//!   router): an address the name resolves to, or once did, that is in the
+//!   address-list before a cycle or an engine start is still there after it:
+//!   hik-f2b removes nothing for it. `name/interval` (all with the name):
+//!   the name is looked up once at each engine start, not at the first poll
+//!   after it, and then exactly at the first poll `RESOLVE_EVERY` or more
+//!   after the last look-up (the first poll for the one at the start).
+//!   `name/log` (all with the name): the start of an engine says what the
+//!   name resolves to (one line) and, if it does not resolve, a WARNING;
+//!   a look-up that changes what it resolves to is one INFO line with the new
+//!   and old addresses, the first that fails after one that worked is one
+//!   WARNING, the first that works after failures and changes nothing is one
+//!   INFO line, and no other line is about the name.
 //! - `health/model` (all): the health notices of each cycle are exactly the
 //!   ones the documented policy gives for what the engine observed (failed
 //!   and successful polls, ban attempts, firewall checks, the rate limit,
@@ -181,6 +211,7 @@ mod fake;
 
 use fake::{Entry, Fake, Harness, Opts, SKEW};
 use hik_f2b::ledger::Ledger;
+use hik_f2b::names::RESOLVE_EVERY;
 use hik_f2b::reader::{CLOCK_JUMP, MAX_SEEN};
 use hik_f2b::state::State;
 use hik_f2b::util;
@@ -238,6 +269,10 @@ const OWN_TEXT: &str = "192.0.2.200";
 const OWN_USER: &str = "f2b";
 /// The safe list of the scenarios that have one.
 const SAFE: &str = "cctv_safe";
+/// The host name in `ignoreip` of the scenarios that have one, and the
+/// addresses its answers give, which no other part of a scenario uses.
+const NAME: &str = "home.example.net";
+const NAMED: [&str; 2] = ["203.0.113.80", "203.0.113.81"];
 /// The interval of the periodic firewall check (`health::HEALTH_CHECK_INTERVAL`).
 const CHECK_EVERY: i64 = 300;
 const FAIL: &str = "illlegealAccess";
@@ -352,7 +387,7 @@ impl Params {
         matches!(self.class, Class::DryRun | Class::NotifyOnly)
     }
 
-    fn general(&self, nets: &[String]) -> String {
+    fn general(&self, nets: &[String], name: bool) -> String {
         let bantime = match self.bantime {
             Some(s) => s.to_string(),
             None => "permanent".to_string(),
@@ -372,7 +407,7 @@ impl Params {
             self.alert_after,
             self.max_per_hour,
             dry,
-            ignore_line(nets)
+            ignore_line(nets, name)
         )
     }
 
@@ -395,8 +430,47 @@ impl Params {
     }
 }
 
-fn ignore_line(nets: &[String]) -> String {
-    format!("ignoreip = {}", nets.join(", "))
+/// The `ignoreip` line: the networks `nets` and, with `name`, `NAME`.
+fn ignore_line(nets: &[String], name: bool) -> String {
+    let mut items = nets.to_vec();
+    if name {
+        items.push(NAME.to_string());
+    }
+    format!("ignoreip = {}", items.join(", "))
+}
+
+/// An answer for `NAME`: one or both of `NAMED`, no IPv4 address, or a
+/// failed look-up.
+fn draw_answer(rng: &mut Rng) -> Result<Vec<Ipv4Addr>, String> {
+    let a: Ipv4Addr = NAMED[0].parse().unwrap();
+    let b: Ipv4Addr = NAMED[1].parse().unwrap();
+    match rng.below(10) {
+        0..=2 => Ok(vec![a]),
+        3..=5 => Ok(vec![b]),
+        6 => Ok(vec![b, a]),
+        7 => Ok(vec![]),
+        _ => Err(format!("cannot resolve {}: timed out", NAME)),
+    }
+}
+
+/// The addresses of an answer that exempt something, sorted: none for one
+/// that failed or found no IPv4 address.
+fn found(answer: &Result<Vec<Ipv4Addr>, String>) -> Option<Vec<Ipv4Addr>> {
+    let mut addresses = answer.as_ref().ok().filter(|a| !a.is_empty())?.clone();
+    addresses.sort_unstable();
+    Some(addresses)
+}
+
+/// `203.0.113.80 and 203.0.113.81`, or `none`, as hik-f2b lists them.
+fn and_list(addresses: &[Ipv4Addr]) -> String {
+    if addresses.is_empty() {
+        return "none".to_string();
+    }
+    addresses
+        .iter()
+        .map(|ip| ip.to_string())
+        .collect::<Vec<_>>()
+        .join(" and ")
 }
 
 fn in_net(ip: Ipv4Addr, net: &str) -> bool {
@@ -589,6 +663,12 @@ enum Line {
     SafeRuleOk,
     SafeRuleFailed,
     SafeOther,
+    /// A failed login said to be exempt for this `ignoreip` name, and a
+    /// waiting ban or counted failed logins dropped for one.
+    NameExempt(Ipv4Addr, String),
+    NameDropped(Ipv4Addr, String),
+    /// Any other line about an `ignoreip` name.
+    NameLog(String),
     Other,
 }
 
@@ -634,6 +714,25 @@ fn classify(line: &str) -> Line {
         }
     }
     let text = line.split_once(' ').map_or("", |(_, text)| text);
+    if let Some((_, rest)) = text.split_once(": failed login from ") {
+        if let Some((ip, rest)) = rest.split_once(' ') {
+            if let Some((_, name)) = rest.split_once("): never banned (ignoreip name ") {
+                if let (Ok(ip), Some((name, _))) = (ip.parse(), name.split_once(')')) {
+                    return Line::NameExempt(ip, name.to_string());
+                }
+            }
+        }
+    }
+    if let Some((_, name)) = text.split_once(": the address is now what the ignoreip name ") {
+        if let (Some((ip, _)), Some((name, _))) = (text.split_once(':'), name.split_once(' ')) {
+            if let Ok(ip) = ip.parse() {
+                return Line::NameDropped(ip, name.to_string());
+            }
+        }
+    }
+    if text.starts_with("ignoreip") {
+        return Line::NameLog(line.to_string());
+    }
     if let Some((n, ip, ts)) = counted(text) {
         return Line::Counted(n, ip, ts);
     }
@@ -817,6 +916,101 @@ struct SafeSim {
     writes: usize,
 }
 
+/// The host name in `ignoreip` of a scenario that has one.
+struct NameSim {
+    /// What the fixed answer for `NAME` gives now.
+    answer: Result<Vec<Ipv4Addr>, String>,
+    /// What the name resolves to for the engine running now: the answer of
+    /// its last look-up that found an address (empty if none did).
+    known: Vec<Ipv4Addr>,
+    /// The last look-up of the engine running now failed.
+    failing: bool,
+    /// Look-ups that reached the fixed answers so far.
+    resolved: usize,
+    /// The host time from which the next look-up is counted; `None` before
+    /// the first poll of the engine running now.
+    since: Option<i64>,
+    /// The addresses the name resolved to at some time.
+    ever: Vec<Ipv4Addr>,
+    /// For the summary: look-ups, and the ones that changed `known`.
+    lookups: usize,
+    changes: usize,
+}
+
+impl NameSim {
+    /// The look-up of a new engine. Returns the lines its start must log
+    /// (`name/log`), each a prefix.
+    fn started(&mut self) -> Vec<String> {
+        self.lookups += 1;
+        self.since = None;
+        let found = found(&self.answer);
+        self.failing = found.is_none();
+        self.known = found.unwrap_or_default();
+        self.remember();
+        let mut lines = vec![format!(
+            "INFO ignoreip names, never banned: {} {}",
+            NAME,
+            if self.known.is_empty() {
+                "not resolved".to_string()
+            } else {
+                and_list(&self.known)
+            }
+        )];
+        if self.failing {
+            lines.push(format!(
+                "WARNING ignoreip: {} does not resolve, so it exempts no address until it does; \
+                 it is tried again every 5 min: ",
+                NAME
+            ));
+        }
+        lines
+    }
+
+    /// A look-up in a poll. Returns the lines it must log, each a prefix.
+    fn looked_up(&mut self) -> Vec<String> {
+        self.lookups += 1;
+        let before = self.known.clone();
+        let was_failing = self.failing;
+        let found = found(&self.answer);
+        self.failing = found.is_none();
+        if let Some(found) = found {
+            self.known = found;
+        }
+        self.remember();
+        if self.known != before {
+            self.changes += 1;
+            return vec![format!(
+                "INFO ignoreip: {} now resolves to {} (was {})",
+                NAME,
+                and_list(&self.known),
+                and_list(&before)
+            )];
+        }
+        match (was_failing, self.failing) {
+            (false, true) => vec![format!(
+                "WARNING ignoreip: the look-up of {} failed, the addresses it last resolved to \
+                 stay exempt ({}): ",
+                NAME,
+                and_list(&self.known)
+            )],
+            (true, false) => vec![format!(
+                "INFO ignoreip: the look-up of {} works again, it still resolves to {}",
+                NAME,
+                and_list(&self.known)
+            )],
+            _ => vec![],
+        }
+    }
+
+    fn remember(&mut self) {
+        for ip in &self.known {
+            if !self.ever.contains(ip) {
+                self.ever.push(*ip);
+            }
+        }
+    }
+}
+
 /// The lines of one cycle (or engine start) about own addresses.
 #[derive(Default)]
 struct OwnSeen {
@@ -932,6 +1126,10 @@ struct Sim {
     own_kept: usize,
     /// The safe list, if the scenario has one.
     safe: Option<SafeSim>,
+    /// The host name in `ignoreip`, if the scenario has one, and the
+    /// generator of its events.
+    name: Option<NameSim>,
+    name_rng: Rng,
     trace: Vec<String>,
 }
 
@@ -944,7 +1142,34 @@ impl Sim {
         if rng.chance(50) {
             nets.push(OWNER_NET.to_string());
         }
-        let general: &'static str = Box::leak(p.general(&nets).into_boxed_str());
+        // Drawn apart from the scenario: the same seed gives the same other
+        // events with and without the name.
+        let mut name_rng = Rng::new(seed ^ 0x4e41_4d45_4e41_4d45);
+        let name = name_rng.chance(50).then(|| NameSim {
+            answer: draw_answer(&mut name_rng),
+            known: Vec::new(),
+            failing: false,
+            resolved: 0,
+            since: None,
+            ever: Vec::new(),
+            lookups: 0,
+            changes: 0,
+        });
+        let general: &'static str = Box::leak(p.general(&nets, name.is_some()).into_boxed_str());
+        // The answer the first engine gets; a failed look-up is the fixed
+        // answers' own for a name they do not know.
+        let names: &'static [(&'static str, &'static [&'static str])] =
+            match name.as_ref().map(|n| &n.answer) {
+                Some(Ok(addresses)) => {
+                    let texts: Vec<&'static str> = addresses
+                        .iter()
+                        .map(|ip| -> &'static str { Box::leak(ip.to_string().into_boxed_str()) })
+                        .collect();
+                    let texts: &'static [&'static str] = Box::leak(texts.into_boxed_slice());
+                    Box::leak(vec![(NAME, texts)].into_boxed_slice())
+                }
+                _ => &[],
+            };
         // Drawn apart from the scenario: the same seed gives the same events
         // with and without a safe list.
         let mut own_rng = Rng::new(seed ^ 0x5afe_5afe_5afe_5afe);
@@ -965,8 +1190,12 @@ impl Sim {
                 ""
             },
             own: OWN,
+            names,
             ..Default::default()
         });
+        if let Some(Err(e)) = name.as_ref().map(|n| &n.answer) {
+            h.own.set_name(NAME, Err(e.clone()));
+        }
         if safe.as_ref().is_some_and(|s| s.rule) {
             h.fake.lock().unwrap().rules = vec![
                 fake::Rule::accept("raw", SAFE),
@@ -1015,6 +1244,8 @@ impl Sim {
             own_removed: 0,
             own_kept: 0,
             safe,
+            name,
+            name_rng,
             trace: Vec::new(),
         }
     }
@@ -1123,8 +1354,12 @@ impl Sim {
     fn start(&mut self) -> Result<(), String> {
         let text = format!("class {:?}: {}", self.p.class, self.p.describe());
         self.note(text);
-        let text = ignore_line(&self.nets);
+        let text = ignore_line(&self.nets, self.name.is_some());
         self.note(text);
+        if let Some(n) = &self.name {
+            let text = format!("{} answers {:?}", NAME, n.answer);
+            self.note(text);
+        }
         if let Some(s) = &self.safe {
             let text = format!(
                 "safe list {}, {}",
@@ -1180,27 +1415,43 @@ impl Sim {
             self.write(n, t, address, FAIL, address.parse().ok());
         }
         // as `main.rs` starts the service
+        let expected = self.name_lookups(true)?;
         self.h.engine.startup_own();
+        self.h.engine.startup_names();
         let listed = self.listed(OWN_TEXT);
+        let named = self.named_listed();
         self.expire_safe();
         let safe_before = self.safe_listed();
         self.h.engine.startup_check(self.host as u64);
-        self.startup_lines(listed, safe_before)?;
+        self.named_kept(&named, "at the engine start")?;
+        self.startup_lines(listed, safe_before, &expected)?;
         self.note("first poll".to_string());
         self.cycle()
     }
 
-    /// The log of an engine start: the firewall check, and the look-up of
-    /// the own address that follows it when the router answers.
-    fn startup_lines(&mut self, listed_before: bool, safe_before: bool) -> Result<(), String> {
+    /// The log of an engine start: what the name resolves to (`expected`,
+    /// see `name_lookups`), the firewall check, and the look-up of the own
+    /// address that follows it when the router answers.
+    fn startup_lines(
+        &mut self,
+        listed_before: bool,
+        safe_before: bool,
+        expected: &[String],
+    ) -> Result<(), String> {
         let lines = util::captured_log();
         let mut own = OwnSeen::default();
         let mut safe = SafeSeen::default();
+        let mut about_name = Vec::new();
         own.deletes(&self.h.fake)?;
         for line in &lines {
             let line = classify(line);
             safe.see(&line)?;
             match line {
+                Line::NameExempt(ip, name) => {
+                    self.named_line(ip, &name, "a failed login said to be exempt")?
+                }
+                Line::NameDropped(ip, name) => self.named_line(ip, &name, "a drop")?,
+                Line::NameLog(text) => about_name.push(text),
                 Line::CheckFailed => {
                     if self.router != Router::Unreachable {
                         return Err(format!(
@@ -1214,6 +1465,7 @@ impl Sim {
                 other => own.see(&other)?,
             }
         }
+        self.name_logged(&about_name, expected)?;
         let answered = self.p.class != Class::NotifyOnly && self.router != Router::Unreachable;
         self.safe_checked(answered, safe_before, &safe)?;
         self.own_swept(answered, listed_before, &own)
@@ -1451,6 +1703,9 @@ impl Sim {
     }
 
     fn step(&mut self) -> Result<(), String> {
+        if self.name.is_some() && self.name_rng.chance(10) {
+            self.name_event();
+        }
         let class = self.p.class;
         let mut table = vec![
             (45, Kind::Poll),
@@ -1662,7 +1917,7 @@ impl Sim {
     }
 
     fn restart(&mut self) -> Result<(), String> {
-        let old = ignore_line(&self.nets);
+        let old = ignore_line(&self.nets, self.name.is_some());
         let mut what = "same config".to_string();
         if self.rng.chance(60) {
             let net = if self.rng.chance(50) {
@@ -1677,7 +1932,7 @@ impl Sim {
                 what = format!("ignoreip with {}", net);
                 self.nets.push(net);
             }
-            let new = ignore_line(&self.nets);
+            let new = ignore_line(&self.nets, self.name.is_some());
             self.h.ini = self
                 .h
                 .ini
@@ -1696,12 +1951,16 @@ impl Sim {
         if let Some(s) = &mut self.safe {
             s.dry_said = false;
         }
+        let expected = self.name_lookups(true)?;
         self.h.engine.startup_own();
+        self.h.engine.startup_names();
         let listed = self.listed(OWN_TEXT);
+        let named = self.named_listed();
         self.expire_safe();
         let safe_before = self.safe_listed();
         self.h.engine.startup_check(self.host as u64);
-        self.startup_lines(listed, safe_before)
+        self.named_kept(&named, "at the engine start")?;
+        self.startup_lines(listed, safe_before, &expected)
     }
 
     /// Thousands of entries logged while hik-f2b does not poll.
@@ -1887,8 +2146,12 @@ impl Sim {
         let queries = router.lock().unwrap().rule_queries.len();
         let offsets = self.offsets();
         let own_listed = self.listed(OWN_TEXT);
+        let named = self.named_listed();
         self.h.set_host(self.host);
         self.h.engine.cycle_at(self.host as u64);
+        self.named_kept(&named, "in a cycle")?;
+        let expected = self.name_lookups(false)?;
+        let mut about_name = Vec::new();
         let started_at = *self.started_at.get_or_insert(self.host);
         for (n, (before, after)) in offsets.iter().zip(self.offsets()).enumerate() {
             if *before != after {
@@ -1939,6 +2202,15 @@ impl Sim {
             own.see(&line)?;
             safe.see(&line)?;
             match line {
+                Line::NameExempt(ip, name) => {
+                    self.named_line(ip, &name, "a failed login said to be exempt")?;
+                    events.push(format!("{} exempt", ip));
+                }
+                Line::NameDropped(ip, name) => {
+                    self.named_line(ip, &name, "a drop")?;
+                    events.push(format!("{} dropped as named", ip));
+                }
+                Line::NameLog(text) => about_name.push(text),
                 Line::Counted(n, ip, ts) => {
                     self.on_count(n, ip, ts)?;
                     events.push(format!("{}+1", ip));
@@ -2046,6 +2318,12 @@ impl Sim {
                 cycle.router_pass = true;
             }
         }
+        self.name_logged(&about_name, &expected)?;
+        if !expected.is_empty() {
+            if let Some(n) = &self.name {
+                events.push(format!("{} -> {}", NAME, and_list(&n.known)));
+            }
+        }
         if !limited && !cycle.transport {
             self.health.pass("rate-limit");
         }
@@ -2151,11 +2429,12 @@ impl Sim {
     }
 
     fn on_count(&mut self, n: usize, ip: Ipv4Addr, ts: i64) -> Result<(), String> {
+        self.named_exempt(ip, "a counted failed login")?;
         if exempt(&self.nets, ip) {
             return Err(format!(
                 "[safety/exempt] a failed login of {} was counted, which is exempt under {}",
                 ip,
-                ignore_line(&self.nets)
+                ignore_line(&self.nets, self.name.is_some())
             ));
         }
         // The engine converts with the NVR's offset at this poll, which is
@@ -2228,14 +2507,189 @@ impl Sim {
         Ok(())
     }
 
+    /// `name/exempt`: `what` happened for `ip` while the name resolves to it
+    /// for the engine running now.
+    fn named_exempt(&self, ip: Ipv4Addr, what: &str) -> Result<(), String> {
+        match &self.name {
+            Some(n) if n.known.contains(&ip) => Err(format!(
+                "[name/exempt] {} for {} while {} resolves to {} for the engine",
+                what,
+                ip,
+                NAME,
+                and_list(&n.known)
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// `name/line`: a line that says `ip` is exempt for the `ignoreip` name
+    /// `name`.
+    fn named_line(&self, ip: Ipv4Addr, name: &str, what: &str) -> Result<(), String> {
+        match &self.name {
+            Some(n) if name == NAME && n.known.contains(&ip) => Ok(()),
+            Some(n) => Err(format!(
+                "[name/line] {} for {} as {}, but {} resolves to {} for the engine",
+                what,
+                ip,
+                name,
+                NAME,
+                and_list(&n.known)
+            )),
+            None => Err(format!(
+                "[name/line] {} for {} as {}, without a name in ignoreip",
+                what, ip, name
+            )),
+        }
+    }
+
+    /// The addresses the name resolves to, or once did, that are in the
+    /// address-list now (`name/kept`).
+    fn named_listed(&self) -> Vec<String> {
+        match &self.name {
+            Some(n) => n
+                .ever
+                .iter()
+                .map(|ip| ip.to_string())
+                .filter(|a| self.listed(a))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// `name/kept`: each of `before` is still in the address-list.
+    fn named_kept(&self, before: &[String], when: &str) -> Result<(), String> {
+        for address in before {
+            if !self.listed(address) {
+                return Err(format!(
+                    "[name/kept] {}, which {} resolves to or did, left the address-list {}",
+                    address, NAME, when
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The look-ups of the name since the last call: `name/interval`, and
+    /// the lines they must log (`name/log`), each a prefix. `start`: an
+    /// engine was started.
+    fn name_lookups(&mut self, start: bool) -> Result<Vec<String>, String> {
+        let resolved = self.h.own.resolved();
+        let host = self.host;
+        let Some(n) = &mut self.name else {
+            if resolved != 0 {
+                return Err(format!(
+                    "[name/interval] {} look-up(s) without a name in ignoreip",
+                    resolved
+                ));
+            }
+            return Ok(Vec::new());
+        };
+        let new = resolved - n.resolved;
+        n.resolved = resolved;
+        if start {
+            if new != 1 {
+                return Err(format!(
+                    "[name/interval] {} look-up(s) at an engine start, expected 1",
+                    new
+                ));
+            }
+            return Ok(n.started());
+        }
+        let due = match n.since {
+            None => {
+                n.since = Some(host);
+                false
+            }
+            Some(since) => host < since || host - since >= RESOLVE_EVERY as i64,
+        };
+        if new != usize::from(due) {
+            return Err(format!(
+                "[name/interval] {} look-up(s) in a poll {} s after the last one, expected {}",
+                new,
+                n.since.map_or(0, |since| host - since),
+                usize::from(due)
+            ));
+        }
+        if !due {
+            return Ok(Vec::new());
+        }
+        n.since = Some(host);
+        Ok(n.looked_up())
+    }
+
+    /// `name/log`: the lines about the name are `expected` (prefixes).
+    fn name_logged(&self, seen: &[String], expected: &[String]) -> Result<(), String> {
+        let matches = seen.len() == expected.len()
+            && seen
+                .iter()
+                .zip(expected)
+                .all(|(line, want)| line.starts_with(want));
+        if !matches {
+            return Err(format!(
+                "[name/log] lines about the name {:?}, expected {:?}",
+                seen, expected
+            ));
+        }
+        Ok(())
+    }
+
+    /// A name event: the answer for `NAME` changes, failed logins come from
+    /// one of `NAMED`, or one of them is put into the address-list by hand.
+    /// Drawn from the name's own generator.
+    fn name_event(&mut self) {
+        let r = self.name_rng.below(100);
+        if r < 45 {
+            let answer = draw_answer(&mut self.name_rng);
+            self.h.own.set_name(NAME, answer.clone());
+            self.note(format!("{} answers {:?}", NAME, answer));
+            if let Some(n) = &mut self.name {
+                n.answer = answer;
+            }
+            return;
+        }
+        let address = NAMED[self.name_rng.below(2) as usize];
+        let ip: Ipv4Addr = address.parse().unwrap();
+        if r < 88 || self.p.report_once() {
+            let n = self.name_rng.below(self.p.nvrs as u64) as usize;
+            let count = self.name_rng.range(1, self.p.maxretry as i64 + 2);
+            let gap = self.name_rng.range(1, 10);
+            let user = self.name_rng.pick(&USERS);
+            // the drop rule keeps a listed address away from the NVR, mostly
+            if !self.p.report_once() && self.listed(address) && self.name_rng.chance(85) {
+                self.note(format!("{} blocked by the router", address));
+                return;
+            }
+            for i in 0..count {
+                self.write_as(n, self.host + i * gap, address, FAIL, Some(ip), user);
+            }
+            self.host += (count - 1) * gap;
+            let text = format!(
+                "fail {} {:?} (named) user {:?} x{} every {}s",
+                self.nvr[n].name, address, user, count, gap
+            );
+            self.note(text);
+            return;
+        }
+        if !self.listed(address) {
+            self.h.fake.lock().unwrap().bans.push(address.to_string());
+        }
+        if let Some(n) = &mut self.name {
+            if !n.ever.contains(&ip) {
+                n.ever.push(ip);
+            }
+        }
+        self.note(format!("router: {} listed by hand", address));
+    }
+
     /// A ban request or report for `ip`: exempt, or not backed by the log?
     fn on_request(&self, ip: Ipv4Addr, what: &str) -> Result<(), String> {
+        self.named_exempt(ip, what)?;
         if exempt(&self.nets, ip) {
             return Err(format!(
                 "[safety/exempt] {} for {}, which is exempt under {}",
                 what,
                 ip,
-                ignore_line(&self.nets)
+                ignore_line(&self.nets, self.name.is_some())
             ));
         }
         // 0 unless a device clock changed between logging and counting
@@ -2573,8 +3027,10 @@ fn run_class(class: Class) {
     let mut failures = Vec::new();
     // cycles, accepted, listed, reported, alerts, liveness, shifted, bypass
     // alerts, own address removed, own address reported in a dry run,
-    // scenarios with a safe list, writes to it
-    let mut stats = [0usize; 12];
+    // scenarios with a safe list, writes to it, scenarios with a name in
+    // ignoreip, its look-ups and changes, bans and reports of its addresses
+    // (after they left its answer)
+    let mut stats = [0usize; 16];
     for &seed in &seeds {
         let mut sim = Sim::new(seed);
         let result = match catch_unwind(AssertUnwindSafe(|| sim.run())) {
@@ -2606,6 +3062,13 @@ fn run_class(class: Class) {
             sim.own_kept,
             usize::from(sim.safe.is_some()),
             sim.safe.as_ref().map_or(0, |s| s.writes),
+            usize::from(sim.name.is_some()),
+            sim.name.as_ref().map_or(0, |n| n.lookups),
+            sim.name.as_ref().map_or(0, |n| n.changes),
+            sim.bans
+                .iter()
+                .filter(|(_, ip, k)| *k != Ban::Listed && NAMED.contains(&ip.to_string().as_str()))
+                .count(),
         ];
         for (total, n) in stats.iter_mut().zip(seen) {
             *total += n;
@@ -2622,7 +3085,8 @@ fn run_class(class: Class) {
         "sim {:?}: {} seed(s), {} cycles, {:.1} s, {} violation(s); bans {}, already listed {}, \
          reports {}, health alerts {} (ban-bypassed {}), addresses due for liveness {}, \
          addresses with a shift {}, own address removed {} (reported in a dry run {}), safe \
-         list in {} scenario(s) ({} write(s)); peak fake threads {} (at most {}){}",
+         list in {} scenario(s) ({} write(s)), ignoreip name in {} scenario(s) ({} look-up(s), \
+         {} change(s), {} ban(s) or report(s) of its addresses); peak fake threads {} (at most {}){}",
         class,
         seeds.len(),
         stats[0],
@@ -2639,6 +3103,10 @@ fn run_class(class: Class) {
         stats[9],
         stats[10],
         stats[11],
+        stats[12],
+        stats[13],
+        stats[14],
+        stats[15],
         fake::peak_threads(),
         MAX_FAKE_THREADS,
         conntrack

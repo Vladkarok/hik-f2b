@@ -30,6 +30,12 @@
 //!   DST on an NVR that cannot be reached for an hour while failed logins
 //!   are logged (they are read only after the step).
 //!
+//! Every class also has failed logins from the host's own address (`OWN`,
+//! the address the harness reaches every device from): with hik-f2b's user
+//! name, as after its NVR password was changed, or with another one, as a
+//! forged entry would have. In the classes with a router, `OWN` is also put
+//! into the address-list by an outside hand now and then.
+//!
 //! Every scenario starts with failed logins already in the logs (some within
 //! `lookback` before the first start), may start with an NVR unreachable, and
 //! ends with a settle phase: router and NVRs back, then polls until no ban is
@@ -39,8 +45,10 @@
 //!
 //! - `safety/exempt` (all): no ban request, report, ban notification or
 //!   counted failed login for an address that is exempt (`ignoreip` in force
-//!   at that moment, or a range that is never banned). Exemption is computed
-//!   here, not by the engine.
+//!   at that moment, a range that is never banned, or the own address `OWN`).
+//!   Exemption is computed here, not by the engine.
+//! - `own/other` (all): only `OWN` is ever said to be an own address of
+//!   hik-f2b: no address read from a log becomes one.
 //! - `safety/maxretry` (all): every ban request or report for an address is
 //!   backed by `maxretry` failed logins of it, logged after its NVR's first
 //!   start, within a `findtime` span (true host time, from the generated
@@ -91,12 +99,28 @@
 //!   one for a permanent ban.
 //! - `notify` (all): one ban notification for each ban and report, none for
 //!   an address that is already listed.
+//! - `own/removed` (`Firewall`, `Backlog`, `Clock`): after each firewall
+//!   check that the router answers (at an engine start, and the periodic one
+//!   in a cycle), `OWN` is not in the address-list if the router accepts
+//!   writes, and each removal is one WARNING. While the router refuses
+//!   writes it stays listed, with an ERROR at each such check. `own/kept`
+//!   (`DryRun`): `OWN` is never removed, and a check that finds it listed
+//!   reports it (a WARNING), once while it stays listed. `own/notify` (all
+//!   with a router): one notification at once for each removal, and one for
+//!   each stretch in which `OWN` stays listed after a check that answered
+//!   (dry run, or refused), sent at the end of the cycle (or of the first
+//!   cycle after an engine start); none else. No other request about `OWN`
+//!   fails while the router answers its checks. `own/only` (all): every
+//!   request to remove an address-list entry is for `OWN`, and the router
+//!   removes one only where a removal is logged.
 //! - `health/model` (all): the health notices of each cycle are exactly the
 //!   ones the documented policy gives for what the engine observed (failed
 //!   and successful polls, ban attempts, firewall checks, the rate limit,
 //!   listed addresses that still reach an NVR well after their ban, which
 //!   is over once none has for `alert_after` while every NVR is read; none
-//!   is such an address within `STARTUP_GRACE` after an engine start):
+//!   is such an address within `STARTUP_GRACE` after an engine start; an own
+//!   address that a check that answered finds listed and cannot remove,
+//!   which is over at the first such check that leaves none listed):
 //!   alert once after `alert_after`, reminder after 24 h, one recovery or
 //!   "unknown" when an alerted problem ends, nothing for a short one, state
 //!   lost on restart. `health/condition` (all): an unreachable firewall is
@@ -185,6 +209,9 @@ const USERS: [&str; 4] = ["admin", "illegal usernam", "", "user1"];
 /// The address the host reaches its devices from (`own::Fixed`): an own
 /// address, which no other part of a scenario uses.
 const OWN: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 200);
+const OWN_TEXT: &str = "192.0.2.200";
+/// The user name hik-f2b logs in with (`support/fake.rs`).
+const OWN_USER: &str = "f2b";
 const FAIL: &str = "illlegealAccess";
 const OTHER: &str = "videoLost/30";
 const NOTICES: [(&str, &str); 4] = [
@@ -352,10 +379,11 @@ fn in_net(ip: Ipv4Addr, net: &str) -> bool {
     u32::from(ip) & mask == u32::from(addr) & mask
 }
 
-/// Never banned under `nets`, by the README's list.
+/// Never banned under `nets`, by the README's list, and the own address.
 fn exempt(nets: &[String], ip: Ipv4Addr) -> bool {
     let first = ip.octets()[0];
-    ip.is_loopback()
+    ip == OWN
+        || ip.is_loopback()
         || ip.is_unspecified()
         || ip.is_broadcast()
         || ip.is_multicast()
@@ -397,6 +425,8 @@ enum Kind {
     List,
     Flood,
     Clock,
+    Own,
+    OwnListed,
 }
 
 struct NvrSim {
@@ -513,6 +543,15 @@ enum Line {
     Skipped(usize, i64, i64),
     SkippedAll(usize),
     Notice(String),
+    /// A failed login said to come from an own address.
+    OwnLogin(Ipv4Addr),
+    /// An own address found in the address-list: removed, reported in a
+    /// dry run, or not removed (refused).
+    OwnRemoved(Ipv4Addr),
+    OwnDryRun(Ipv4Addr),
+    OwnStuck(Ipv4Addr),
+    /// The look-up of an own address failed.
+    OwnAskFailed,
     Other,
 }
 
@@ -570,6 +609,37 @@ fn classify(line: &str) -> Line {
     if let Some(ip) = address_after(text, "DRY RUN: would ban ") {
         return Line::Ban(ip, Ban::Reported);
     }
+    if let Some(ip) = address_after(text, "cannot remove own address ") {
+        return Line::OwnStuck(ip);
+    }
+    if text.starts_with("cannot ask ") && text.contains(" whether own address ") {
+        return Line::OwnAskFailed;
+    }
+    if let Some(rest) = text.strip_prefix("DRY RUN: ") {
+        if let Some((ip, rest)) = rest.split_once(' ') {
+            if rest.starts_with("is an own address of hik-f2b and is in ") {
+                if let Ok(ip) = ip.parse() {
+                    return Line::OwnDryRun(ip);
+                }
+            }
+        }
+    }
+    if let Some((ip, rest)) = text.split_once(' ') {
+        if rest.starts_with("is an own address of hik-f2b and was in ") {
+            if let Ok(ip) = ip.parse() {
+                return Line::OwnRemoved(ip);
+            }
+        }
+    }
+    if let Some((_, rest)) = text.split_once(": failed login from ") {
+        if let Some((ip, rest)) = rest.split_once(' ') {
+            if rest.contains("): an own address of hik-f2b, ") {
+                if let Ok(ip) = ip.parse() {
+                    return Line::OwnLogin(ip);
+                }
+            }
+        }
+    }
     if let Some(ip) = address_after(text, "cannot ban ") {
         if text.contains(", will retry next cycle: ") {
             return Line::Transport(ip);
@@ -610,11 +680,87 @@ fn classify(line: &str) -> Line {
     Line::Other
 }
 
+/// Whether a notification is the one sent at once about the own address
+/// in the address-list.
+fn own_notice(body: &str) -> bool {
+    fake::text_of(body).starts_with(&format!(
+        "\u{26a0}\u{fe0f} hik-f2b: {} is an own address of hik-f2b and ",
+        OWN_TEXT
+    ))
+}
+
 /// The address a ban notification is about.
 fn ban_notice(body: &str) -> Option<Ipv4Addr> {
     let text = fake::text_of(body);
     let rest = text.strip_prefix("\u{26d4} hik-f2b: ")?;
     rest.split(' ').next()?.parse().ok()
+}
+
+/// The lines of one cycle (or engine start) about own addresses.
+#[derive(Default)]
+struct OwnSeen {
+    logins: usize,
+    removed: usize,
+    dry_run: usize,
+    stuck: usize,
+    ask_failed: bool,
+    /// Entries the router removed.
+    deleted: usize,
+}
+
+impl OwnSeen {
+    /// Takes the requests to remove an entry that reached the router;
+    /// `own/only` for one that is not about `OWN`.
+    fn deletes(&mut self, router: &Mutex<Fake>) -> Result<(), String> {
+        let deletes = std::mem::take(&mut router.lock().unwrap().delete_log);
+        for (address, outcome) in deletes {
+            if address != OWN_TEXT {
+                return Err(format!(
+                    "[own/only] a request to remove the entry of {:?} ({})",
+                    address, outcome
+                ));
+            }
+            if outcome == "removed" {
+                self.deleted += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes one classified line; `own/other` for an own address that is
+    /// not `OWN`.
+    fn see(&mut self, line: &Line) -> Result<(), String> {
+        let ip = match line {
+            Line::OwnLogin(ip) => {
+                self.logins += 1;
+                ip
+            }
+            Line::OwnRemoved(ip) => {
+                self.removed += 1;
+                ip
+            }
+            Line::OwnDryRun(ip) => {
+                self.dry_run += 1;
+                ip
+            }
+            Line::OwnStuck(ip) => {
+                self.stuck += 1;
+                ip
+            }
+            Line::OwnAskFailed => {
+                self.ask_failed = true;
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        if *ip != OWN {
+            return Err(format!(
+                "[own/other] {} is said to be an own address of hik-f2b",
+                ip
+            ));
+        }
+        Ok(())
+    }
 }
 
 struct Sim {
@@ -654,6 +800,15 @@ struct Sim {
     started_at: Option<i64>,
     /// Addresses the liveness check had a due ban or report for.
     musts: usize,
+    /// `OWN` stays listed after a check that answered, and that was
+    /// reported (`own/notify`); the engine running now knows it.
+    own_reported: bool,
+    /// Notifications about `OWN` in the address-list that the engine
+    /// running now still has to send.
+    own_notices: usize,
+    /// Removals of `OWN` and reports of it in a dry run.
+    own_removed: usize,
+    own_kept: usize,
     trace: Vec<String>,
 }
 
@@ -712,6 +867,10 @@ impl Sim {
             last_bypass: None,
             started_at: None,
             musts: 0,
+            own_reported: false,
+            own_notices: 0,
+            own_removed: 0,
+            own_kept: 0,
             trace: Vec::new(),
         }
     }
@@ -743,6 +902,19 @@ impl Sim {
     /// the IPv4 address of a failed login, if it has one.
     fn write(&mut self, n: usize, host: i64, address: &str, minor: &str, counts: Option<Ipv4Addr>) {
         let user = self.rng.pick(&USERS);
+        self.write_as(n, host, address, minor, counts, user);
+    }
+
+    /// `write` with the user name `user`.
+    fn write_as(
+        &mut self,
+        n: usize,
+        host: i64,
+        address: &str,
+        minor: &str,
+        counts: Option<Ipv4Addr>,
+        user: &str,
+    ) {
         let device = host + self.nvr[n].skew;
         let entry = Entry {
             ts: fake::device(device),
@@ -853,24 +1025,108 @@ impl Sim {
         }
         // as `main.rs` starts the service
         self.h.engine.startup_own();
+        let listed = self.listed(OWN_TEXT);
         self.h.engine.startup_check(self.host as u64);
-        self.startup_lines()?;
+        self.startup_lines(listed)?;
         self.note("first poll".to_string());
         self.cycle()
     }
 
-    /// The log of an engine start: only the firewall check matters.
-    fn startup_lines(&mut self) -> Result<(), String> {
-        for line in util::captured_log() {
-            if matches!(classify(&line), Line::CheckFailed) {
-                if self.router != Router::Unreachable {
-                    return Err(format!(
-                        "[health/condition] the firewall check failed at startup while the \
-                         router was {:?}",
-                        self.router
-                    ));
+    /// The log of an engine start: the firewall check, and the look-up of
+    /// the own address that follows it when the router answers.
+    fn startup_lines(&mut self, listed_before: bool) -> Result<(), String> {
+        let lines = util::captured_log();
+        let mut own = OwnSeen::default();
+        own.deletes(&self.h.fake)?;
+        for line in &lines {
+            match classify(line) {
+                Line::CheckFailed => {
+                    if self.router != Router::Unreachable {
+                        return Err(format!(
+                            "[health/condition] the firewall check failed at startup while the \
+                             router was {:?}",
+                            self.router
+                        ));
+                    }
+                    self.health.fail("firewall", self.host);
                 }
-                self.health.fail("firewall", self.host);
+                other => own.see(&other)?,
+            }
+        }
+        let answered = self.p.class != Class::NotifyOnly && self.router != Router::Unreachable;
+        self.own_swept(answered, listed_before, &own)
+    }
+
+    /// See `own/removed`, `own/kept` and `own/notify` in the module comment:
+    /// what a firewall check (`answered`: the router answered it) must have
+    /// done about `OWN`, listed before it or not, given the lines `own` of
+    /// the engine.
+    fn own_swept(
+        &mut self,
+        answered: bool,
+        listed_before: bool,
+        own: &OwnSeen,
+    ) -> Result<(), String> {
+        let listed = self.listed(OWN_TEXT);
+        let dry = self.p.class == Class::DryRun;
+        let found = answered && listed_before;
+        let (removed, stuck) = match (found, dry, self.router) {
+            (false, _, _) => (0, 0),
+            (true, true, _) => (0, 0),
+            (true, false, Router::Refusing) => (0, 1),
+            (true, false, _) => (1, 0),
+        };
+        let reported = usize::from(found && dry && !self.own_reported);
+        let expected = (removed, reported, stuck);
+        let seen = (own.removed, own.dry_run, own.stuck);
+        if seen != expected {
+            return Err(format!(
+                "[own/removed] (removed, reported in a dry run, not removed) lines {:?}, \
+                 expected {:?} (check answered {}, listed before {}, router {:?})",
+                seen, expected, answered, listed_before, self.router
+            ));
+        }
+        if listed != (listed_before && removed == 0) {
+            return Err(format!(
+                "[own/removed] {} is {}listed after a check (answered {}, listed before {}, \
+                 router {:?})",
+                OWN_TEXT,
+                if listed { "" } else { "not " },
+                answered,
+                listed_before,
+                self.router
+            ));
+        }
+        if own.ask_failed {
+            return Err("[own/removed] the look-up of the own address failed".to_string());
+        }
+        if own.deleted != own.removed {
+            return Err(format!(
+                "[own/only] the router removed {} entr(ies), {} removal(s) logged",
+                own.deleted, own.removed
+            ));
+        }
+        if removed > 0 {
+            self.own_notices += 1;
+            self.own_removed += 1;
+            self.own_reported = false;
+            self.note(format!("  -> {} removed from the address-list", OWN_TEXT));
+        } else if found {
+            if !self.own_reported {
+                self.own_notices += 1;
+                self.own_reported = true;
+            }
+            if dry {
+                self.own_kept += reported;
+            }
+        } else if answered {
+            self.own_reported = false;
+        }
+        if answered {
+            if stuck > 0 {
+                self.health.fail("own-address-listed", self.host);
+            } else {
+                self.health.pass("own-address-listed");
             }
         }
         Ok(())
@@ -896,6 +1152,10 @@ impl Sim {
         }
         if class == Class::Clock {
             table.push((10, Kind::Clock));
+        }
+        table.push((3, Kind::Own));
+        if class != Class::NotifyOnly {
+            table.push((2, Kind::OwnListed));
         }
         let total: u64 = table.iter().map(|(weight, _)| weight).sum();
         let mut roll = self.rng.below(total);
@@ -974,7 +1234,41 @@ impl Sim {
             }
             Kind::Flood => self.flood(),
             Kind::Clock => self.clock(),
+            Kind::Own => {
+                self.own_fail();
+                Ok(())
+            }
+            Kind::OwnListed => {
+                if !self.listed(OWN_TEXT) {
+                    self.h.fake.lock().unwrap().bans.push(OWN_TEXT.to_string());
+                }
+                self.note(format!("router: {} listed by an outside hand", OWN_TEXT));
+                Ok(())
+            }
         }
+    }
+
+    /// Failed logins from the own address: with hik-f2b's user name, as
+    /// while the NVR rejects hik-f2b's login, or with another, as a forged
+    /// entry has. Enough to reach `maxretry` if they were counted.
+    fn own_fail(&mut self) {
+        let n = self.rng.below(self.p.nvrs as u64) as usize;
+        let count = self.rng.range(1, self.p.maxretry as i64 + 3);
+        let gap = self.rng.range(1, 30);
+        let user = if self.rng.chance(50) {
+            OWN_USER
+        } else {
+            self.rng.pick(&USERS)
+        };
+        for i in 0..count {
+            self.write_as(n, self.host + i * gap, OWN_TEXT, FAIL, Some(OWN), user);
+        }
+        self.host += (count - 1) * gap;
+        let text = format!(
+            "fail {} {:?} (own) user {:?} x{} every {}s",
+            self.nvr[n].name, OWN_TEXT, user, count, gap
+        );
+        self.note(text);
     }
 
     fn set_router(&mut self, mode: Router) {
@@ -1078,9 +1372,13 @@ impl Sim {
         self.health = Health::default();
         self.last_bypass = None;
         self.started_at = None;
+        // what the engine before knew and had still to send is gone
+        self.own_reported = false;
+        self.own_notices = 0;
         self.h.engine.startup_own();
+        let listed = self.listed(OWN_TEXT);
         self.h.engine.startup_check(self.host as u64);
-        self.startup_lines()
+        self.startup_lines(listed)
     }
 
     /// Thousands of entries logged while hik-f2b does not poll.
@@ -1263,6 +1561,7 @@ impl Sim {
         let router = Arc::clone(&self.h.fake);
         let queries = router.lock().unwrap().rule_queries.len();
         let offsets = self.offsets();
+        let own_listed = self.listed(OWN_TEXT);
         self.h.set_host(self.host);
         self.h.engine.cycle_at(self.host as u64);
         let started_at = *self.started_at.get_or_insert(self.host);
@@ -1307,8 +1606,12 @@ impl Sim {
         let mut check_failed = false;
         let mut notified = Vec::new();
         let mut events = Vec::new();
+        let mut own = OwnSeen::default();
+        own.deletes(&router)?;
         for line in &lines {
-            match classify(line) {
+            let line = classify(line);
+            own.see(&line)?;
+            match line {
                 Line::Counted(n, ip, ts) => {
                     self.on_count(n, ip, ts)?;
                     events.push(format!("{}+1", ip));
@@ -1392,7 +1695,12 @@ impl Sim {
                     events.push(notice.clone());
                     cycle.notices.push(notice);
                 }
-                Line::Other => {}
+                Line::OwnLogin(_)
+                | Line::OwnRemoved(_)
+                | Line::OwnDryRun(_)
+                | Line::OwnStuck(_)
+                | Line::OwnAskFailed
+                | Line::Other => {}
             }
         }
         for (address, outcome) in puts {
@@ -1424,6 +1732,12 @@ impl Sim {
             self.health.pass("firewall");
             self.health.pass("firewall-rule");
         }
+        // the look-up of the own address follows a check that the router
+        // answered
+        self.own_swept(checked, own_listed, &own)?;
+        if own.logins > 0 {
+            events.push(format!("{} own failed login(s) not counted", own.logins));
+        }
         if (cycle.transport || check_failed) && self.router != Router::Unreachable {
             return Err(format!(
                 "[health/condition] the firewall was found unreachable while the router was {:?}",
@@ -1447,11 +1761,22 @@ impl Sim {
             ));
         }
         let mut announced = Vec::new();
+        let mut own_sent = 0;
         for body in &sent {
             if let Some(ip) = ban_notice(body) {
                 announced.push(ip);
             }
+            if own_notice(body) {
+                own_sent += 1;
+            }
         }
+        if own_sent != self.own_notices {
+            return Err(format!(
+                "[own/notify] {} notification(s) about {} in the address-list, expected {}",
+                own_sent, OWN_TEXT, self.own_notices
+            ));
+        }
+        self.own_notices = 0;
         announced.sort();
         notified.sort();
         if announced != notified {
@@ -1897,8 +2222,8 @@ fn run_class(class: Class) {
     let seeds = seeds(class);
     let mut failures = Vec::new();
     // cycles, accepted, listed, reported, alerts, liveness, shifted, bypass
-    // alerts
-    let mut stats = [0usize; 8];
+    // alerts, own address removed, own address reported in a dry run
+    let mut stats = [0usize; 10];
     for &seed in &seeds {
         let mut sim = Sim::new(seed);
         let result = match catch_unwind(AssertUnwindSafe(|| sim.run())) {
@@ -1926,6 +2251,8 @@ fn run_class(class: Class) {
                 .flat_map(|c| &c.notices)
                 .filter(|n| *n == "alert ban-bypassed")
                 .count(),
+            sim.own_removed,
+            sim.own_kept,
         ];
         for (total, n) in stats.iter_mut().zip(seen) {
             *total += n;
@@ -1941,7 +2268,8 @@ fn run_class(class: Class) {
     let summary = format!(
         "sim {:?}: {} seed(s), {} cycles, {:.1} s, {} violation(s); bans {}, already listed {}, \
          reports {}, health alerts {} (ban-bypassed {}), addresses due for liveness {}, \
-         addresses with a shift {}; peak fake threads {} (at most {}){}",
+         addresses with a shift {}, own address removed {} (reported in a dry run {}); peak \
+         fake threads {} (at most {}){}",
         class,
         seeds.len(),
         stats[0],
@@ -1954,6 +2282,8 @@ fn run_class(class: Class) {
         stats[7],
         stats[5],
         stats[6],
+        stats[8],
+        stats[9],
         fake::peak_threads(),
         MAX_FAKE_THREADS,
         conntrack

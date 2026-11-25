@@ -760,9 +760,9 @@ impl Sim {
                     .h
                     .engine
                     .state
-                    .nvr
+                    .cursors
                     .get(&self.nvr[n].name)
-                    .and_then(|st| st.offset);
+                    .and_then(|st| st.offset());
                 let logged = Logged {
                     host,
                     stored,
@@ -1440,7 +1440,7 @@ impl Sim {
         self.cycles.push(cycle);
         let state = &self.h.engine.state;
         let started: Vec<usize> = (0..self.p.nvrs)
-            .filter(|&n| !self.nvr[n].started && state.nvr.contains_key(&self.nvr[n].name))
+            .filter(|&n| !self.nvr[n].started && state.cursors.get(&self.nvr[n].name).is_some())
             .collect();
         for n in started {
             self.nvr[n].started = true;
@@ -1458,9 +1458,9 @@ impl Sim {
                 self.h
                     .engine
                     .state
-                    .nvr
+                    .cursors
                     .get(&n.name)
-                    .and_then(|st| st.offset)
+                    .and_then(|st| st.offset())
             })
             .collect()
     }
@@ -1655,13 +1655,9 @@ impl Sim {
                 held.most_fail_times
             ));
         }
-        for (name, st) in &state.nvr {
-            if st.seen.len() > MAX_SEEN {
-                return Err(format!(
-                    "[caps] {} seen entries for {}",
-                    st.seen.len(),
-                    name
-                ));
+        for (name, st) in state.cursors.iter() {
+            if st.seen() > MAX_SEEN {
+                return Err(format!("[caps] {} seen entries for {}", st.seen(), name));
             }
         }
         Ok(())

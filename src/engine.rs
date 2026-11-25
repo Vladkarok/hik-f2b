@@ -147,7 +147,7 @@ impl Engine {
         let readers = cfg
             .nvrs
             .iter()
-            .map(|nvr| Nvr::new(nvr).map(LogReader::new))
+            .map(|nvr| Nvr::new(nvr).map(|client| LogReader::new(&nvr.name, client)))
             .collect::<Result<Vec<_>, _>>()?;
         let template = cfg
             .telegram
@@ -337,7 +337,7 @@ impl Engine {
         let mut out = Vec::new();
         let meta_id = self.cfg.meta_id.clone();
         for reader in self.readers.iter_mut() {
-            let nvr = &mut reader.nvr;
+            let nvr = reader.client();
             // The device time proves that the NVR answers and accepts the
             // login; a search, that the user may search the log. The search
             // also shows what the engine relies on (see `describe_log`).
@@ -444,7 +444,7 @@ impl Engine {
                     .nvr_polled(self.readers[i].name(), NvrRead::NotTried, host_now);
                 break;
             }
-            match self.readers[i].poll(&mut self.state.nvr, &self.cfg, host_now) {
+            match self.readers[i].poll(&mut self.state.cursors, &self.cfg, host_now) {
                 Poll::BackingOff => {
                     self.health
                         .nvr_polled(self.readers[i].name(), NvrRead::NotTried, host_now);

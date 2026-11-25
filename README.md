@@ -1176,7 +1176,9 @@ opens or ends, and when a problem is worth a health alert, is decided in
 `src/health.rs`. Neither does I/O, and each is tested on its own. How an
 NVR log is read (where it was read up to, a device clock that changed, the
 order and the paging of the log) and how its times become host time is
-decided in `src/reader.rs`, by one log reader per NVR.
+decided in `src/reader.rs`, by one log reader per NVR. The reader gets the
+log through the `LogSource` trait, so its unit tests give it a log in
+memory.
 
 CI also runs `.github/scripts/repo-guard.sh`, which keeps addresses of real
 devices and other private data out of the repository, and

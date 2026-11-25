@@ -1,9 +1,10 @@
-//! Persistent state: where each NVR log was read up to, and the ban ledger
-//! (failure counters, bans that still have to be applied, remembered bans
-//! and the ban rate limit, see `ledger.rs`), which writes and reads its own
-//! lines. A plain line-based text file; anything that does not parse or is
-//! out of range is ignored, so a damaged or hand-edited file can never make
-//! the daemon do arithmetic on absurd values.
+//! Persistent state: where each NVR log was read up to (the cursors, see
+//! `reader.rs`) and the ban ledger (failure counters, bans that still have
+//! to be applied, remembered bans and the ban rate limit, see `ledger.rs`),
+//! each of which writes and reads its own lines. A plain line-based text
+//! file; anything that does not parse or is out of range is ignored, so a
+//! damaged or hand-edited file can never make the daemon do arithmetic on
+//! absurd values.
 //!
 //! A file that cannot be used at all (too large, unreadable, not text, of
 //! another version) is not silently replaced: `load` says why at WARNING
@@ -12,8 +13,7 @@
 //! copy of it in memory.
 
 use crate::ledger::Ledger;
-use crate::reader::{Cursor, MAX_SEEN};
-use std::collections::BTreeMap;
+use crate::reader::{CursorLines, Cursors};
 use std::hash::Hasher;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -28,8 +28,8 @@ pub const MAX_TIME: i64 = 253_402_300_799;
 
 #[derive(Default, Debug, PartialEq)]
 pub struct State {
-    /// The read cursor of each NVR, see `reader.rs`.
-    pub nvr: BTreeMap<String, Cursor>,
+    /// The read cursor of each NVR.
+    pub cursors: Cursors,
     /// Failure counters, waiting and remembered bans, the rate limit.
     pub ledger: Ledger,
 }
@@ -42,15 +42,6 @@ pub(crate) fn time(text: &str) -> Option<i64> {
 
 pub(crate) fn utime(text: &str) -> Option<u64> {
     time(text).map(|t| t as u64)
-}
-
-/// An NVR name as the configuration allows it.
-fn name_ok(text: &str) -> bool {
-    crate::util::is_name(text, 32)
-}
-
-fn key_ok(text: &str) -> bool {
-    text.len() == 32 && text.chars().all(|c| c.is_ascii_hexdigit())
 }
 
 /// Feeds what is written to a hash, so that the state can be compared with
@@ -98,17 +89,7 @@ impl State {
     /// Writes the state in its file format.
     pub fn write_to(&self, out: &mut impl Write) -> std::io::Result<()> {
         writeln!(out, "{}", HEADER)?;
-        for (name, st) in &self.nvr {
-            match st.offset {
-                Some(o) => writeln!(out, "nvr {} {} {}", name, st.since, o)?,
-                None => writeln!(out, "nvr {} {} -", name, st.since)?,
-            }
-            let mut seen: Vec<_> = st.seen.iter().collect();
-            seen.sort();
-            for (key, count) in seen {
-                writeln!(out, "seen {} {} {}", name, key, count)?;
-            }
-        }
+        self.cursors.write_to(out)?;
         self.ledger.write_to(out)?;
         Ok(())
     }
@@ -155,61 +136,23 @@ impl State {
 /// Reads a state file line by line.
 #[derive(Default)]
 struct Reader {
-    /// An NVR is known only through a valid `nvr` line: `seen` lines alone
-    /// must not fake a read position of 0.
-    positioned: std::collections::HashSet<String>,
+    cursors: CursorLines,
 }
 
 impl Reader {
     /// Takes one line into `st`; false when the line is not used.
     fn line(&mut self, st: &mut State, line: &str) -> bool {
-        let positioned = &mut self.positioned;
         let f: Vec<&str> = line.split(' ').collect();
-        match f.as_slice() {
-            ["nvr", name, since, offset] if name_ok(name) => {
-                let offset = match *offset {
-                    "-" => Some(None),
-                    o => o
-                        .parse::<i64>()
-                        .ok()
-                        .filter(|o| o.abs() <= MAX_TIME)
-                        .map(Some),
-                };
-                let (Some(since), Some(offset)) = (time(since), offset) else {
-                    return false;
-                };
-                let nvr = st.nvr.entry(name.to_string()).or_default();
-                nvr.since = since;
-                nvr.offset = offset;
-                positioned.insert(name.to_string());
-                true
-            }
-            ["seen", name, key, count] if name_ok(name) && key_ok(key) => {
-                let Some(count) = count.parse::<u32>().ok().filter(|c| *c <= 1_000_000) else {
-                    return false;
-                };
-                let nvr = st.nvr.entry(name.to_string()).or_default();
-                if nvr.seen.len() >= MAX_SEEN {
-                    return false;
-                }
-                nvr.seen.insert(key.to_string(), count);
-                true
-            }
-            _ => st.ledger.read_line(&f),
+        match self.cursors.line(&mut st.cursors, &f) {
+            Some(used) => used,
+            None => st.ledger.read_line(&f),
         }
     }
 
     /// Ends the reading: drops `seen` lines of NVRs without a position and
     /// sorts what needs order. Returns the number of lines dropped.
     fn finish(self, st: &mut State) -> usize {
-        let mut dropped = 0;
-        st.nvr.retain(|name, nvr| {
-            let keep = self.positioned.contains(name);
-            if !keep {
-                dropped += nvr.seen.len();
-            }
-            keep
-        });
+        let dropped = self.cursors.finish(&mut st.cursors);
         st.ledger.finish_reading();
         dropped
     }
@@ -331,6 +274,7 @@ impl State {
 mod tests {
     use super::*;
     use crate::ledger::{Sizes, MAX_BANNED, MAX_FAIL_TIMES, MAX_PENDING, MAX_RATE, MAX_TRACKED};
+    use crate::reader::MAX_SEEN;
     use std::net::Ipv4Addr;
 
     const KEY: &str = "0123456789abcdef0123456789abcdef";
@@ -346,11 +290,12 @@ mod tests {
             k = KEY
         );
         let st = State::parse(&text);
-        assert_eq!(st.nvr["nvr1"].since, 1_700_000_000);
-        assert_eq!(st.nvr["nvr1"].offset, Some(-7200));
-        assert_eq!(st.nvr["nvr1"].seen[KEY], 2);
-        assert_eq!(st.nvr["nvr2"].since, 5);
-        assert_eq!(st.nvr["nvr2"].offset, None);
+        assert_eq!(st.cursors["nvr1"].since(), 1_700_000_000);
+        assert_eq!(st.cursors["nvr1"].offset(), Some(-7200));
+        assert_eq!(st.cursors["nvr1"].seen(), 1);
+        assert!(st.serialize().contains(&format!("\nseen nvr1 {} 2\n", KEY)));
+        assert_eq!(st.cursors["nvr2"].since(), 5);
+        assert_eq!(st.cursors["nvr2"].offset(), None);
         let ip: Ipv4Addr = "198.51.100.7".parse().unwrap();
         assert_eq!(st.ledger.failed_logins(ip), 2);
         assert!(st.ledger.is_waiting(ip));
@@ -403,7 +348,7 @@ mod tests {
             rate 1768032120\n\
             rate 1768032120\n";
         let st = State::parse(FILE);
-        assert_eq!(st.nvr.len(), 2);
+        assert_eq!(st.cursors.iter().count(), 2);
         let sizes = st.ledger.sizes();
         assert_eq!((sizes.tracked, sizes.fail_times), (2, 7));
         assert_eq!(
@@ -452,9 +397,10 @@ mod tests {
              rate -1\nrate 99999999999999999\n",
             k = KEY
         ));
-        assert_eq!(st.nvr.keys().collect::<Vec<_>>(), vec!["e"]);
-        assert_eq!(st.nvr["e"].offset, Some(-7200));
-        assert!(st.nvr["e"].seen.is_empty());
+        let names: Vec<&str> = st.cursors.iter().map(|(name, _)| name).collect();
+        assert_eq!(names, vec!["e"]);
+        assert_eq!(st.cursors["e"].offset(), Some(-7200));
+        assert_eq!(st.cursors["e"].seen(), 0);
         assert_eq!(st.ledger, Ledger::default());
     }
 
@@ -539,7 +485,7 @@ mod tests {
         crate::util::capture_log();
         let st = State::load_at(&path, 5).unwrap();
         assert_eq!(st.ledger.sizes().remembered, 1);
-        assert!(st.nvr.is_empty());
+        assert!(st.cursors.is_empty());
         let log = crate::util::captured_log();
         assert_eq!(log.len(), 1, "{:?}", log);
         assert!(log[0].contains("3 line(s) could not be used"), "{}", log[0]);
@@ -552,16 +498,25 @@ mod tests {
     /// leave it: the file stays below `MAX_FILE`, so it is read back.
     #[test]
     fn a_full_state_fits_the_file_limit() {
-        let mut st = State::default();
+        let mut cursors = String::new();
         for name in ["nvr1", "nvr2"] {
-            let nvr = st.nvr.entry(name.to_string()).or_default();
-            nvr.since = MAX_TIME;
-            nvr.offset = Some(-MAX_TIME);
-            for i in 0..MAX_SEEN {
-                nvr.seen
-                    .insert(format!("{:032x}", u128::MAX - i as u128), 1_000_000);
+            cursors.push_str(&format!("nvr {} {} {}\n", name, MAX_TIME, -MAX_TIME));
+            let mut keys: Vec<String> = (0..MAX_SEEN)
+                .map(|i| format!("{:032x}", u128::MAX - i as u128))
+                .collect();
+            keys.sort();
+            for key in keys {
+                cursors.push_str(&format!("seen {} {} 1000000\n", name, key));
             }
         }
+        let mut st = State::parse(&format!("{}\n{}", HEADER, cursors));
+        for name in ["nvr1", "nvr2"] {
+            let cursor = &st.cursors[name];
+            assert_eq!(cursor.since(), MAX_TIME);
+            assert_eq!(cursor.offset(), Some(-MAX_TIME));
+            assert_eq!(cursor.seen(), MAX_SEEN);
+        }
+        assert_eq!(st.serialize(), format!("{}\n{}", HEADER, cursors));
         let address = |i: usize| Ipv4Addr::from(0xC000_0000u32 + i as u32);
         let per_address = MAX_FAIL_TIMES / MAX_TRACKED;
         let mut lines = String::new();

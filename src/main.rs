@@ -164,7 +164,7 @@ fn dump(engine: &mut Engine, hours: i64, raw: bool) -> usize {
     let meta_id = engine.cfg.meta_id.clone();
     let mut failed = 0;
     for reader in engine.readers.iter_mut() {
-        let nvr = &mut reader.nvr;
+        let nvr = reader.client();
         println!("=== {} ({})", nvr.name, nvr.url);
         let mut sink = Vec::new();
         let result = nvr.now().and_then(|now| {

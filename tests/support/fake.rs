@@ -1204,7 +1204,7 @@ impl Harness {
     }
 
     pub fn since(&self, nvr: &str) -> String {
-        device(self.engine.state.nvr[nvr].since)
+        device(self.engine.state.cursors[nvr].since())
     }
 
     /// Saves the state, loads it again and starts a new engine with it, as

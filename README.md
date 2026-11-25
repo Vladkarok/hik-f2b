@@ -156,7 +156,7 @@ image is built natively but has not been tried on real hardware. The deploy
 files use an exact version. To get it, run:
 
 ```bash
-podman pull ghcr.io/vladkarok/hik-f2b:0.4.0
+podman pull ghcr.io/vladkarok/hik-f2b:0.4.1
 ```
 
 For how versions are tagged and how to update, see
@@ -224,7 +224,7 @@ host's architecture. For an image that you built yourself, use
 `localhost/hik-f2b:latest`. Run:
 
 ```bash
-podman create --name hik-f2b-copy ghcr.io/vladkarok/hik-f2b:0.4.0
+podman create --name hik-f2b-copy ghcr.io/vladkarok/hik-f2b:0.4.1
 podman cp hik-f2b-copy:/hik-f2b ./hik-f2b
 podman rm hik-f2b-copy
 ```
@@ -269,7 +269,7 @@ podman run --rm --network host \
   -v ~/.config/hik-f2b:/etc/hik-f2b:ro,Z \
   --secret hik-f2b-router,uid=65532,mode=0400 \
   --secret hik-f2b-nvr,uid=65532,mode=0400 \
-  ghcr.io/vladkarok/hik-f2b:0.4.0 --dump --hours 72
+  ghcr.io/vladkarok/hik-f2b:0.4.1 --dump --hours 72
 ```
 
 To run `--check` in the container, put `--check` in place of
@@ -350,10 +350,10 @@ as these image tags:
 
 | Tag | Meaning |
 | --- | --- |
-| `0.4.0` | Exactly this release. It never changes. Use this one. |
+| `0.4.1` | Exactly this release. It never changes. Use this one. |
 | `0.4` | The newest `0.4.x` release; moves with every bug-fix release. |
 | `latest` | The newest release; moves with every release, including ones that need config changes. |
-| `0.4.0-rc.1` | A release candidate, for trying out before `0.4.0`. Never `latest`, never `0.4`. |
+| `0.4.1-rc.1` | A release candidate, for trying out before `0.4.1`. Never `latest`, never `0.4`. |
 
 Pin an exact version, as the deploy files do. Before 1.0, a new second number
 (`0.3` to `0.4`) may need changes to your config; the changelog says so.

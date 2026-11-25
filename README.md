@@ -1234,7 +1234,7 @@ vulnerability, see [SECURITY.md](SECURITY.md).
 | --- | --- | --- |
 | DS-7616NI-Q1 | V4.72.109 build 230107 | Failed logins are read and counted; a real brute-forcer was banned and stopped appearing in the log. |
 | DS-7732NXI-K4 | V4.83.013 build 241227 | Failed logins made on purpose over HTTP and from iVMS-4200 are read correctly: same format as above, over HTTP with an extra `additionInformation` field. No real attack to test a ban against. |
-| MikroTik RB5009, RouterOS | 7.18.1 | Setup commands work as written. Bans are added over REST with the CA certificate verified, repeated bans are recognised, entries expire on time, and the `raw` rule drops the banned address's packets. |
+| MikroTik RB5009, RouterOS | 7.18.1 | Setup commands work as written. Bans are added over REST with the CA certificate verified, repeated bans are recognised, entries expire on time, and the `raw` rule drops the banned address's packets. 0.5.0-rc.1 removed an own address from the address-list with `DELETE`. |
 
 The container image was run with a read-only filesystem, no capabilities,
 Podman secrets and a memory limit. A 25-minute unattended dry run against both
@@ -1274,6 +1274,53 @@ topic. When the NVR was reachable again, it sent the recovery notice. The
 checks behind the alerts were also run with `--check` against both NVRs and
 the router: the drop-rule check found enabled rules in `raw` and in `filter`
 and left a disabled one out.
+
+Release candidate 0.5.0-rc.1 (the published `linux/amd64` image) was run on
+25 November 2026 on the same host with rootless Podman, which reaches the
+router and both NVRs through a VPN tunnel. The device URLs in the config
+hold addresses, not host names. `--check` passed, `--dump` for 72 hours
+printed the same lines as 0.4.0, and a 400-second dry run on a copy of the
+state file had no warnings.
+
+Own addresses: the start line and `--check` named the addresses of the
+router and of both NVRs, and the local address of the host toward each of
+them (the same for all three: the address of the tunnel). The real router
+answered the look-ups of the own addresses in the address-list: while the
+address-list held one entry of another address (a real ban), none of the
+look-ups found an entry. So RouterOS applies the `list` and `address`
+filters of the request together.
+
+The removal was tried with the host's own address put into the address-list
+by hand with `--test-ban` of 0.4.0 (an entry with a 60-second timeout). With
+`--once --dry-run`, hik-f2b logged the `DRY RUN: ... it would be removed`
+warning for that address only and left the entry, which expired by itself
+after 60 seconds. With `--once` and bans applied, hik-f2b logged that the
+entry is removed, one second after it was added, and sent the Telegram
+notification about the removal. The router then showed the entry gone and
+the other entry of the address-list untouched. So RouterOS 7.18.1 accepts
+the `DELETE` of a timed (dynamic) address-list entry by its id. While its
+own address was in the address-list, the host still reached the router and
+the NVRs: on this site the drop rule matches only packets that come in from
+the WAN, and the host comes through the tunnel.
+
+Host names in `ignoreip` were tried on the real host with `--check` and a
+test copy of the config. A public name was resolved through the host's real
+resolver, and `--check` printed it with its address. A name that does not
+exist gave a FAILED line and the exit status 1.
+
+The safe list was tried with a test copy of the config in which `safe_list`
+named an address-list that no firewall rule uses. No firewall rule was added
+or changed on the router. `--check` and the start of hik-f2b reported that
+no rule in `/ip/firewall/raw` uses the safe list, with the message to add
+one with `action=accept` above the drop rule. For this the real router
+answered the request for the ids of the rules of the table, and the drop
+rule was found among them. `--once --dry-run` logged what it would keep in
+the safe list and wrote nothing. `--once` then added the host's address
+toward the router with a 30-minute timeout (the `PUT`): the router showed a
+dynamic entry with the comment `hik-f2b own address`. A second `--once` 26
+seconds later renewed it with `PATCH`: the router showed the same entry
+(same creation time) with the timeout back at 30 minutes. `--check` then
+said that the address is in the safe list.
 
 CI (GitHub Actions) tries the deploy files on every push, with a dummy config
 only: the router and the NVR are addresses that nothing answers, the secrets
@@ -1326,24 +1373,25 @@ Not yet tried:
   several challenges in one `WWW-Authenticate` header, a user name with a bare
   `&`, and a clock set before 1970. Only the tests make these happen.
 - Notify-only mode on real devices.
-- The own addresses of 0.5.0 on real devices: none of it has been tried
-  yet. Not the addresses this host finds toward a real router and NVR, nor
-  a host name in a device URL, nor the start line and `--check` with real
-  devices. Not the removal of an own address from a real router's
-  address-list either: the `DELETE` request, the answers of RouterOS to it
-  (also for a router user without the `write` policy) and the
-  `own-address-listed` alert. Only the tests and the simulation make these
-  happen.
-- The host names in `ignoreip` of 0.5.0 on a real host: none of it has
-  been tried yet. Not the look-up through a real resolver (with a dynamic
-  DNS name or otherwise), nor the start line and `--check` with a real
-  name. Only the tests and the simulation make these happen.
-- The safe list of 0.5.0 on a real router: none of it has been tried yet.
-  Not the rule command of the setup (with `place-before`), the renewal of a
-  timeout with `PATCH`, the answers of RouterOS to the safe-list requests,
-  the order in which it lists the rules of a table, nor the `action`
-  property in its answer. Only the tests and the simulation make these
-  happen.
+- The own addresses of 0.5.0 with a host name in a device URL (the config
+  of the tries above holds addresses). Also not tried: the answers of
+  RouterOS to the `DELETE` for a router user without the `write` policy, a
+  removal that fails and the `own-address-listed` alert, and the removal of
+  an entry without a timeout (a static one). Only the tests and the
+  simulation make these happen.
+- The host names in `ignoreip` of 0.5.0 beyond `--check`: a dynamic DNS
+  name, the service running with a name in `ignoreip` (the start line, the
+  look-up every 5 minutes, a change of the address while it runs), and a
+  failed login from an address of such a name. Only the tests and the
+  simulation make these happen.
+- The safe list of 0.5.0 with an accept rule on a real router: the rule
+  command of the setup (with `place-before`), the check of the order with a
+  real accept rule above or below the drop rule, and the `action` property
+  in a real answer. Also not tried: a refused write and the
+  `safe-list-refused` alert, an entry of the safe list made by hand without
+  a timeout, and the service running for longer with a safe list (the
+  renewal at every firewall check). Only the tests and the simulation make
+  these happen.
 - A ban with a country on real devices: only `--country` and `--check` were
   run against a real database file.
 - MaxMind GeoLite2 City and IPinfo Lite database files.

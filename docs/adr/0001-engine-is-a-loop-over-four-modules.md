@@ -32,3 +32,14 @@ The split must not change what an operator sees: the hik-f2b log, the
 notifications, the config and the state file stay as they were. The
 simulation test gives the same counts for the same seeds before and after
 each step.
+
+## As built (0.4.1)
+
+The code differs from the decision above in four places. A fifth module,
+`src/check.rs`, holds the checks of `--check`. The read cursors of the NVR
+log readers and the ban ledger live in `State`, which is saved and loaded
+as a whole; for a poll, the engine lends a reader the cursors. The engine
+still renders the notification texts, looks up the country of an address
+and writes the health notices to the hik-f2b log. The engine's fields are
+private, and four read-only methods remain for tests: `alerted_problems`,
+`queued_notifications`, `state` and `readers`.

@@ -759,7 +759,7 @@ impl Sim {
                 let stored = self
                     .h
                     .engine
-                    .state
+                    .state()
                     .cursors
                     .get(&self.nvr[n].name)
                     .and_then(|st| st.offset());
@@ -1209,7 +1209,7 @@ impl Sim {
             self.cycle()?;
         }
         let mut rounds = 0;
-        while self.h.engine.state.ledger.waiting() > 0 && rounds < 48 {
+        while self.h.engine.state().ledger.waiting() > 0 && rounds < 48 {
             self.host += 600;
             self.cycle()?;
             rounds += 1;
@@ -1267,7 +1267,7 @@ impl Sim {
             instance: self.instance,
             nvr_ok,
             router: self.router,
-            pending_after: self.h.engine.state.ledger.waiting() > 0,
+            pending_after: self.h.engine.state().ledger.waiting() > 0,
             transport: false,
             refused: false,
             ban_pass: false,
@@ -1438,7 +1438,7 @@ impl Sim {
             self.note(format!("  -> {}", events.join(", ")));
         }
         self.cycles.push(cycle);
-        let state = &self.h.engine.state;
+        let state = self.h.engine.state();
         let started: Vec<usize> = (0..self.p.nvrs)
             .filter(|&n| !self.nvr[n].started && state.cursors.get(&self.nvr[n].name).is_some())
             .collect();
@@ -1457,7 +1457,7 @@ impl Sim {
             .map(|n| {
                 self.h
                     .engine
-                    .state
+                    .state()
                     .cursors
                     .get(&n.name)
                     .and_then(|st| st.offset())
@@ -1626,7 +1626,7 @@ impl Sim {
     }
 
     fn check_state(&self) -> Result<(), String> {
-        let state = &self.h.engine.state;
+        let state = self.h.engine.state();
         if State::parse(&state.serialize()) != *state {
             return Err("[state] the state does not load back from its file format".to_string());
         }

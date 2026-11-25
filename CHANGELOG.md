@@ -43,6 +43,17 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   log reader per NVR and unit tests of its own. hik-f2b behaves as before:
   the hik-f2b log, what hik-f2b asks the NVR and the state file are
   unchanged.
+- The queue of notifications (how many may wait, how often hik-f2b tries to
+  send one before it drops it, and the wait that Telegram asks for) moved
+  into its own module, `src/outbox.rs`, with unit tests of its own. hik-f2b
+  behaves as before: the notifications, the times they are sent and the
+  hik-f2b log are unchanged.
+- `--check`, `--dump`, `--test-ban` and `--test-notify` run on the router,
+  Telegram and NVR clients that the config asks for, without the part of
+  hik-f2b that runs as a service; the checks of `--check` moved into
+  `src/check.rs`. What these options print, their exit status and what
+  they ask of the devices are unchanged, and new tests compare their output
+  exactly.
 
 ### Fixed
 

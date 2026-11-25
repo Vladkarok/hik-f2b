@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
 use hik_f2b::action::{BanTime, Firewall, Notifier};
+use hik_f2b::check;
 use hik_f2b::config::{self, Config};
 use hik_f2b::country;
 use hik_f2b::engine::Engine;
 use hik_f2b::health::Status;
 use hik_f2b::mikrotik::Mikrotik;
+use hik_f2b::nvr::Nvr;
 use hik_f2b::state::State;
 use hik_f2b::telegram::Telegram;
 use hik_f2b::{info, util, warn};
@@ -160,11 +162,10 @@ fn check_combination(args: &Args) -> Result<(), String> {
 
 /// Shows what the NVRs return, to check field names and `log_filter`.
 /// Returns how many NVRs could not be read.
-fn dump(engine: &mut Engine, hours: i64, raw: bool) -> usize {
-    let meta_id = engine.cfg.meta_id.clone();
+fn dump(cfg: &Config, nvrs: &mut [Nvr], hours: i64, raw: bool) -> usize {
+    let meta_id = cfg.meta_id.clone();
     let mut failed = 0;
-    for reader in engine.readers.iter_mut() {
-        let nvr = reader.client();
+    for nvr in nvrs.iter_mut() {
         println!("=== {} ({})", nvr.name, nvr.url);
         let mut sink = Vec::new();
         let result = nvr.now().and_then(|now| {
@@ -210,7 +211,7 @@ fn dump(engine: &mut Engine, hours: i64, raw: bool) -> usize {
                 "{}  {}  ip={:<15} user={:<18} {}",
                 if ambiguous {
                     "AMBIG"
-                } else if engine.cfg.log_filter.is_match(&ev.meta) {
+                } else if cfg.log_filter.is_match(&ev.meta) {
                     "MATCH"
                 } else {
                     "     "
@@ -227,6 +228,71 @@ fn dump(engine: &mut Engine, hours: i64, raw: bool) -> usize {
     failed
 }
 
+/// `--check`, `--dump`, `--test-ban` or `--test-notify`, with the clients
+/// set up from the config; no engine is involved.
+fn one_shot(
+    args: &Args,
+    cfg: &Config,
+    nvrs: &mut [Nvr],
+    mikrotik: Option<&Mikrotik>,
+    telegram: Option<&Telegram>,
+) -> Result<(), String> {
+    if args.check {
+        let lines = check::check_all(
+            cfg,
+            nvrs,
+            mikrotik.map(|m| m as &dyn Firewall),
+            util::unix_now(),
+        );
+        for line in &lines {
+            println!("{}", util::terminal_safe(&line.to_string()));
+        }
+        let failed = lines
+            .iter()
+            .filter(|line| line.status == Status::Failed)
+            .count();
+        if failed > 0 {
+            return Err(format!("{} check(s) failed", failed));
+        }
+        return Ok(());
+    }
+    if args.dump {
+        let failed = dump(cfg, nvrs, args.hours.unwrap_or(24), args.raw);
+        if failed > 0 {
+            return Err(format!(
+                "{} of {} NVR(s) could not be read",
+                failed,
+                nvrs.len()
+            ));
+        }
+        return Ok(());
+    }
+    if let Some(ip) = args.test_ban {
+        let firewall = mikrotik.ok_or_else(|| {
+            "--test-ban needs a firewall, but there is no [mikrotik] section in the config"
+                .to_string()
+        })?;
+        let added = firewall
+            .ban(ip, BanTime::Seconds(60), "hik-f2b test")
+            .map_err(|e| e.to_string())?;
+        println!(
+            "ok: {} {} {} (60 s)",
+            ip,
+            if added { "added to" } else { "is already in" },
+            firewall.describe()
+        );
+        return Ok(());
+    }
+    if args.test_notify {
+        let notifier = telegram.ok_or_else(|| "no [telegram] section in the config".to_string())?;
+        notifier
+            .send("hik-f2b test message: notifications work.")
+            .map_err(|e| e.to_string())?;
+        println!("ok: test message sent");
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let Some(args) = parse_args(std::env::args().skip(1))? else {
         return Ok(());
@@ -234,6 +300,7 @@ fn run() -> Result<(), String> {
     util::set_verbose(args.verbose);
     let path = args
         .config
+        .clone()
         .unwrap_or_else(|| PathBuf::from("/etc/hik-f2b/hik-f2b.ini"));
     let mut cfg = Config::load(&path)?;
     cfg.dry_run = cfg.dry_run || args.dry_run;
@@ -318,68 +385,25 @@ fn run() -> Result<(), String> {
             );
         }
     }
+    if !daemon {
+        // Every NVR's client is set up before the command runs, as for the
+        // service, so a client that cannot be set up fails every command.
+        let mut nvrs = cfg
+            .nvrs
+            .iter()
+            .map(Nvr::new)
+            .collect::<Result<Vec<_>, _>>()?;
+        return one_shot(&args, &cfg, &mut nvrs, mikrotik.as_ref(), telegram.as_ref());
+    }
     // MikroTik-specific, so it needs a client of its own: the engine only
     // knows a plain firewall.
-    let counter = match (&cfg.mikrotik, daemon) {
-        (Some(m), true) => Some(Mikrotik::new(m)?),
-        _ => None,
+    let counter = match &cfg.mikrotik {
+        Some(m) => Some(Mikrotik::new(m)?),
+        None => None,
     };
     let firewall = mikrotik.map(|m| Box::new(m) as Box<dyn Firewall>);
     let notifier = telegram.map(|t| Box::new(t) as Box<dyn Notifier>);
-    let mut engine = Engine::with_parts(cfg, state, firewall, notifier)?;
-
-    if args.check {
-        let lines = engine.check_all();
-        for line in &lines {
-            println!("{}", util::terminal_safe(&line.to_string()));
-        }
-        let failed = lines
-            .iter()
-            .filter(|line| line.status == Status::Failed)
-            .count();
-        if failed > 0 {
-            return Err(format!("{} check(s) failed", failed));
-        }
-        return Ok(());
-    }
-    if args.dump {
-        let failed = dump(&mut engine, args.hours.unwrap_or(24), args.raw);
-        if failed > 0 {
-            return Err(format!(
-                "{} of {} NVR(s) could not be read",
-                failed,
-                engine.readers.len()
-            ));
-        }
-        return Ok(());
-    }
-    if let Some(ip) = args.test_ban {
-        let firewall = engine.firewall.as_ref().ok_or_else(|| {
-            "--test-ban needs a firewall, but there is no [mikrotik] section in the config"
-                .to_string()
-        })?;
-        let added = firewall
-            .ban(ip, BanTime::Seconds(60), "hik-f2b test")
-            .map_err(|e| e.to_string())?;
-        println!(
-            "ok: {} {} {} (60 s)",
-            ip,
-            if added { "added to" } else { "is already in" },
-            firewall.describe()
-        );
-        return Ok(());
-    }
-    if args.test_notify {
-        let notifier = engine
-            .notifier
-            .as_ref()
-            .ok_or_else(|| "no [telegram] section in the config".to_string())?;
-        notifier
-            .send("hik-f2b test message: notifications work.")
-            .map_err(|e| e.to_string())?;
-        println!("ok: test message sent");
-        return Ok(());
-    }
+    let mut engine = Engine::new(cfg, state, firewall, notifier)?;
 
     // A stop takes effect between the steps of a cycle (see
     // `Engine::cycle_at`); the state is saved before hik-f2b exits.

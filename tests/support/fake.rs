@@ -8,10 +8,15 @@
 
 #![allow(dead_code)]
 
+use hik_f2b::action::{Firewall, Notifier};
+use hik_f2b::check;
 use hik_f2b::config::Config;
 use hik_f2b::engine::Engine;
-use hik_f2b::nvr::parse_kv;
+use hik_f2b::health::CheckLine;
+use hik_f2b::mikrotik::Mikrotik;
+use hik_f2b::nvr::{parse_kv, Nvr};
 use hik_f2b::state::State;
+use hik_f2b::telegram::Telegram;
 use hik_f2b::util;
 use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Read, Write};
@@ -986,32 +991,41 @@ impl Default for Opts {
 pub struct Harness {
     pub fake: Arc<Mutex<Fake>>,
     pub fake2: Option<Arc<Mutex<Fake>>>,
+    /// Declared before `servers`, so it is dropped first (see `Servers`).
     pub engine: Engine,
     pub dir: PathBuf,
     pub ini: String,
     pub port: u16,
     pub host: i64,
-    /// The fakes' servers, stopped when the harness is dropped.
-    servers: Vec<FakeServer>,
+    /// The fakes' servers, stopped when the harness is dropped. The last
+    /// field: the fields of a struct are dropped in their order.
+    servers: Servers,
 }
 
 impl Drop for Harness {
-    /// Removes the directory and stops the fakes' servers: their threads
-    /// end and are joined, their sockets close. A thread that has not ended
-    /// within `STOP_TIMEOUT` fails the test (it is left running).
+    /// Removes the directory. Then the fields are dropped: the engine
+    /// first, then the fakes' servers.
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.dir);
-        // The engine's clients close their idle connections, which ends
-        // the threads serving them. `stop` also shuts the connections down
-        // from the server side, but on Windows that does not wake a thread
-        // blocked reading.
-        self.engine.readers.clear();
-        self.engine.firewall = None;
-        self.engine.notifier = None;
+    }
+}
+
+/// The servers of a harness's fakes.
+struct Servers(Vec<FakeServer>);
+
+impl Drop for Servers {
+    /// Stops the servers: their threads end and are joined, their sockets
+    /// close. A thread that has not ended within `STOP_TIMEOUT` fails the
+    /// test (it is left running). The harness's engine has been dropped
+    /// before: its clients closed their idle connections, which ends the
+    /// threads serving them. `stop` also shuts the connections down from
+    /// the server side, but on Windows that does not wake a thread blocked
+    /// reading.
+    fn drop(&mut self) {
         sample_conntrack();
         let deadline = Instant::now() + STOP_TIMEOUT;
         let stuck: Vec<String> = self
-            .servers
+            .0
             .iter_mut()
             .filter_map(|server| server.stop(deadline).err())
             .collect();
@@ -1088,7 +1102,7 @@ impl Harness {
                 port, TOKEN, opts.telegram_extra
             ));
         }
-        let engine = Engine::new(Config::parse(&ini).unwrap(), State::default()).unwrap();
+        let engine = start(&ini, State::default());
         let mut h = Harness {
             fake,
             fake2,
@@ -1097,7 +1111,7 @@ impl Harness {
             ini,
             port,
             host: 0,
-            servers,
+            servers: Servers(servers),
         };
         h.set_host(host_of("10:00:00"));
         h
@@ -1200,22 +1214,79 @@ impl Harness {
     }
 
     pub fn fails(&self, address: &str) -> usize {
-        self.engine.state.ledger.failed_logins(ip(address))
+        self.engine.state().ledger.failed_logins(ip(address))
     }
 
     pub fn since(&self, nvr: &str) -> String {
-        device(self.engine.state.cursors[nvr].since())
+        device(self.engine.state().cursors[nvr].since())
     }
 
-    /// Saves the state, loads it again and starts a new engine with it, as
-    /// a restart of the daemon does.
+    /// Saves the state, loads it again and starts a new engine with it and
+    /// with `ini` as it is now, as a restart of the service does.
     pub fn restart(&mut self) {
-        let path = self.dir.join("state");
-        self.engine.state.save(&path).unwrap();
-        let restored = State::load(&path).unwrap();
-        assert_eq!(restored, self.engine.state, "state file round trip");
-        self.engine = Engine::new(Config::parse(&self.ini).unwrap(), restored).unwrap();
+        let restored = self.round_trip(self.engine.state());
+        self.engine = start(&self.ini, restored);
     }
+
+    /// Starts a new engine with `state` instead of the engine's own, saved
+    /// and loaded again, as a restart with that state file does.
+    pub fn restart_with(&mut self, state: State) {
+        let restored = self.round_trip(&state);
+        self.engine = start(&self.ini, restored);
+    }
+
+    fn round_trip(&self, state: &State) -> State {
+        let path = self.dir.join("state");
+        state.save(&path).unwrap();
+        let restored = State::load(&path).unwrap();
+        assert_eq!(&restored, state, "state file round trip");
+        restored
+    }
+
+    /// The config of the harness, as the engine was given it.
+    pub fn config(&self) -> Config {
+        Config::parse(&self.ini).unwrap()
+    }
+
+    /// A router client of its own, set up from the config.
+    pub fn router(&self) -> Mikrotik {
+        Mikrotik::new(self.config().mikrotik.as_ref().unwrap()).unwrap()
+    }
+
+    /// A client of its own for the NVR `name`, set up from the config.
+    pub fn nvr(&self, name: &str) -> Nvr {
+        let cfg = self.config();
+        Nvr::new(cfg.nvrs.iter().find(|n| n.name == name).unwrap()).unwrap()
+    }
+
+    /// `--check` at the harness's host time, as hik-f2b runs it: with
+    /// clients of its own, set up from the config.
+    pub fn check(&self) -> Vec<CheckLine> {
+        let cfg = self.config();
+        let mut nvrs: Vec<Nvr> = cfg.nvrs.iter().map(|n| Nvr::new(n).unwrap()).collect();
+        let router = cfg.mikrotik.as_ref().map(|m| Mikrotik::new(m).unwrap());
+        check::check_all(
+            &cfg,
+            &mut nvrs,
+            router.as_ref().map(|m| m as &dyn Firewall),
+            self.host as u64,
+        )
+    }
+}
+
+/// An engine with the router and Telegram clients `ini` asks for, set up
+/// as `main.rs` sets them up.
+fn start(ini: &str, state: State) -> Engine {
+    let cfg = Config::parse(ini).unwrap();
+    let firewall = cfg
+        .mikrotik
+        .as_ref()
+        .map(|m| Box::new(Mikrotik::new(m).unwrap()) as Box<dyn Firewall>);
+    let notifier = cfg
+        .telegram
+        .as_ref()
+        .map(|t| Box::new(Telegram::new(t).unwrap()) as Box<dyn Notifier>);
+    Engine::new(cfg, state, firewall, notifier).unwrap()
 }
 
 /// Runs `n` cycles, `step` seconds apart.

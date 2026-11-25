@@ -12,17 +12,20 @@
 //! firewall check and each ban attempt went, how the ban loop ended and when
 //! the poll ends; that module decides which health check this opens or ends
 //! and when it is worth an alert.
+//!
+//! Notifications (about bans and from health) are rendered here and handed
+//! to the outbox (`outbox.rs`) as texts; at the end of the poll the outbox
+//! sends what it can.
 
-use crate::action::{render, BanError, BanInfo, Firewall, HealthError, Notifier, NotifyError};
+use crate::action::{render, BanError, BanInfo, Firewall, HealthError, Notifier};
 use crate::config::{Config, DEFAULT_MESSAGE};
 use crate::country::{self, Code};
-use crate::health::{BanAttempt, BansEnded, CheckLine, Health, Kind, Notice, NvrRead, Status};
+use crate::health::{BanAttempt, BansEnded, Health, Kind, Notice, NvrRead};
 use crate::ledger::{Outcome, Rules, Turn};
-use crate::mikrotik::Mikrotik;
-use crate::nvr::{Nvr, NvrError, Search};
+use crate::nvr::{Nvr, NvrError};
+use crate::outbox::Outbox;
 use crate::reader::{LogReader, Login, Logins, Poll};
 use crate::state::State;
-use crate::telegram::Telegram;
 use crate::util::{self, host_i64};
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
@@ -30,64 +33,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const MAX_QUEUED_NOTIFICATIONS: usize = 100;
-const NOTIFY_ATTEMPTS: u32 = 5;
-/// The longest wait for the messenger that is kept: one further away can
-/// only come from the host clock having gone back.
-const MAX_NOTIFY_WAIT: u64 = 3600;
-/// `--check` searches the log of the last day before the device time...
-const CHECK_WINDOW: i64 = 86400;
-/// ...and reads at most this many pages of it, so it stays quick on a busy
-/// NVR. Two pages tell the page size and, mostly, the order.
-const CHECK_PAGES: usize = 2;
-
-/// The device clock against the host clock, for `--check`: what the log
-/// reader subtracts from device times.
-fn describe_offset(offset: i64) -> String {
-    let abs = offset.unsigned_abs();
-    let hms = format!("{}:{:02}:{:02}", abs / 3600, abs / 60 % 60, abs % 60);
-    match offset {
-        0 => "same as the host clock".to_string(),
-        o if o > 0 => format!("{} ahead of the host clock", hms),
-        _ => format!("{} behind the host clock", hms),
-    }
-}
-
-/// What a `--check` search showed about the NVR's log: the order of the
-/// entries (the log reader reads both, see `read_window` in `reader.rs`) and
-/// the page size.
-fn describe_log(search: &Search) -> String {
-    let times: Vec<i64> = search.events.iter().filter_map(|ev| ev.ts).collect();
-    let up = times.windows(2).any(|w| w[0] < w[1]);
-    let down = times.windows(2).any(|w| w[0] > w[1]);
-    let order = match (up, down) {
-        (true, false) => "oldest first",
-        (false, true) => "newest first",
-        (false, false) => "order not known",
-        (true, true) => "neither oldest nor newest first",
-    };
-    let page = match search.page_size {
-        Some(n) => format!("{} entries per page", n),
-        None => "page size not known".to_string(),
-    };
-    let mut out = format!("{}, {}", order, page);
-    if !(up || down) || search.page_size.is_none() {
-        out.push_str(&format!(
-            " ({} entries read from the last 24 h)",
-            search.events.len()
-        ));
-    }
-    out
-}
-
 pub struct Engine {
-    pub cfg: Config,
-    pub state: State,
-    pub readers: Vec<LogReader>,
-    pub firewall: Option<Box<dyn Firewall>>,
-    pub notifier: Option<Box<dyn Notifier>>,
+    cfg: Config,
+    state: State,
+    readers: Vec<LogReader>,
+    firewall: Option<Box<dyn Firewall>>,
+    outbox: Outbox,
     template: String,
-    notifications: Vec<(String, u32)>,
     health: Health,
     /// The reason the last country lookup failed, if it did: a failure is
     /// logged when its reason changes, a recovery once.
@@ -95,10 +47,6 @@ pub struct Engine {
     /// Set (by a signal handler) when the service is to stop. A cycle
     /// looks at it between its steps (see `cycle_at`).
     stop: Arc<AtomicBool>,
-    /// Notifications not queued in this cycle because the queue was full.
-    dropped_notifications: usize,
-    /// Host time before which the messenger asked not to be sent anything.
-    notify_after: u64,
 }
 
 /// Counts one failed login (host time) in the ledger, which queues the ban
@@ -123,22 +71,11 @@ fn register(login: &Login, host_now: i64, rules: &Rules, state: &mut State, repo
 }
 
 impl Engine {
-    /// An engine with the router and Telegram clients the configuration
-    /// asks for.
-    pub fn new(cfg: Config, state: State) -> Result<Engine, String> {
-        let firewall: Option<Box<dyn Firewall>> = match &cfg.mikrotik {
-            Some(m) => Some(Box::new(Mikrotik::new(m)?)),
-            None => None,
-        };
-        let notifier: Option<Box<dyn Notifier>> = match &cfg.telegram {
-            Some(t) => Some(Box::new(Telegram::new(t)?)),
-            None => None,
-        };
-        Engine::with_parts(cfg, state, firewall, notifier)
-    }
-
-    /// An engine with the given firewall and notifier (either may be absent).
-    pub fn with_parts(
+    /// An engine that starts from `state` (what the state file held, or
+    /// an empty state) with the given firewall and notifier (either may be
+    /// absent; `main.rs` gives it the router and Telegram clients the
+    /// configuration asks for). It sets up a client per NVR of `cfg`.
+    pub fn new(
         cfg: Config,
         state: State,
         firewall: Option<Box<dyn Firewall>>,
@@ -160,13 +97,10 @@ impl Engine {
             state,
             readers,
             firewall,
-            notifier,
+            outbox: Outbox::new(notifier),
             template,
-            notifications: Vec::new(),
             country_failure: None,
             stop: Arc::new(AtomicBool::new(false)),
-            dropped_notifications: 0,
-            notify_after: 0,
         };
         engine.state.ledger.fit(&Rules::of(&engine.cfg));
         Ok(engine)
@@ -297,25 +231,15 @@ impl Engine {
         }
     }
 
-    /// Logs the health notices that are due and queues them for the chat.
+    /// Logs the health notices that are due and queues them for the chat
+    /// (the outbox keeps nothing without a notifier).
     fn report_health(&mut self, host_now: u64) {
-        let to_chat =
-            self.notifier.is_some() && self.cfg.telegram.as_ref().is_none_or(|t| t.health_alerts);
+        let to_chat = self.cfg.telegram.as_ref().is_none_or(|t| t.health_alerts);
         for notice in self.health.due(host_now) {
             log_notice(&notice);
             if to_chat {
-                self.queue_notification(notice.text());
+                self.outbox.queue(notice.text());
             }
-        }
-    }
-
-    /// Queues a message for the chat; counts it as dropped when
-    /// `MAX_QUEUED_NOTIFICATIONS` already wait.
-    fn queue_notification(&mut self, text: String) {
-        if self.notifications.len() < MAX_QUEUED_NOTIFICATIONS {
-            self.notifications.push((text, 0));
-        } else {
-            self.dropped_notifications += 1;
         }
     }
 
@@ -325,105 +249,8 @@ impl Engine {
         self.health.alerted()
     }
 
-    /// `--check` at the current host time.
-    pub fn check_all(&mut self) -> Vec<CheckLine> {
-        self.check_all_at(util::unix_now())
-    }
-
-    /// `--check`: every health check once. Only reads: the state, the
-    /// alerts and the firewall are left as they are, and nothing is sent.
-    /// `host_now` is the host's Unix time.
-    pub fn check_all_at(&mut self, host_now: u64) -> Vec<CheckLine> {
-        let mut out = Vec::new();
-        let meta_id = self.cfg.meta_id.clone();
-        for reader in self.readers.iter_mut() {
-            let nvr = reader.client();
-            // The device time proves that the NVR answers and accepts the
-            // login; a search, that the user may search the log. The search
-            // also shows what the engine relies on (see `describe_log`).
-            let result = nvr.now().and_then(|now| {
-                nvr.sample(
-                    now.saturating_sub(CHECK_WINDOW),
-                    now.saturating_add(60),
-                    &meta_id,
-                    CHECK_PAGES,
-                )
-                .map(|search| (now, search))
-            });
-            let (status, detail, log) = match result {
-                Ok((now, search)) => (
-                    Status::Ok,
-                    format!(
-                        "login accepted, device time {} ({}), log search works",
-                        util::fmt_ts(now),
-                        describe_offset(now.saturating_sub(host_i64(host_now)))
-                    ),
-                    Some(describe_log(&search)),
-                ),
-                Err(NvrError::Auth(e)) => (Status::Failed, format!("login rejected ({})", e), None),
-                Err(NvrError::Other(e)) => (Status::Failed, e, None),
-            };
-            out.push(CheckLine {
-                item: format!("nvr {}", nvr.name),
-                status,
-                detail,
-            });
-            if let Some(detail) = log {
-                out.push(CheckLine {
-                    item: format!("nvr {} log", nvr.name),
-                    status: Status::Ok,
-                    detail,
-                });
-            }
-        }
-        let (status, detail) = match &self.firewall {
-            None => (Status::Off, "not configured (notify-only mode)".to_string()),
-            Some(fw) => match fw.check() {
-                Ok(found) => (Status::Ok, found),
-                Err(e) => (Status::Failed, e.to_string()),
-            },
-        };
-        out.push(CheckLine {
-            item: "firewall".to_string(),
-            status,
-            detail,
-        });
-        let (status, detail) = match &self.cfg.telegram {
-            None => (Status::Off, "not configured".to_string()),
-            Some(t) => (
-                Status::Ok,
-                format!(
-                    "configured, health alerts {}; nothing sent (see --test-notify)",
-                    if t.health_alerts { "on" } else { "off" }
-                ),
-            ),
-        };
-        out.push(CheckLine {
-            item: "telegram".to_string(),
-            status,
-            detail,
-        });
-        // A lookup proves that the search tree can be walked, not only that
-        // the metadata can be read.
-        let (status, detail) = match &self.cfg.country_db {
-            None => (Status::Off, "not configured".to_string()),
-            Some(path) => match country::info(path)
-                .and_then(|info| country::lookup(path, Ipv4Addr::new(192, 0, 2, 1)).map(|_| info))
-            {
-                Ok(info) => (Status::Ok, info.describe()),
-                Err(e) => (Status::Failed, e),
-            },
-        };
-        out.push(CheckLine {
-            item: "country database".to_string(),
-            status,
-            detail,
-        });
-        out
-    }
-
     /// One full pass at the current host time.
-    pub fn cycle(&mut self) {
+    fn cycle(&mut self) {
         self.cycle_at(util::unix_now());
     }
 
@@ -483,7 +310,7 @@ impl Engine {
             self.periodic_check(host_now);
         }
         self.report_health(host_now);
-        self.flush_notifications(host_now);
+        self.outbox.send(host_now, &self.stop);
         self.cleanup(host_now);
         if self.stopping() {
             crate::info!(
@@ -628,7 +455,7 @@ impl Engine {
             self.state
                 .ledger
                 .outcome(&Rules::of(&self.cfg), ip, now, outcome);
-            if notify && self.notifier.is_some() {
+            if notify {
                 // The flag only goes to the chat.
                 let country = code
                     .map(|c| format!(" ({} {})", c.flag(), c))
@@ -646,73 +473,11 @@ impl Engine {
                         findtime: self.cfg.findtime,
                     },
                 );
-                self.queue_notification(text);
+                self.outbox.queue(text);
             }
         }
         self.health
             .bans_ended(end, self.state.ledger.waiting(), now);
-    }
-
-    /// Notifications never hold up a ban: they are sent afterwards and
-    /// retried on later cycles if the messenger is unreachable. The first
-    /// failure ends the attempt for this cycle, so an unreachable service
-    /// costs at most one timeout per cycle. When the messenger asks to wait
-    /// (too many messages), nothing is sent until then, and that wait is not
-    /// a failed attempt.
-    fn flush_notifications(&mut self, now: u64) {
-        if self.dropped_notifications > 0 {
-            crate::warn!(
-                "{} notification(s) dropped: {} already wait to be sent",
-                self.dropped_notifications,
-                MAX_QUEUED_NOTIFICATIONS
-            );
-            self.dropped_notifications = 0;
-        }
-        let Some(notifier) = &self.notifier else {
-            self.notifications.clear();
-            return;
-        };
-        if self.notify_after > now {
-            if self.notify_after - now <= MAX_NOTIFY_WAIT {
-                return;
-            }
-            self.notify_after = 0;
-        }
-        while let Some((text, attempts)) = self.notifications.first().cloned() {
-            if self.stop.load(Ordering::Relaxed) {
-                break;
-            }
-            match notifier.send(&text) {
-                Ok(()) => {
-                    crate::debug!("notification sent");
-                    self.notifications.remove(0);
-                }
-                Err(NotifyError::RateLimited(wait)) => {
-                    crate::info!(
-                        "Telegram asks to wait {} s before the next message; {} notification(s) \
-                         wait",
-                        wait,
-                        self.notifications.len()
-                    );
-                    self.notify_after = now.saturating_add(wait);
-                    break;
-                }
-                Err(NotifyError::Failed(e)) => {
-                    if attempts + 1 >= NOTIFY_ATTEMPTS {
-                        crate::error!(
-                            "notification dropped after {} attempts: {}",
-                            NOTIFY_ATTEMPTS,
-                            e
-                        );
-                        self.notifications.remove(0);
-                    } else {
-                        crate::warn!("notification failed, will retry: {}", e);
-                        self.notifications[0].1 = attempts + 1;
-                    }
-                    break;
-                }
-            }
-        }
     }
 
     fn cleanup(&mut self, host_now: u64) {
@@ -721,7 +486,19 @@ impl Engine {
 
     /// Notifications waiting to be sent (for tests and diagnostics).
     pub fn queued_notifications(&self) -> usize {
-        self.notifications.len()
+        self.outbox.waiting()
+    }
+
+    /// What the engine remembers: the ledger and the read cursors, as the
+    /// state file holds them (for tests and diagnostics).
+    pub fn state(&self) -> &State {
+        &self.state
+    }
+
+    /// The NVR log readers, one per NVR of the config, in its order (for
+    /// tests and diagnostics).
+    pub fn readers(&self) -> &[LogReader] {
+        &self.readers
     }
 }
 

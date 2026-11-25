@@ -59,6 +59,12 @@ pub enum Check {
     /// An own address is in the address-list and hik-f2b could not remove
     /// it. Over once a look-up of every own address finds none listed.
     OwnListed,
+    /// With a safe list: no enabled, valid rule accepts the safe list
+    /// before the drop rule, so an own address that is banned is blocked.
+    SafeRule,
+    /// With a safe list: the firewall answers, but refuses to write the
+    /// own address to it. Only a write that works ends it.
+    SafeRefused,
 }
 
 impl Check {
@@ -72,6 +78,8 @@ impl Check {
             Check::BanRefused => "ban-refused".to_string(),
             Check::Bypassed => "ban-bypassed".to_string(),
             Check::OwnListed => "own-address-listed".to_string(),
+            Check::SafeRule => "safe-list-rule".to_string(),
+            Check::SafeRefused => "safe-list-refused".to_string(),
         }
     }
 
@@ -86,6 +94,12 @@ impl Check {
             Check::OwnListed => {
                 "an own address of hik-f2b is in the address-list and cannot be removed".to_string()
             }
+            Check::SafeRule => {
+                "the safe list does not keep the own address from being blocked".to_string()
+            }
+            Check::SafeRefused => {
+                "the firewall refuses to write the own address to the safe list".to_string()
+            }
         }
     }
 
@@ -99,6 +113,12 @@ impl Check {
             Check::Bypassed => "banned addresses no longer reach the NVRs".to_string(),
             Check::OwnListed => {
                 "no own address of hik-f2b is in the address-list any more".to_string()
+            }
+            Check::SafeRule => {
+                "the safe list keeps the own address from being blocked again".to_string()
+            }
+            Check::SafeRefused => {
+                "the firewall writes the own address to the safe list again".to_string()
             }
         }
     }
@@ -322,6 +342,20 @@ pub struct OwnStuck<'a> {
     pub error: &'a str,
 }
 
+/// How the write of the own address to the safe list ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SafeWrite<'a> {
+    /// Every own address toward the router is in the safe list.
+    Written,
+    /// The firewall refused to write this one.
+    Refused {
+        ip: Ipv4Addr,
+        /// The safe list's name.
+        list: &'a str,
+        error: &'a str,
+    },
+}
+
 /// How the ban loop of a poll ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BansEnded {
@@ -486,6 +520,29 @@ impl Health {
                     ip, list, error
                 );
                 self.alerts.fail(Check::OwnListed, &reason, now);
+            }
+        }
+    }
+
+    /// The result of the check of the safe list's rule at `now` (made with
+    /// a firewall check that found the drop rule).
+    pub fn safe_rule_checked(&mut self, result: &Result<String, String>, now: u64) {
+        match result {
+            Ok(_) => self.alerts.pass(&Check::SafeRule, now),
+            Err(reason) => self.alerts.fail(Check::SafeRule, reason, now),
+        }
+    }
+
+    /// How the write of the own address to the safe list ended at `now`.
+    /// As for a ban, a refusal is a problem of its own, which only a write
+    /// that works ends. (A firewall that cannot be used for the write is
+    /// reported as a failed firewall check, see `Engine::checked`.)
+    pub fn safe_written(&mut self, write: SafeWrite, now: u64) {
+        match write {
+            SafeWrite::Written => self.alerts.pass(&Check::SafeRefused, now),
+            SafeWrite::Refused { ip, list, error } => {
+                let reason = format!("{} cannot be written to {}: {}", ip, list, error);
+                self.alerts.fail(Check::SafeRefused, &reason, now);
             }
         }
     }
@@ -837,6 +894,8 @@ mod tests {
         assert_eq!(Check::BanRefused.key(), "ban-refused");
         assert_eq!(Check::Bypassed.key(), "ban-bypassed");
         assert_eq!(Check::OwnListed.key(), "own-address-listed");
+        assert_eq!(Check::SafeRule.key(), "safe-list-rule");
+        assert_eq!(Check::SafeRefused.key(), "safe-list-refused");
     }
 
     #[test]
@@ -1384,6 +1443,75 @@ mod tests {
         h.own_swept(Some(stuck), T0 + 4 * AFTER);
         h.own_swept(None, T0 + 4 * AFTER + 60);
         assert!(h.due(T0 + 6 * AFTER).is_empty());
+    }
+
+    #[test]
+    fn the_safe_list_rule_opens_and_ends_its_own_problem() {
+        let mut h = health();
+        let missing = "no rule in /ip/firewall/raw has src-address-list=cctv_safe: add one with \
+                       action=accept above the drop rule for cctv_ban, in the same table";
+        h.safe_rule_checked(&Err(missing.to_string()), T0);
+        // a firewall check that passes says nothing about it
+        h.firewall_checked(&Ok(String::new()), T0);
+        let due = h.due(T0 + AFTER);
+        assert_eq!(kinds(&due), vec![(Check::SafeRule, Kind::Alert)]);
+        assert_eq!(
+            due[0].text(),
+            format!(
+                "\u{26a0}\u{fe0f} hik-f2b: the safe list does not keep the own address from \
+                 being blocked for 10 min: {}",
+                missing
+            )
+        );
+        h.safe_rule_checked(&Ok("found".to_string()), T0 + 2 * AFTER);
+        let due = h.due(T0 + 2 * AFTER);
+        assert_eq!(kinds(&due), vec![(Check::SafeRule, Kind::Recovered)]);
+        assert_eq!(
+            due[0].text(),
+            "\u{2705} hik-f2b: the safe list keeps the own address from being blocked again \
+             (after 20 min)"
+        );
+    }
+
+    #[test]
+    fn a_refused_safe_list_write_is_ended_only_by_a_write() {
+        let mut h = health();
+        let refused = SafeWrite::Refused {
+            ip: Ipv4Addr::new(192, 0, 2, 200),
+            list: "cctv_safe",
+            error: "refused: HTTP 400",
+        };
+        h.safe_written(refused, T0);
+        // a firewall check, a ban, a poll: none of these end it
+        h.firewall_checked(&Ok(String::new()), T0 + 60);
+        h.ban_tried(BanAttempt::Accepted, T0 + 60);
+        h.bans_ended(BansEnded::Complete, 0, T0 + 60);
+        h.poll_ended(T0 + 60);
+        let due = h.due(T0 + AFTER);
+        assert_eq!(kinds(&due), vec![(Check::SafeRefused, Kind::Alert)]);
+        assert_eq!(
+            due[0].text(),
+            "\u{26a0}\u{fe0f} hik-f2b: the firewall refuses to write the own address to the safe \
+             list for 10 min: 192.0.2.200 cannot be written to cctv_safe: refused: HTTP 400"
+        );
+        h.safe_written(SafeWrite::Written, T0 + 2 * AFTER);
+        let due = h.due(T0 + 2 * AFTER);
+        assert_eq!(kinds(&due), vec![(Check::SafeRefused, Kind::Recovered)]);
+        assert_eq!(
+            due[0].text(),
+            "\u{2705} hik-f2b: the firewall writes the own address to the safe list again \
+             (after 20 min)"
+        );
+        // a write says nothing about the firewall
+        h.firewall_checked(
+            &Err(HealthError::Unusable("timeout".into())),
+            T0 + 3 * AFTER,
+        );
+        h.safe_written(SafeWrite::Written, T0 + 3 * AFTER);
+        assert_eq!(
+            kinds(&h.due(T0 + 4 * AFTER)),
+            vec![(Check::Firewall, Kind::Alert)]
+        );
     }
 
     #[test]

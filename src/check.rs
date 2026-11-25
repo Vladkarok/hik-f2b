@@ -1,7 +1,7 @@
 //! `--check`: every health check once, on clients of its own. It only
 //! reads: nothing is banned, sent or remembered, and no engine is involved.
 
-use crate::action::Firewall;
+use crate::action::{Checked, Firewall, HealthError, SafeEntry};
 use crate::config::Config;
 use crate::country;
 use crate::health::{CheckLine, Status};
@@ -53,6 +53,61 @@ fn describe_log(search: &Search) -> String {
         ));
     }
     out
+}
+
+/// The line of the safe list `list`: its rule, as the firewall check
+/// `checked` found it, and whether each own address toward the router is
+/// in it. Only reads, like the rest of `--check`: the entry is written by
+/// the service.
+fn safe_list_line(
+    fw: &dyn Firewall,
+    list: &str,
+    checked: &Result<Checked, HealthError>,
+    own: &OwnAddresses,
+) -> CheckLine {
+    let (mut failed, rule) = match checked {
+        Err(_) => (true, "not checked: the firewall check failed".to_string()),
+        Ok(Checked {
+            safe_rule: Some(Ok(found)),
+            ..
+        }) => (false, found.clone()),
+        Ok(Checked {
+            safe_rule: Some(Err(e)),
+            ..
+        }) => (true, e.clone()),
+        Ok(Checked {
+            safe_rule: None, ..
+        }) => (false, "rule check is off".to_string()),
+    };
+    let mut parts = vec![rule];
+    let toward = own.toward_router();
+    if matches!(checked, Err(HealthError::Unusable(_))) {
+        // The router cannot be used: asking it again would only fail again.
+    } else if toward.is_empty() {
+        parts.push("the own address toward the router is not known".to_string());
+    } else {
+        for ip in toward {
+            parts.push(match fw.safe_entry(ip) {
+                Ok(Some(SafeEntry { timed: true, .. })) => format!("{} is in {}", ip, list),
+                Ok(Some(SafeEntry { timed: false, .. })) => {
+                    format!("{} is in {} without a timeout", ip, list)
+                }
+                Ok(None) => format!(
+                    "{} is not in {} (the service writes it at every firewall check)",
+                    ip, list
+                ),
+                Err(e) => {
+                    failed = true;
+                    format!("cannot ask whether {} is in {}: {}", ip, list, e)
+                }
+            });
+        }
+    }
+    CheckLine {
+        item: "safe list".to_string(),
+        status: if failed { Status::Failed } else { Status::Ok },
+        detail: parts.join("; "),
+    }
 }
 
 /// `--check`: every health check once, with the NVR clients `nvrs` (one per
@@ -107,18 +162,22 @@ pub fn check_all(
             });
         }
     }
-    let (status, detail) = match firewall {
+    let checked = firewall.map(|fw| fw.check_with_safe_list());
+    let (status, detail) = match &checked {
         None => (Status::Off, "not configured (notify-only mode)".to_string()),
-        Some(fw) => match fw.check() {
-            Ok(found) => (Status::Ok, found),
-            Err(e) => (Status::Failed, e.to_string()),
-        },
+        Some(Ok(checked)) => (Status::Ok, checked.found.clone()),
+        Some(Err(e)) => (Status::Failed, e.to_string()),
     };
     out.push(CheckLine {
         item: "firewall".to_string(),
         status,
         detail,
     });
+    if let (Some(fw), Some(checked)) = (firewall, &checked) {
+        if let Some(list) = fw.safe_list() {
+            out.push(safe_list_line(fw, &list, checked, own));
+        }
+    }
     // A look-up that failed leaves an address unprotected.
     let failures = own.failures();
     let (status, detail) = if failures.is_empty() {

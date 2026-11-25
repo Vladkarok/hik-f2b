@@ -33,6 +33,7 @@ const MIKROTIK_KEYS: &[&str] = &[
     "password",
     "password_file",
     "address_list",
+    "safe_list",
     "ca_file",
     "check_rule",
 ];
@@ -158,6 +159,9 @@ pub struct MikrotikCfg {
     pub user: String,
     pub password: String,
     pub address_list: String,
+    /// The address-list in which hik-f2b keeps its own address toward the
+    /// router, if set (`None`: no safe list, and nothing of it is done).
+    pub safe_list: Option<String>,
     /// `None` = the bundled public roots (`ca_file = public`).
     pub ca_file: Option<PathBuf>,
     /// Whether the health check looks for a rule that uses the list.
@@ -494,6 +498,20 @@ fn mikrotik(m: &Section) -> Result<MikrotikCfg, String> {
     if !is_name(&address_list, 64) {
         return Err("mikrotik: address_list may contain only letters, digits, _ - .".to_string());
     }
+    // Empty is unset, as for country_db.
+    let safe_list = m.get("safe_list").filter(|s| !s.is_empty()).cloned();
+    if let Some(safe) = &safe_list {
+        if !is_name(safe, 64) {
+            return Err("mikrotik: safe_list may contain only letters, digits, _ - .".to_string());
+        }
+        if *safe == address_list {
+            return Err(format!(
+                "mikrotik: safe_list must differ from address_list ({}): the safe list holds \
+                 addresses that are never blocked",
+                address_list
+            ));
+        }
+    }
     let url = check_url(required(m, "url", "mikrotik")?, true, "mikrotik")?;
     // The router holds the ban list, so whoever can impersonate it can make
     // bans silently fail. Trusting every public CA must be a visible choice.
@@ -509,6 +527,7 @@ fn mikrotik(m: &Section) -> Result<MikrotikCfg, String> {
         user: check_user(required(m, "user", "mikrotik")?, "mikrotik")?,
         password: secret(m, "password", "mikrotik")?,
         address_list,
+        safe_list,
         ca_file: ca_file(m),
         check_rule: boolean(m, "check_rule", true)?,
     })
@@ -917,6 +936,68 @@ mod tests {
     }
 
     #[test]
+    fn safe_list_setting() {
+        let with = |line: &str| {
+            Config::parse(&BASE.replace(
+                "ca_file = public\n",
+                &format!("ca_file = public\n{}\n", line),
+            ))
+        };
+        // unset by default, and when empty
+        assert_eq!(
+            Config::parse(BASE).unwrap().mikrotik.unwrap().safe_list,
+            None
+        );
+        assert_eq!(
+            with("safe_list =").unwrap().mikrotik.unwrap().safe_list,
+            None
+        );
+        assert_eq!(
+            with("safe_list = cctv_safe")
+                .unwrap()
+                .mikrotik
+                .unwrap()
+                .safe_list
+                .as_deref(),
+            Some("cctv_safe")
+        );
+        // the rules of a list name
+        let long = "s".repeat(65);
+        for bad in ["cctv safe", "cctv/safe", "x\"y", long.as_str()] {
+            assert_eq!(
+                with(&format!("safe_list = {}", bad)).err().unwrap(),
+                "mikrotik: safe_list may contain only letters, digits, _ - .",
+                "{}",
+                bad
+            );
+        }
+        assert!(with(&format!("safe_list = {}", "s".repeat(64))).is_ok());
+        // never the address-list itself, also when that is not the default
+        assert_eq!(
+            with("safe_list = cctv_ban").err().unwrap(),
+            "mikrotik: safe_list must differ from address_list (cctv_ban): the safe list holds \
+             addresses that are never blocked"
+        );
+        assert_eq!(
+            with("address_list = blocked\nsafe_list = blocked")
+                .err()
+                .unwrap(),
+            "mikrotik: safe_list must differ from address_list (blocked): the safe list holds \
+             addresses that are never blocked"
+        );
+        assert!(with("address_list = blocked\nsafe_list = cctv_ban").is_ok());
+        // a [mikrotik] setting, nowhere else
+        let e = Config::parse(&format!("{}[general]\nsafe_list = x\n", BASE))
+            .err()
+            .unwrap();
+        assert!(
+            e.ends_with("safe_list belongs in a [mikrotik] section"),
+            "{}",
+            e
+        );
+    }
+
+    #[test]
     fn country_db_setting() {
         assert_eq!(Config::parse(BASE).unwrap().country_db, None);
         assert_eq!(general("country_db =").unwrap().country_db, None);
@@ -1177,7 +1258,7 @@ mod tests {
                    meta_id = log.std-cgi.com/Exception\nlog_filter = x\ndry_run = false\n\
                    country_db = /tmp/c.mmdb\n\
                    [mikrotik]\nurl = https://192.0.2.1\nuser = f2b\npassword = p\n\
-                   address_list = l\nca_file = public\ncheck_rule = true\n\
+                   address_list = l\nsafe_list = s\nca_file = public\ncheck_rule = true\n\
                    [nvr:one]\nurl = https://192.0.2.10\nuser = f2b\npassword = p\nca_file = public\n\
                    [telegram]\nenabled = true\napi_url = https://api.telegram.org\n\
                    bot_token = 1:a\nchat_id = 5\nmessage_thread_id = 7\nsilent = false\n\

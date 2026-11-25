@@ -189,7 +189,10 @@ struct Found {
 /// The own addresses: what was last found for each device of the config,
 /// and why a look-up failed, if it did.
 pub struct OwnAddresses {
+    /// The devices of the config: the router first, if there is one.
     devices: Vec<Device>,
+    /// Whether `devices` starts with the router.
+    router: bool,
     source: Box<dyn Source>,
     /// The host names of the devices, resolved now and then.
     names: Names,
@@ -219,6 +222,7 @@ impl OwnAddresses {
         let mut own = OwnAddresses {
             found: vec![Found::default(); devices.len()],
             failures: vec![None; devices.len()],
+            router: cfg.mikrotik.is_some(),
             devices,
             source,
             names: Names::new(),
@@ -320,6 +324,18 @@ impl OwnAddresses {
             .copied()
             .filter(|ip| !never_ban(*ip))
             .collect()
+    }
+
+    /// The local addresses this host reaches the router from, as last
+    /// found, outside the ranges that are never banned anyway: what the
+    /// safe list holds. Part of the set, so built only from the config and
+    /// the host's own sockets: nothing read from an NVR log reaches it.
+    pub fn toward_router(&self) -> Vec<Ipv4Addr> {
+        if !self.router {
+            return Vec::new();
+        }
+        let local: BTreeSet<Ipv4Addr> = self.found[0].local.values().copied().collect();
+        local.into_iter().filter(|ip| !never_ban(*ip)).collect()
     }
 
     /// Why the last look-ups failed, by device (empty when all worked).
@@ -426,6 +442,46 @@ mod tests {
         let own = OwnAddresses::new(&cfg, Box::new(Fixed::new(LOCAL)));
         assert_eq!(set(&own), ["192.0.2.200", "198.51.100.4"]);
         assert_eq!(own.describe(), "nvr1 198.51.100.4 from 192.0.2.200");
+    }
+
+    #[test]
+    fn the_address_toward_the_router_is_the_local_one() {
+        let fixed = Fixed::new(LOCAL);
+        let cfg = config(
+            Some("https://192.0.2.1"),
+            &[("nvr1", "http://198.51.100.4")],
+        );
+        let mut own = OwnAddresses::new(&cfg, Box::new(fixed.clone()));
+        assert_eq!(own.toward_router(), vec![LOCAL]);
+        // it follows the host
+        fixed.set_local(Ok(ip("192.0.2.201")));
+        own.refresh(T0);
+        assert_eq!(own.toward_router(), vec![ip("192.0.2.201")]);
+        // a failed look-up keeps it
+        fixed.set_local(Err("no route".to_string()));
+        own.refresh(T0 + 30);
+        assert_eq!(own.toward_router(), vec![ip("192.0.2.201")]);
+        // none without a router, none on loopback, none never found
+        let cfg = config(None, &[("nvr1", "http://198.51.100.4")]);
+        assert!(OwnAddresses::new(&cfg, Box::new(Fixed::new(LOCAL)))
+            .toward_router()
+            .is_empty());
+        let cfg = config(
+            Some("http://127.0.0.1:8728"),
+            &[("nvr1", "http://198.51.100.4")],
+        );
+        assert!(
+            OwnAddresses::new(&cfg, Box::new(Fixed::new(Ipv4Addr::LOCALHOST)))
+                .toward_router()
+                .is_empty()
+        );
+        let cfg = config(
+            Some("https://router.example.net"),
+            &[("nvr1", "http://198.51.100.4")],
+        );
+        assert!(OwnAddresses::new(&cfg, Box::new(Fixed::new(LOCAL)))
+            .toward_router()
+            .is_empty());
     }
 
     #[test]

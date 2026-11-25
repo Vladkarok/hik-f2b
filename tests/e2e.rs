@@ -3536,6 +3536,609 @@ fn own_address_in_the_address_list_in_a_dry_run_and_in_notify_only_mode() {
     assert!(telegram_texts(&h).is_empty());
 }
 
+// --------------------------------------------------------------- safe list
+
+/// The requests of one firewall check that the router answers, without a
+/// safe list, as they were before the safe list existed: the drop rule in
+/// `raw`, and the look-up of the own address in the address-list.
+const CHECK_REQUESTS: [&str; 2] = [
+    "GET /rest/ip/firewall/raw?src-address-list=cctv_ban&.proplist=.id%2Cdisabled%2Cinvalid",
+    "GET /rest/ip/firewall/address-list?list=cctv_ban&address=192.0.2.200&.proplist=.id",
+];
+
+/// A harness with the safe list `cctv_safe`, its rule above the drop rule
+/// in `raw`, the own address `OWN`, and `general` in `[general]`; the
+/// engine has not checked or polled yet.
+fn with_safe_list(general: &'static str) -> Harness {
+    let h = Harness::build(Opts {
+        own: ip(OWN),
+        telegram: true,
+        general,
+        mikrotik_extra: "safe_list = cctv_safe",
+        ..Default::default()
+    });
+    h.fake.lock().unwrap().rules = vec![
+        Rule::accept("raw", "cctv_safe"),
+        Rule::new("raw", "cctv_ban", false),
+    ];
+    h
+}
+
+/// The requests that reached the router since the last call.
+fn requests(h: &Harness) -> Vec<String> {
+    std::mem::take(&mut h.fake.lock().unwrap().rest_log)
+}
+
+/// What was written to the safe list since the last call.
+fn safe_writes(h: &Harness) -> Vec<(String, String, &'static str)> {
+    std::mem::take(&mut h.fake.lock().unwrap().safe_log)
+}
+
+fn safe(outcome: &'static str) -> (String, String, &'static str) {
+    ("cctv_safe".to_string(), OWN.to_string(), outcome)
+}
+
+/// Without `safe_list`, a firewall check sends what it sent before the
+/// safe list existed, at startup and in a cycle, and nothing about another
+/// list.
+#[test]
+fn without_a_safe_list_no_request_is_added() {
+    let mut h = Harness::build(Opts {
+        own: ip(OWN),
+        ..Default::default()
+    });
+    assert!(h.engine.startup_check(h.host as u64));
+    assert_eq!(requests(&h), CHECK_REQUESTS);
+    // the first poll: the next check is due 300 s after the first
+    run(&mut h, 10, 30);
+    assert_eq!(requests(&h), CHECK_REQUESTS);
+    run(&mut h, 30, 30);
+    assert_eq!(
+        requests(&h),
+        [CHECK_REQUESTS, CHECK_REQUESTS, CHECK_REQUESTS].concat()
+    );
+    let f = h.fake.lock().unwrap();
+    assert!(f.safe_log.is_empty() && f.listed.is_empty());
+}
+
+/// The own address toward the router is written at startup, with a
+/// timeout of six firewall checks, and renewed at each check: four
+/// requests more per check.
+#[test]
+fn the_safe_list_is_written_at_startup_and_renewed_at_each_check() {
+    let mut h = with_safe_list("");
+    util::capture_log();
+    assert!(h.engine.startup_check(h.host as u64));
+    assert_eq!(
+        util::captured_log(),
+        vec![
+            "INFO firewall check ok: 1 enabled rule(s) in /ip/firewall/raw with \
+             src-address-list=cctv_ban",
+            "INFO safe list check ok: 1 enabled accept rule(s) in /ip/firewall/raw with \
+             src-address-list=cctv_safe before the drop rule for cctv_ban",
+            "INFO 192.0.2.200 added to the safe list cctv_safe for 00:30:00",
+        ]
+    );
+    let check = [
+        CHECK_REQUESTS[0],
+        "GET /rest/ip/firewall/raw?.proplist=.id",
+        "GET /rest/ip/firewall/raw?src-address-list=cctv_safe&.proplist=.id%2Cdisabled%2Cinvalid%2Caction",
+        "GET /rest/ip/firewall/address-list?list=cctv_safe&address=192.0.2.200&.proplist=.id%2Cdynamic%2Ctimeout",
+    ];
+    let added = [
+        &check[..],
+        &["PUT /rest/ip/firewall/address-list?", CHECK_REQUESTS[1]],
+    ]
+    .concat();
+    assert_eq!(requests(&h), added);
+    assert_eq!(safe_writes(&h), vec![safe("added")]);
+    {
+        let f = h.fake.lock().unwrap();
+        assert_eq!(
+            f.listed,
+            vec![Listed {
+                list: "cctv_safe".to_string(),
+                address: OWN.to_string(),
+                timeout: Some("00:30:00".to_string()),
+            }]
+        );
+        // nothing of it went to the address-list
+        assert!(f.ban_bodies.is_empty() && f.put_log.is_empty());
+    }
+    // the polls between two checks send nothing to the router
+    run(&mut h, 9, 30);
+    assert!(requests(&h).is_empty());
+    // the periodic check renews it
+    h.fake.lock().unwrap().listed[0].timeout = Some("00:25:00".to_string());
+    h.advance(30);
+    // the id of the entry, as the fake router makes it
+    let patch = format!(
+        "PATCH /rest/ip/firewall/address-list/*1{:08X}?",
+        u32::from(ip(OWN))
+    );
+    let renewed = [&check[..], &[patch.as_str(), CHECK_REQUESTS[1]]].concat();
+    assert_eq!(requests(&h), renewed);
+    assert_eq!(safe_writes(&h), vec![safe("renewed")]);
+    let f = h.fake.lock().unwrap();
+    assert_eq!(f.listed.len(), 1);
+    assert_eq!(f.listed[0].timeout.as_deref(), Some("00:30:00"));
+    drop(f);
+    assert!(h.engine.alerted_problems().is_empty());
+    assert!(telegram_texts(&h).is_empty());
+}
+
+/// An entry that is there already is renewed, never added a second time;
+/// one without a timeout (added by hand) is left as it is.
+#[test]
+fn an_existing_entry_is_renewed_not_duplicated() {
+    let mut h = with_safe_list("");
+    h.fake.lock().unwrap().listed.push(Listed {
+        list: "cctv_safe".to_string(),
+        address: OWN.to_string(),
+        timeout: Some("00:01:00".to_string()),
+    });
+    assert!(h.engine.startup_check(h.host as u64));
+    run(&mut h, 20, 30);
+    assert_eq!(safe_writes(&h), vec![safe("renewed"); 3]);
+    assert_eq!(h.fake.lock().unwrap().listed.len(), 1);
+    // static: no write at all
+    requests(&h);
+    h.fake.lock().unwrap().listed[0].timeout = None;
+    run(&mut h, 20, 30);
+    assert!(safe_writes(&h).is_empty());
+    let f = h.fake.lock().unwrap();
+    assert_eq!(f.listed.len(), 1);
+    assert_eq!(f.listed[0].timeout, None);
+    assert!(!f
+        .rest_log
+        .iter()
+        .any(|r| r.starts_with("PUT") || r.starts_with("PATCH")));
+}
+
+/// A new own address toward the router is written at the next check; the
+/// old entry is left to expire, not removed.
+#[test]
+fn a_new_own_address_is_written_and_the_old_one_left_to_expire() {
+    let mut h = with_safe_list("");
+    assert!(h.engine.startup_check(h.host as u64));
+    h.tick();
+    h.own.set_local(Ok(ip("192.0.2.201")));
+    run(&mut h, 9, 30);
+    util::capture_log();
+    h.advance(30);
+    let log = util::captured_log();
+    for line in [
+        "INFO 192.0.2.200 is no longer the own address toward the router: its entry in the safe \
+         list cctv_safe is left to expire",
+        "INFO 192.0.2.201 added to the safe list cctv_safe for 00:30:00",
+    ] {
+        assert_eq!(exactly(&log, line), 1, "{:?}", log);
+    }
+    let f = h.fake.lock().unwrap();
+    let listed: Vec<&str> = f.listed.iter().map(|e| e.address.as_str()).collect();
+    assert_eq!(listed, ["192.0.2.200", "192.0.2.201"]);
+    assert!(f.delete_log.is_empty());
+    drop(f);
+    // said once
+    util::capture_log();
+    run(&mut h, 10, 30);
+    assert_eq!(
+        starting(&util::captured_log(), "INFO 192.0.2.200 is no longer"),
+        0
+    );
+    let writes = safe_writes(&h);
+    assert_eq!(
+        writes.last(),
+        Some(&(
+            "cctv_safe".to_string(),
+            "192.0.2.201".to_string(),
+            "renewed"
+        ))
+    );
+}
+
+/// A write the router refuses is an ERROR at each check and the health
+/// problem `safe-list-refused`, which a write that works ends. A write that
+/// meets a router error is the firewall problem, as for a ban.
+#[test]
+fn a_refused_write_is_its_own_health_problem() {
+    let mut h = with_safe_list("alert_after = 60");
+    h.fake.lock().unwrap().refuse_writes = true;
+    util::capture_log();
+    assert!(h.engine.startup_check(h.host as u64));
+    let refused = "ERROR cannot write own address 192.0.2.200 to the safe list cctv_safe, will \
+                   retry at the next firewall check: refused: HTTP 400: {\"detail\":\"not enough \
+                   permissions (9)\",\"error\":400,\"message\":\"Bad Request\"}";
+    assert_eq!(exactly(&util::captured_log(), refused), 1);
+    run(&mut h, 10, 30);
+    let log = util::captured_log();
+    assert_eq!(exactly(&log, refused), 1, "{:?}", log);
+    assert_eq!(
+        exactly(
+            &log,
+            "ERROR health alert [safe-list-refused]: hik-f2b: the firewall refuses to write the \
+             own address to the safe list for 1 min: 192.0.2.200 cannot be written to cctv_safe: \
+             refused: HTTP 400: {\"detail\":\"not enough \
+             permissions (9)\",\"error\":400,\"message\":\"Bad Request\"}"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    assert_eq!(h.engine.alerted_problems(), vec!["safe-list-refused"]);
+    assert_eq!(safe_writes(&h), vec![safe("refused"); 2]);
+    // the write works
+    h.fake.lock().unwrap().refuse_writes = false;
+    run(&mut h, 10, 30);
+    assert_eq!(
+        exactly(
+            &util::captured_log(),
+            "INFO health recovered [safe-list-refused]: hik-f2b: the firewall writes the own \
+             address to the safe list again (after 10 min)"
+        ),
+        1
+    );
+    assert!(h.engine.alerted_problems().is_empty());
+    assert_eq!(h.fake.lock().unwrap().listed.len(), 1);
+    // a router error on the write: the firewall problem
+    h.fake.lock().unwrap().listed.clear();
+    h.fake.lock().unwrap().put_status = Some(500);
+    run(&mut h, 12, 30);
+    assert_eq!(h.engine.alerted_problems(), vec!["firewall"]);
+    h.fake.lock().unwrap().put_status = None;
+    run(&mut h, 10, 30);
+    assert!(h.engine.alerted_problems().is_empty());
+}
+
+/// The rule is missing: an ERROR at startup, a WARNING at each check, the
+/// health problem `safe-list-rule` after `alert_after`; the rule is added
+/// and the problem ends. The safe list is written either way.
+#[test]
+fn a_missing_safe_list_rule_is_a_problem_until_it_is_added() {
+    let mut h = with_safe_list("alert_after = 60");
+    h.fake.lock().unwrap().rules = vec![Rule::new("raw", "cctv_ban", false)];
+    let reason = "no rule in /ip/firewall/raw has src-address-list=cctv_safe: add one with \
+                  action=accept above the drop rule for cctv_ban, in the same table";
+    util::capture_log();
+    assert!(h.engine.startup_check(h.host as u64));
+    let log = util::captured_log();
+    assert_eq!(
+        exactly(&log, &format!("ERROR safe list check failed: {}", reason)),
+        1,
+        "{:?}",
+        log
+    );
+    assert_eq!(safe_writes(&h), vec![safe("added")]);
+    run(&mut h, 10, 30);
+    let log = util::captured_log();
+    assert_eq!(
+        exactly(&log, &format!("WARNING safe list check failed: {}", reason)),
+        1,
+        "{:?}",
+        log
+    );
+    assert_eq!(h.engine.alerted_problems(), vec!["safe-list-rule"]);
+    let texts = telegram_texts(&h);
+    assert_eq!(
+        texts,
+        vec![format!(
+            "{}the safe list does not keep the own address from being blocked for 1 min: {}",
+            WARN, reason
+        )]
+    );
+    // the operator adds the rule above the drop rule
+    h.fake
+        .lock()
+        .unwrap()
+        .rules
+        .insert(0, Rule::accept("raw", "cctv_safe"));
+    run(&mut h, 10, 30);
+    assert!(h.engine.alerted_problems().is_empty());
+    assert_eq!(
+        telegram_texts(&h)[1],
+        format!(
+            "{}the safe list keeps the own address from being blocked again (after 10 min)",
+            OK
+        )
+    );
+}
+
+/// The rule check on the router's answers, in every case: the rule must
+/// be in the table of the first usable drop rule, enabled, valid, with the
+/// action `accept`, and come before that drop rule in the table's order,
+/// whatever its id.
+#[test]
+fn the_safe_list_rule_check_in_every_case() {
+    let h = with_safe_list("");
+    let check = |rules: Vec<Rule>| {
+        h.fake.lock().unwrap().rules = rules;
+        let checked = h.router().check_with_safe_list().unwrap();
+        assert_eq!(
+            checked.found.split(" with ").next(),
+            Some(
+                if h.fake
+                    .lock()
+                    .unwrap()
+                    .rules
+                    .iter()
+                    .any(|r| r.table == "raw" && r.list == "cctv_ban" && !r.disabled)
+                {
+                    "1 enabled rule(s) in /ip/firewall/raw"
+                } else {
+                    "1 enabled rule(s) in /ip/firewall/filter"
+                }
+            )
+        );
+        checked.safe_rule.unwrap()
+    };
+    let drop_raw = || Rule::new("raw", "cctv_ban", false);
+    let drop_filter = || Rule::new("filter", "cctv_ban", false);
+    let accept = |t| Rule::accept(t, "cctv_safe");
+    let ok_raw = Ok(
+        "1 enabled accept rule(s) in /ip/firewall/raw with src-address-list=cctv_safe \
+                     before the drop rule for cctv_ban"
+            .to_string(),
+    );
+    let counts = |table: &str, what: &str, fix: &str| {
+        Err(format!(
+            "no rule in /ip/firewall/{} with src-address-list=cctv_safe counts ({}): {}",
+            table, what, fix
+        ))
+    };
+    let missing = |table: &str| {
+        Err(format!(
+            "no rule in /ip/firewall/{} has src-address-list=cctv_safe: add one with \
+             action=accept above the drop rule for cctv_ban, in the same table",
+            table
+        ))
+    };
+    // before the drop rule
+    assert_eq!(check(vec![accept("raw"), drop_raw()]), ok_raw);
+    // missing
+    assert_eq!(check(vec![drop_raw()]), missing("raw"));
+    // disabled
+    let disabled = Rule {
+        disabled: true,
+        ..accept("raw")
+    };
+    assert_eq!(
+        check(vec![disabled, drop_raw()]),
+        counts("raw", "1 disabled", "enable it")
+    );
+    // invalid
+    let invalid = Rule {
+        invalid: true,
+        ..accept("raw")
+    };
+    assert_eq!(
+        check(vec![invalid, drop_raw()]),
+        counts("raw", "1 invalid", "make it valid")
+    );
+    // another action
+    assert_eq!(
+        check(vec![Rule::new("raw", "cctv_safe", false), drop_raw()]),
+        counts("raw", "1 with another action", "set action=accept")
+    );
+    // after the drop rule
+    assert_eq!(
+        check(vec![drop_raw(), accept("raw")]),
+        counts(
+            "raw",
+            "1 after the drop rule",
+            "move it above the drop rule"
+        )
+    );
+    // in the other table
+    assert_eq!(check(vec![accept("filter"), drop_raw()]), missing("raw"));
+    assert_eq!(check(vec![accept("raw"), drop_filter()]), missing("filter"));
+    // in filter, where the drop rule is
+    assert_eq!(
+        check(vec![accept("filter"), drop_filter()]),
+        Ok("1 enabled accept rule(s) in /ip/firewall/filter with \
+            src-address-list=cctv_safe before the drop rule for cctv_ban"
+            .to_string())
+    );
+    // the order counts, not the ids: RouterOS keeps the id of a moved rule
+    assert_eq!(
+        check(vec![accept("raw").with_id(0x20), drop_raw().with_id(0x3)]),
+        ok_raw
+    );
+    assert_eq!(
+        check(vec![drop_raw().with_id(0x20), accept("raw").with_id(0x3)]),
+        counts(
+            "raw",
+            "1 after the drop rule",
+            "move it above the drop rule"
+        )
+    );
+    // before the first usable drop rule, a disabled one before it does not
+    // count
+    let off = Rule::new("raw", "cctv_ban", true);
+    assert_eq!(check(vec![off, accept("raw"), drop_raw()]), ok_raw);
+    // one good rule is enough, the others are not named
+    let disabled = Rule {
+        disabled: true,
+        ..accept("raw")
+    };
+    assert_eq!(check(vec![disabled, accept("raw"), drop_raw()]), ok_raw);
+    // several reasons
+    let disabled = Rule {
+        disabled: true,
+        ..accept("raw")
+    };
+    assert_eq!(
+        check(vec![disabled, drop_raw(), accept("raw")]),
+        counts(
+            "raw",
+            "1 disabled, 1 after the drop rule",
+            "enable it, move it above the drop rule"
+        )
+    );
+    // with the rule check off, the rule is not looked at
+    let h = Harness::build(Opts {
+        mikrotik_extra: "safe_list = cctv_safe\ncheck_rule = false",
+        ..Default::default()
+    });
+    assert_eq!(h.router().check_with_safe_list().unwrap().safe_rule, None);
+    assert_eq!(h.fake.lock().unwrap().rule_queries.len(), 0);
+    // and without a safe list, neither
+    let h = Harness::build(Opts::default());
+    assert_eq!(h.router().check_with_safe_list().unwrap().safe_rule, None);
+    assert_eq!(h.fake.lock().unwrap().rule_queries.len(), 1);
+}
+
+/// A dry run writes nothing to the safe list and says once what it would
+/// do; the rule is still checked.
+#[test]
+fn a_dry_run_writes_nothing_to_the_safe_list() {
+    let mut h = with_safe_list("dry_run = true");
+    util::capture_log();
+    assert!(h.engine.startup_check(h.host as u64));
+    run(&mut h, 40, 30);
+    h.restart();
+    assert!(h.engine.startup_check(h.host as u64));
+    let log = util::captured_log();
+    assert_eq!(
+        exactly(
+            &log,
+            "INFO DRY RUN: would keep 192.0.2.200 in the safe list cctv_safe for 00:30:00, \
+             renewed at every firewall check"
+        ),
+        2,
+        "once per start: {:?}",
+        log
+    );
+    assert_eq!(
+        starting(&log, "INFO safe list check ok: "),
+        2,
+        "at the starts; the periodic ones are DEBUG"
+    );
+    let f = h.fake.lock().unwrap();
+    assert!(f.safe_log.is_empty() && f.listed.is_empty());
+    assert!(!f.rest_log.iter().any(|r| r.contains("cctv_safe&address")
+        || r.starts_with("PUT")
+        || r.starts_with("PATCH")));
+}
+
+/// `--check` prints one line for the safe list, after the firewall's, and
+/// changes nothing on the router.
+#[test]
+fn check_prints_the_safe_list() {
+    use hik_f2b::health::Status;
+    let mut h = with_safe_list("");
+    let line = |h: &Harness| {
+        h.check()
+            .into_iter()
+            .find(|l| l.item == "safe list")
+            .unwrap()
+    };
+    let items: Vec<String> = h.check().into_iter().map(|l| l.item).collect();
+    assert_eq!(
+        items,
+        [
+            "nvr nvr1",
+            "nvr nvr1 log",
+            "firewall",
+            "safe list",
+            "own addresses",
+            "telegram",
+            "country database"
+        ]
+    );
+    let rule = "1 enabled accept rule(s) in /ip/firewall/raw with src-address-list=cctv_safe \
+                before the drop rule for cctv_ban";
+    assert_eq!(
+        line(&h).to_string(),
+        format!(
+            "ok       safe list: {}; 192.0.2.200 is not in cctv_safe (the service writes it at \
+             every firewall check)",
+            rule
+        )
+    );
+    assert!(safe_writes(&h).is_empty());
+    assert!(h.engine.startup_check(h.host as u64));
+    // what the service wrote; --check writes nothing from here on
+    assert_eq!(safe_writes(&h), vec![safe("added")]);
+    requests(&h);
+    assert_eq!(
+        line(&h).to_string(),
+        format!("ok       safe list: {}; 192.0.2.200 is in cctv_safe", rule)
+    );
+    h.fake.lock().unwrap().listed[0].timeout = None;
+    assert_eq!(
+        line(&h).to_string(),
+        format!(
+            "ok       safe list: {}; 192.0.2.200 is in cctv_safe without a timeout",
+            rule
+        )
+    );
+    // the rule is missing
+    h.fake.lock().unwrap().rules = vec![Rule::new("raw", "cctv_ban", false)];
+    let l = line(&h);
+    assert_eq!(l.status, Status::Failed);
+    assert_eq!(
+        l.to_string(),
+        "FAILED   safe list: no rule in /ip/firewall/raw has src-address-list=cctv_safe: add one \
+         with action=accept above the drop rule for cctv_ban, in the same table; 192.0.2.200 is \
+         in cctv_safe without a timeout"
+    );
+    // no drop rule: the rule cannot be placed
+    h.fake.lock().unwrap().rules = vec![];
+    assert_eq!(
+        line(&h).to_string(),
+        "FAILED   safe list: not checked: the firewall check failed; 192.0.2.200 is in cctv_safe \
+         without a timeout"
+    );
+    // the router cannot be used
+    h.fake.lock().unwrap().router_unreachable = true;
+    assert_eq!(
+        line(&h).to_string(),
+        "FAILED   safe list: not checked: the firewall check failed"
+    );
+    h.fake.lock().unwrap().router_unreachable = false;
+    // the address toward the router is not known (loopback)
+    h.own.set_local(Ok(std::net::Ipv4Addr::LOCALHOST));
+    h.fake.lock().unwrap().rules = vec![
+        Rule::accept("raw", "cctv_safe"),
+        Rule::new("raw", "cctv_ban", false),
+    ];
+    assert_eq!(
+        line(&h).to_string(),
+        format!(
+            "ok       safe list: {}; the own address toward the router is not known",
+            rule
+        )
+    );
+    // with the rule check off
+    h.ini = h.ini.replace(
+        "safe_list = cctv_safe",
+        "safe_list = cctv_safe\ncheck_rule = false",
+    );
+    h.own.set_local(Ok(ip(OWN)));
+    assert_eq!(
+        line(&h).to_string(),
+        "ok       safe list: rule check is off; 192.0.2.200 is in cctv_safe without a timeout"
+    );
+    // nothing was written by any of these
+    assert!(safe_writes(&h).is_empty());
+    assert!(!requests(&h)
+        .iter()
+        .any(|r| r.starts_with("PUT") || r.starts_with("PATCH") || r.starts_with("DELETE")));
+    // the command itself prints the line in its place
+    let (_, stdout, _) = hik_f2b(&h, &h.ini, &["--check"]);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        lines[2].starts_with("ok       firewall: ") && lines[4].starts_with("ok       own "),
+        "{}",
+        stdout
+    );
+    // the operating system reaches the fakes from loopback
+    assert_eq!(
+        lines[3],
+        "ok       safe list: rule check is off; the own address toward the router is not known"
+    );
+}
+
 // ------------------------------------------------------------------ --check
 
 #[test]

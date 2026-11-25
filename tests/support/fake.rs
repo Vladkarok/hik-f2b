@@ -43,7 +43,8 @@ pub struct Entry {
     pub user: Vec<u8>, // inserted into the XML as is (may be XML-escaped, may be broken)
 }
 
-/// A firewall rule on the fake router.
+/// A firewall rule on the fake router. The rules of a table are in the
+/// order of `Fake::rules`, as RouterOS lists them.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Rule {
     pub table: &'static str,
@@ -54,6 +55,12 @@ pub struct Rule {
     /// it names is removed; the rule then matches nothing.
     pub invalid: bool,
     pub dynamic: bool,
+    /// `drop`, `accept`, ...
+    pub action: &'static str,
+    /// The number of its id (`*<hex>`); by default its place in
+    /// `Fake::rules` plus one. RouterOS keeps the id of a rule that is
+    /// moved, so ids need not follow the order.
+    pub id: Option<u32>,
 }
 
 impl Rule {
@@ -64,6 +71,25 @@ impl Rule {
             disabled,
             invalid: false,
             dynamic: false,
+            action: "drop",
+            id: None,
+        }
+    }
+
+    /// An enabled rule that accepts what comes from `list`: the rule of the
+    /// safe list.
+    pub fn accept(table: &'static str, list: &str) -> Rule {
+        Rule {
+            action: "accept",
+            ..Rule::new(table, list, false)
+        }
+    }
+
+    /// This rule with the id `*<id in hex>`.
+    pub fn with_id(self, id: u32) -> Rule {
+        Rule {
+            id: Some(id),
+            ..self
         }
     }
 
@@ -80,6 +106,16 @@ impl Rule {
             ..Rule::new(table, list, false)
         }
     }
+}
+
+/// An entry of an address-list other than `cctv_ban` on the fake router
+/// (the safe list).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Listed {
+    pub list: String,
+    pub address: String,
+    /// As written; `None`: a static entry.
+    pub timeout: Option<String>,
 }
 
 #[derive(Default)]
@@ -155,6 +191,15 @@ pub struct Fake {
     pub delete_log: Vec<(String, &'static str)>,
     /// Answer every DELETE with this HTTP status, reads work.
     pub delete_status: Option<u16>,
+    /// The entries of the other address-lists (the safe list).
+    pub listed: Vec<Listed>,
+    /// (list, address, outcome) of every PUT to another list than
+    /// `cctv_ban` and of every PATCH that reached the router: `added`,
+    /// `duplicate`, `renewed`, `refused`, `down`, `status` or `no such
+    /// item`.
+    pub safe_log: Vec<(String, String, &'static str)>,
+    /// `METHOD path?query` of every REST request that reached the router.
+    pub rest_log: Vec<String>,
     // --- Telegram
     pub tg_sent: Vec<String>,
     pub tg_attempts: u32,
@@ -301,6 +346,7 @@ fn route(
             return reply(DROP, json, "");
         }
         f.rest_requests += 1;
+        f.rest_log.push(format!("{} {}?{}", method, path, query));
         if f.rest_html {
             return reply(
                 200,
@@ -312,10 +358,22 @@ fn route(
             .rest_status
             .or(f.put_status.filter(|_| method == "PUT"))
             .or(f.delete_status.filter(|_| method == "DELETE"));
+        let status = status.or(f.put_status.filter(|_| method == "PATCH"));
         if let Some(code) = status {
             if path.starts_with("/rest/ip/firewall/address-list") && method == "PUT" {
                 let address = between(body, "\"address\":\"", "\"").to_string();
-                f.put_log.push((address, "status"));
+                let list = between(body, "\"list\":\"", "\"").to_string();
+                if list == "cctv_ban" {
+                    f.put_log.push((address, "status"));
+                } else {
+                    f.safe_log.push((list, address, "status"));
+                }
+            }
+            if method == "PATCH" {
+                let id = path.trim_start_matches("/rest/ip/firewall/address-list/");
+                let (list, address) = listed_of(&f, id);
+                f.safe_log.push((list, address, "status"));
+                return reply(code, json, format!("{{\"error\":{}}}", code));
             }
             if let Some(id) = path.strip_prefix("/rest/ip/firewall/address-list/") {
                 let address = address_of(&f, id);
@@ -351,6 +409,7 @@ fn route(
         // misses them), in `raw` as in `filter`; `invalid` is `"false"` on an
         // ordinary rule; a dynamic rule has only `"dynamic":"true"`.
         let shown = |n: usize, r: &Rule| -> Option<&'static str> {
+            let n = r.id.map_or(n, |id| id as usize);
             match (r.dynamic, r.disabled) {
                 (true, _) => None,
                 (false, true) => Some("true"),
@@ -370,7 +429,7 @@ fn route(
                         .is_none_or(|want| shown(*n, r) == Some(want.as_str()))
             })
             .map(|(n, r)| {
-                let mut member = format!("{{\".id\":\"*{:X}\"", n + 1);
+                let mut member = format!("{{\".id\":\"*{:X}\"", r.id.unwrap_or(n as u32 + 1));
                 if let Some(v) = shown(n, r) {
                     if asked("disabled") {
                         member.push_str(&format!(",\"disabled\":\"{}\"", v));
@@ -381,6 +440,9 @@ fn route(
                 }
                 if r.dynamic && asked("dynamic") {
                     member.push_str(",\"dynamic\":\"true\"");
+                }
+                if asked("action") {
+                    member.push_str(&format!(",\"action\":\"{}\"", r.action));
                 }
                 member.push('}');
                 member
@@ -441,6 +503,30 @@ fn route(
             f.lookups.push(query.to_string());
             let list = param(query, "list").unwrap_or_default();
             let address = param(query, "address").unwrap_or_default();
+            if list != "cctv_ban" {
+                // As RouterOS answers `.proplist=.id,dynamic,timeout`: a
+                // timed entry is dynamic and has a timeout, a static one
+                // has neither.
+                let proplist = param(query, ".proplist").unwrap_or_default();
+                let asked = |p: &str| proplist.split(',').any(|q| q == p);
+                let out: Vec<String> = f
+                    .listed
+                    .iter()
+                    .filter(|e| e.list == list && e.address == address)
+                    .map(|e| {
+                        let mut member = format!("{{\".id\":\"{}\"", listed_id(e));
+                        if let (Some(t), true) = (&e.timeout, asked("timeout")) {
+                            member.push_str(&format!(",\"timeout\":\"{}\"", t));
+                        }
+                        if asked("dynamic") {
+                            member.push_str(&format!(",\"dynamic\":\"{}\"", e.timeout.is_some()));
+                        }
+                        member.push('}');
+                        member
+                    })
+                    .collect();
+                return reply(200, json, format!("[{}]", out.join(",")));
+            }
             let found = list == "cctv_ban" && f.bans.contains(&address);
             let out = match address.parse::<Ipv4Addr>() {
                 Ok(ip) if found => format!("[{{\".id\":\"{}\"}}]", entry_id(ip)),
@@ -483,6 +569,91 @@ fn route(
                 .map(|a| format!("{{\"address\":\"{}\"}}", a))
                 .collect();
             return reply(200, json, format!("[{}]", list.join(",")));
+        }
+        if method == "PATCH" {
+            let id = path.trim_start_matches("/rest/ip/firewall/address-list/");
+            let (list, address) = listed_of(&f, id);
+            let outcome = if f.router_down {
+                "down"
+            } else if f.refuse_writes {
+                "refused"
+            } else if address.is_empty() {
+                "no such item"
+            } else {
+                "renewed"
+            };
+            f.safe_log.push((list, address.clone(), outcome));
+            return match outcome {
+                "down" => reply(500, json, "{\"error\":500,\"message\":\"down\"}"),
+                "refused" => reply(
+                    400,
+                    json,
+                    "{\"detail\":\"not enough permissions (9)\",\"error\":400,\
+                     \"message\":\"Bad Request\"}",
+                ),
+                "no such item" => reply(
+                    400,
+                    json,
+                    "{\"detail\":\"no such item\",\"error\":400,\"message\":\"Bad Request\"}",
+                ),
+                _ => {
+                    let timeout = between(body, "\"timeout\":\"", "\"").to_string();
+                    let entry = f.listed.iter_mut().find(|e| listed_id(e) == id).unwrap();
+                    entry.timeout = Some(timeout);
+                    let out = format!("{{\".id\":\"{}\",\"address\":\"{}\"}}", id, address);
+                    reply(200, json, out)
+                }
+            };
+        }
+        if method == "PUT" && between(body, "\"list\":\"", "\"") != "cctv_ban" {
+            let list = between(body, "\"list\":\"", "\"").to_string();
+            let address = between(body, "\"address\":\"", "\"").to_string();
+            let listed = f
+                .listed
+                .iter()
+                .any(|e| e.list == list && e.address == address);
+            let outcome = if f.router_down {
+                "down"
+            } else if f.refuse_writes {
+                "refused"
+            } else if listed {
+                "duplicate"
+            } else {
+                "added"
+            };
+            f.safe_log.push((list.clone(), address.clone(), outcome));
+            return match outcome {
+                "down" => reply(500, json, "{\"error\":500,\"message\":\"down\"}"),
+                "refused" => reply(
+                    400,
+                    json,
+                    "{\"detail\":\"not enough permissions (9)\",\"error\":400,\
+                     \"message\":\"Bad Request\"}",
+                ),
+                "duplicate" => reply(
+                    400,
+                    json,
+                    "{\"detail\":\"failure: already have such entry\",\"error\":400,\
+                     \"message\":\"Bad Request\"}",
+                ),
+                _ => {
+                    let timeout = Some(between(body, "\"timeout\":\"", "\"").to_string())
+                        .filter(|t| !t.is_empty());
+                    let entry = Listed {
+                        list,
+                        address,
+                        timeout,
+                    };
+                    let out = format!(
+                        "{{\".id\":\"{}\",\"address\":\"{}\",\"list\":\"{}\"}}",
+                        listed_id(&entry),
+                        entry.address,
+                        entry.list
+                    );
+                    f.listed.push(entry);
+                    reply(201, json, out)
+                }
+            };
         }
         if method == "PUT" {
             if let Some(flag) = &f.stop_on_put {
@@ -558,6 +729,23 @@ fn route(
 /// exists (RouterOS ids are `*` and a hexadecimal number too).
 pub fn entry_id(ip: Ipv4Addr) -> String {
     format!("*{:X}", u32::from(ip))
+}
+
+/// The id of an entry of another list: `*1` and the address as eight
+/// hexadecimal digits, so it differs from every id of `cctv_ban`.
+pub fn listed_id(entry: &Listed) -> String {
+    let ip: Ipv4Addr = entry.address.parse().unwrap_or(Ipv4Addr::UNSPECIFIED);
+    format!("*1{:08X}", u32::from(ip))
+}
+
+/// The list and address of the entry of another list with the id `id`
+/// (empty when none).
+fn listed_of(f: &Fake, id: &str) -> (String, String) {
+    f.listed
+        .iter()
+        .find(|e| listed_id(e) == id)
+        .map(|e| (e.list.clone(), e.address.clone()))
+        .unwrap_or_default()
 }
 
 /// The address whose entry has the id `id`, as text (empty when none).

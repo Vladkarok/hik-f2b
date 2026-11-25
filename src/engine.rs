@@ -22,12 +22,16 @@
 //! ledger with the rules. With every firewall check
 //! the engine asks the router whether an own address is in the
 //! address-list, and removes it if it is (`sweep_own`): the only ban
-//! hik-f2b ever removes (ADR 0005).
+//! hik-f2b ever removes (ADR 0005). With a safe list, the same checks keep
+//! the own address toward the router in it (`keep_safe`, ADR 0006).
 
-use crate::action::{render, BanError, BanInfo, Firewall, HealthError, Notifier};
+use crate::action::{render, BanError, BanInfo, Firewall, HealthError, Kept, Notifier};
 use crate::config::{Config, DEFAULT_MESSAGE};
 use crate::country::{self, Code};
-use crate::health::{self, BanAttempt, BansEnded, Health, Kind, Notice, NvrRead, OwnStuck};
+use crate::health::{
+    self, BanAttempt, BansEnded, Health, Kind, Notice, NvrRead, OwnStuck, SafeWrite,
+    HEALTH_CHECK_INTERVAL,
+};
 use crate::ledger::{Outcome, Rules, Turn, MAX_USER};
 use crate::names::RESOLVE_EVERY;
 use crate::nvr::{Nvr, NvrError};
@@ -42,6 +46,13 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+/// The timeout of the own address's entry in the safe list: six firewall
+/// checks. It is renewed at every check the router answers, so it outlives
+/// five checks in a row that fail (a router that restarts, a network that
+/// is down for 25 minutes), and an address that is no longer the host's
+/// stays safe for at most half an hour.
+pub const SAFE_TIMEOUT: u64 = 6 * HEALTH_CHECK_INTERVAL;
 
 pub struct Engine {
     cfg: Config,
@@ -65,6 +76,9 @@ pub struct Engine {
     /// removed (a dry run, or a removal that failed): reported once while
     /// they stay listed.
     own_reported: BTreeSet<Ipv4Addr>,
+    /// The own addresses toward the router that this engine has kept in
+    /// the safe list (or, in a dry run, said it would keep).
+    safe_kept: BTreeSet<Ipv4Addr>,
 }
 
 /// The first grace period (`Engine::grace`) after the engine started. The
@@ -159,6 +173,7 @@ impl Engine {
             startup: Startup::NotPolled,
             own,
             own_reported: BTreeSet::new(),
+            safe_kept: BTreeSet::new(),
         };
         engine
             .state
@@ -214,15 +229,23 @@ impl Engine {
     /// Returns whether the firewall answered (so that more can be asked of
     /// it without waiting for a second timeout).
     /// Like every firewall check that the router answers, it is followed by
-    /// the look-up of the own addresses in the address-list (`sweep_own`).
+    /// the write of the safe list, if there is one (`keep_safe`), and the
+    /// look-up of the own addresses in the address-list (`sweep_own`).
     pub fn startup_check(&mut self, host_now: u64) -> bool {
-        let answered = match self.check_firewall(host_now) {
-            None => false,
-            Some(Ok(found)) => {
+        let Some((result, safe_rule)) = self.check_firewall() else {
+            return false;
+        };
+        let answered = match &result {
+            Ok(found) => {
                 crate::info!("firewall check ok: {}", found);
+                match &safe_rule {
+                    Some(Ok(found)) => crate::info!("safe list check ok: {}", found),
+                    Some(Err(e)) => crate::error!("safe list check failed: {}", e),
+                    None => {}
+                }
                 true
             }
-            Some(Err(e)) => {
+            Err(e) => {
                 crate::error!(
                     "firewall check failed: {} (bans will keep being retried)",
                     e
@@ -230,6 +253,7 @@ impl Engine {
                 matches!(e, HealthError::NotEnforced(_))
             }
         };
+        self.checked(result, safe_rule, answered, host_now);
         if answered {
             self.sweep_own(host_now);
         }
@@ -293,11 +317,44 @@ impl Engine {
         }
     }
 
-    /// One health check of the firewall; the outcome goes to health.
-    fn check_firewall(&mut self, host_now: u64) -> Option<Result<String, HealthError>> {
-        let result = self.firewall.as_ref()?.check();
-        self.health.firewall_checked(&result, host_now);
-        Some(result)
+    /// One health check of the firewall, with the rule of the safe list if
+    /// there is one (`checked` gives the outcome to health).
+    #[allow(clippy::type_complexity)]
+    fn check_firewall(
+        &self,
+    ) -> Option<(Result<String, HealthError>, Option<Result<String, String>>)> {
+        let checked = self.firewall.as_ref()?.check_with_safe_list();
+        Some(match checked {
+            Ok(checked) => (Ok(checked.found), checked.safe_rule),
+            Err(e) => (Err(e), None),
+        })
+    }
+
+    /// After a firewall check at `now`: when the router `answered` it, the
+    /// write of the safe list (`keep_safe`); then the outcome goes to
+    /// health. A write that finds the router unusable makes the check a
+    /// failed one: the firewall problem stays open rather than passing at
+    /// the check and failing at the write a moment later.
+    fn checked(
+        &mut self,
+        result: Result<String, HealthError>,
+        safe_rule: Option<Result<String, String>>,
+        answered: bool,
+        now: u64,
+    ) {
+        let unusable = if answered && !self.stopping() {
+            self.keep_safe(now)
+        } else {
+            None
+        };
+        let result = match unusable {
+            Some(e) => Err(HealthError::Unusable(e)),
+            None => result,
+        };
+        self.health.firewall_checked(&result, now);
+        if let Some(safe_rule) = &safe_rule {
+            self.health.safe_rule_checked(safe_rule, now);
+        }
     }
 
     /// The periodic firewall check, at most once per cycle, when health
@@ -307,20 +364,127 @@ impl Engine {
         if !self.health.check_due(host_now) {
             return;
         }
-        let answered = match self.check_firewall(host_now) {
-            Some(Err(e)) => {
+        let Some((result, safe_rule)) = self.check_firewall() else {
+            return;
+        };
+        let answered = match &result {
+            Err(e) => {
                 crate::warn!("firewall check failed: {}", e);
                 matches!(e, HealthError::NotEnforced(_))
             }
-            Some(Ok(found)) => {
+            Ok(found) => {
                 crate::debug!("firewall check ok: {}", found);
+                match &safe_rule {
+                    Some(Ok(found)) => crate::debug!("safe list check ok: {}", found),
+                    Some(Err(e)) => crate::warn!("safe list check failed: {}", e),
+                    None => {}
+                }
                 true
             }
-            None => false,
         };
+        self.checked(result, safe_rule, answered, host_now);
         if answered && !self.stopping() {
             self.sweep_own(host_now);
         }
+    }
+
+    /// With a safe list, keeps the own addresses toward the router in it
+    /// for `SAFE_TIMEOUT` (ADR 0006): a look-up and a renewal or an add per
+    /// address, at every firewall check the router answers. An address
+    /// that is no longer an own address is left to expire. Without a safe
+    /// list nothing is done and nothing is sent. A dry run sends nothing
+    /// and says once per address what it would do. A refused write is the
+    /// health problem `safe-list-refused`. A router that cannot be used
+    /// ends the writes; its error is returned, for the firewall problem, as
+    /// for a ban.
+    fn keep_safe(&mut self, now: u64) -> Option<String> {
+        let fw = self.firewall.as_ref()?;
+        let list = fw.safe_list()?;
+        // Only own addresses: built from the config and the host's sockets.
+        let addresses = self.own.toward_router();
+        let timeout = util::fmt_timeout(SAFE_TIMEOUT);
+        for ip in self.safe_kept.iter().filter(|ip| !addresses.contains(ip)) {
+            crate::info!(
+                "{} is no longer the own address toward the router: its entry in the safe list \
+                 {} is left to expire",
+                ip,
+                list
+            );
+        }
+        self.safe_kept.retain(|ip| addresses.contains(ip));
+        if addresses.is_empty() {
+            // Nothing to write: the router is on this host, or the address
+            // toward it was never found (the look-up says why).
+            return None;
+        }
+        if self.cfg.dry_run {
+            for ip in addresses {
+                if self.safe_kept.insert(ip) {
+                    crate::info!(
+                        "DRY RUN: would keep {} in the safe list {} for {}, renewed at every \
+                         firewall check",
+                        ip,
+                        list,
+                        timeout
+                    );
+                }
+            }
+            return None;
+        }
+        let mut refused: Option<(Ipv4Addr, String)> = None;
+        for ip in addresses {
+            if self.stopping() {
+                return None;
+            }
+            match fw.keep_safe(ip, SAFE_TIMEOUT) {
+                Ok(kept) => {
+                    match kept {
+                        Kept::Added => {
+                            crate::info!("{} added to the safe list {} for {}", ip, list, timeout)
+                        }
+                        Kept::Renewed => {
+                            crate::debug!(
+                                "{} renewed in the safe list {} for {}",
+                                ip,
+                                list,
+                                timeout
+                            )
+                        }
+                        Kept::Left => crate::debug!(
+                            "{} is in the safe list {} without a timeout (added by hand): the \
+                             entry is left as it is",
+                            ip,
+                            list
+                        ),
+                    }
+                    self.safe_kept.insert(ip);
+                }
+                Err(e) => {
+                    let error = e.to_string();
+                    crate::error!(
+                        "cannot write own address {} to the safe list {}, will retry at the next \
+                         firewall check: {}",
+                        ip,
+                        list,
+                        error
+                    );
+                    if !matches!(e, BanError::Refused(_)) {
+                        return Some(error);
+                    }
+                    refused = Some((ip, error));
+                }
+            }
+        }
+        let write = match &refused {
+            None => SafeWrite::Written,
+            Some((ip, error)) => SafeWrite::Refused {
+                ip: *ip,
+                list: &list,
+                error,
+            },
+        };
+        self.health.safe_written(write, now);
+        None
     }
 
     /// Asks the firewall whether an own address is in the address-list, one

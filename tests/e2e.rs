@@ -4903,6 +4903,28 @@ fn test_ban_prints_what_the_router_did() {
     );
 }
 
+/// `--test-ban` refuses an own address, as the service never bans one: it
+/// says why, exits non-zero and sends nothing to the router. The command
+/// asks the operating system, which reaches the fakes from loopback.
+#[test]
+fn test_ban_refuses_an_own_address() {
+    let h = Harness::build(Opts::default());
+    assert_eq!(
+        hik_f2b(&h, &h.ini, &["--test-ban", "127.0.0.1"]),
+        (
+            Some(1),
+            String::new(),
+            "hik-f2b: --test-ban 127.0.0.1: that is an own address of hik-f2b (router 127.0.0.1 \
+             from 127.0.0.1, nvr1 127.0.0.1 from 127.0.0.1), and hik-f2b never bans its own \
+             addresses; nothing was sent to the router\n"
+                .to_string()
+        )
+    );
+    let f = h.fake.lock().unwrap();
+    assert_eq!(f.rest_requests, 0);
+    assert!(f.bans.is_empty() && f.put_log.is_empty());
+}
+
 /// What `--test-notify` prints and sends, exactly.
 #[test]
 fn test_notify_prints_whether_the_message_was_sent() {

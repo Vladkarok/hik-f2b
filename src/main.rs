@@ -283,6 +283,16 @@ fn one_shot(
             "--test-ban needs a firewall, but there is no [mikrotik] section in the config"
                 .to_string()
         })?;
+        // As in the service: an own address is never banned (ADR 0004).
+        let own = OwnAddresses::new(cfg, Box::new(System));
+        if own.set().contains(&ip) {
+            return Err(format!(
+                "--test-ban {}: that is an own address of hik-f2b ({}), and hik-f2b never bans \
+                 its own addresses; nothing was sent to the router",
+                ip,
+                own.describe()
+            ));
+        }
         let added = firewall
             .ban(ip, BanTime::Seconds(60), "hik-f2b test")
             .map_err(|e| e.to_string())?;

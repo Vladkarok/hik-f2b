@@ -7,14 +7,15 @@
 //! poll converts an NVR's entries with that NVR's current offset. The host
 //! time is passed in (`cycle_at`), so tests can drive both clocks.
 //!
-//! Along the way the engine tells `health::Alerts` whether each NVR could be
-//! read, whether the firewall could be used and whether bans are held back;
-//! that module decides when this is worth an alert.
+//! Along the way the engine tells `health::Health` how each NVR read, each
+//! firewall check and each ban attempt went, how the ban loop ended and when
+//! the poll ends; that module decides which health check this opens or ends
+//! and when it is worth an alert.
 
 use crate::action::{render, BanError, BanInfo, Firewall, HealthError, Notifier, NotifyError};
 use crate::config::{Config, DEFAULT_MESSAGE};
 use crate::country::{self, Code};
-use crate::health::{Alerts, Check, CheckLine, Kind, Notice, Status};
+use crate::health::{BanAttempt, BansEnded, CheckLine, Health, Kind, Notice, NvrRead, Status};
 use crate::ledger::{Outcome, Rules, Turn, MAX_FUTURE};
 use crate::mikrotik::Mikrotik;
 use crate::nvr::{Event, Nvr, NvrError, Search};
@@ -43,8 +44,6 @@ const MAX_FAILED_POLLS: u32 = 10;
 /// it and read after it are converted with the new offset, so their host
 /// times can be off by up to this much.
 pub const CLOCK_JUMP: i64 = 900;
-/// Time between two health checks of the firewall.
-pub const HEALTH_CHECK_INTERVAL: u64 = 300;
 /// Searches of one NVR's log per poll, when the NVR lists newest first and
 /// the window holds more than one search returns (see `read_window`). With
 /// the caps in `nvr.rs` one poll reads at most this many times 50 pages or
@@ -103,15 +102,10 @@ pub struct Engine {
     pub notifier: Option<Box<dyn Notifier>>,
     template: String,
     notifications: Vec<(String, u32)>,
-    alerts: Alerts,
-    /// Host time of the next firewall health check.
-    next_check: u64,
+    health: Health,
     /// The reason the last country lookup failed, if it did: a failure is
     /// logged when its reason changes, a recovery once.
     country_failure: Option<String>,
-    /// Host time a banned address was last seen reaching an NVR well after
-    /// its ban (see `Check::Bypassed`); `None` once that problem is over.
-    last_bypass: Option<u64>,
     /// Set (by a signal handler) when the service is to stop. A cycle
     /// looks at it between its steps (see `cycle_at`).
     stop: Arc<AtomicBool>,
@@ -537,7 +531,7 @@ impl Engine {
             .map(|t| t.message.clone())
             .unwrap_or_else(|| DEFAULT_MESSAGE.replace("\\n", "\n"));
         let mut engine = Engine {
-            alerts: Alerts::new(cfg.alert_after),
+            health: Health::new(cfg.alert_after, cfg.max_bans_per_hour),
             cfg,
             state,
             nvrs,
@@ -545,9 +539,7 @@ impl Engine {
             notifier,
             template,
             notifications: Vec::new(),
-            next_check: 0,
             country_failure: None,
-            last_bypass: None,
             stop: Arc::new(AtomicBool::new(false)),
             dropped_notifications: 0,
             notify_after: 0,
@@ -598,7 +590,8 @@ impl Engine {
     }
 
     /// Runs the firewall health check once at startup and logs the result;
-    /// the first periodic check follows `HEALTH_CHECK_INTERVAL` later.
+    /// the first periodic check follows `health::HEALTH_CHECK_INTERVAL`
+    /// later.
     /// Returns whether the firewall answered (so that more can be asked of
     /// it without waiting for a second timeout).
     pub fn startup_check(&mut self, host_now: u64) -> bool {
@@ -660,33 +653,17 @@ impl Engine {
         }
     }
 
-    /// One health check of the firewall; the outcome goes to the alerts.
+    /// One health check of the firewall; the outcome goes to health.
     fn check_firewall(&mut self, host_now: u64) -> Option<Result<String, HealthError>> {
         let result = self.firewall.as_ref()?.check();
-        self.next_check = host_now.saturating_add(HEALTH_CHECK_INTERVAL);
-        match &result {
-            Ok(_) => {
-                self.alerts.pass(&Check::Firewall, host_now);
-                self.alerts.pass(&Check::Rule, host_now);
-            }
-            Err(HealthError::Unusable(e)) => self.alerts.fail(Check::Firewall, e, host_now),
-            Err(HealthError::NotEnforced(e)) => {
-                self.alerts.pass(&Check::Firewall, host_now);
-                self.alerts.fail(Check::Rule, e, host_now);
-            }
-        }
+        self.health.firewall_checked(&result, host_now);
         Some(result)
     }
 
-    /// The periodic firewall check, at most once per cycle. Skipped when a
-    /// ban attempt in this cycle already found the firewall unusable: that
-    /// is known, a second timeout would only delay the next poll, and a read
-    /// that works must not end a problem that writes still show.
-    fn periodic_check(&mut self, host_now: u64, unreachable: bool) {
-        // A next check further away than the interval can only come from
-        // the host clock having gone back.
-        let due = host_now >= self.next_check || self.next_check - host_now > HEALTH_CHECK_INTERVAL;
-        if !due || unreachable {
+    /// The periodic firewall check, at most once per cycle, when health
+    /// says it is due (see `Health::check_due`).
+    fn periodic_check(&mut self, host_now: u64) {
+        if !self.health.check_due(host_now) {
             return;
         }
         match self.check_firewall(host_now) {
@@ -700,7 +677,7 @@ impl Engine {
     fn report_health(&mut self, host_now: u64) {
         let to_chat =
             self.notifier.is_some() && self.cfg.telegram.as_ref().is_none_or(|t| t.health_alerts);
-        for notice in self.alerts.due(host_now) {
+        for notice in self.health.due(host_now) {
             log_notice(&notice);
             if to_chat {
                 self.queue_notification(notice.text());
@@ -721,7 +698,7 @@ impl Engine {
     /// Problems that have been alerted and still persist, by key (for
     /// tests and diagnostics).
     pub fn alerted_problems(&self) -> Vec<String> {
-        self.alerts.alerted()
+        self.health.alerted()
     }
 
     /// `--check` at the current host time.
@@ -836,11 +813,10 @@ impl Engine {
     pub fn cycle_at(&mut self, host_now: u64) {
         let now = host_i64(host_now);
         let report_once = self.firewall.is_none() || self.cfg.dry_run;
-        // Whether every NVR was read in this cycle.
-        let mut all_read = true;
         for i in 0..self.nvrs.len() {
             if self.stopping() {
-                all_read = false;
+                self.health
+                    .nvr_polled(&self.nvrs[i].name, NvrRead::NotTried, host_now);
                 break;
             }
             let retry_after = self.nvrs[i].retry_after;
@@ -848,12 +824,12 @@ impl Engine {
                 // A wait longer than auth_backoff can only come from the
                 // host clock jumping back; do not wait for years.
                 if retry_after - host_now <= self.cfg.auth_backoff {
-                    all_read = false;
+                    self.health
+                        .nvr_polled(&self.nvrs[i].name, NvrRead::NotTried, host_now);
                     continue;
                 }
                 self.nvrs[i].retry_after = 0;
             }
-            let check = Check::Nvr(self.nvrs[i].name.clone());
             match poll_nvr(&mut self.nvrs[i], &self.cfg, &mut self.state, now) {
                 Err(NvrError::Auth(e)) => {
                     self.nvrs[i].retry_after = host_now.saturating_add(self.cfg.auth_backoff);
@@ -864,27 +840,30 @@ impl Engine {
                         e,
                         self.cfg.auth_backoff
                     );
-                    // The NVR is not polled while backing off, so the
-                    // problem stays open until the next attempt.
-                    let reason = format!("login rejected ({})", e);
-                    self.alerts.fail(check, &reason, host_now);
-                    all_read = false;
+                    self.health.nvr_polled(
+                        &self.nvrs[i].name,
+                        NvrRead::LoginRejected(&e),
+                        host_now,
+                    );
                 }
                 Err(NvrError::Other(e)) => {
                     crate::warn!("{}: poll failed: {}", self.nvrs[i].name, e);
-                    self.alerts.fail(check, &e, host_now);
-                    all_read = false;
+                    self.health
+                        .nvr_polled(&self.nvrs[i].name, NvrRead::Failed(&e), host_now);
                 }
                 Ok(polled) => {
-                    self.alerts.pass(&check, host_now);
+                    self.health
+                        .nvr_polled(&self.nvrs[i].name, NvrRead::Read, host_now);
                     self.count(polled, now, report_once);
                 }
             }
         }
-        let unreachable = self.stopping() || self.flush_pending(host_now);
-        self.bypass_over(host_now, all_read);
         if !self.stopping() {
-            self.periodic_check(host_now, unreachable);
+            self.flush_pending(host_now);
+        }
+        self.health.poll_ended(host_now);
+        if !self.stopping() {
+            self.periodic_check(host_now);
         }
         self.report_health(host_now);
         self.flush_notifications(host_now);
@@ -894,26 +873,6 @@ impl Engine {
                 "stop requested: the rest of this poll is skipped; waiting bans and \
                  notifications wait for the next start"
             );
-        }
-    }
-
-    /// Ends the `Check::Bypassed` problem once no banned address has
-    /// reached an NVR for `alert_after`, counted only while every NVR is
-    /// read (an NVR that cannot be read shows nothing either way). An
-    /// attacker that pauses for less than that does not end it; so it is
-    /// alerted when banned addresses keep reaching the NVRs for
-    /// `alert_after` without such a pause.
-    fn bypass_over(&mut self, now: u64, all_read: bool) {
-        let Some(last) = self.last_bypass else {
-            return;
-        };
-        // A last time in the future can only come from the host clock
-        // having gone back: count from now.
-        let last = last.min(now);
-        self.last_bypass = Some(last);
-        if all_read && now - last >= self.cfg.alert_after {
-            self.alerts.pass(&Check::Bypassed, now);
-            self.last_bypass = None;
         }
     }
 
@@ -938,25 +897,23 @@ impl Engine {
         }
     }
 
-    /// Applies waiting bans. Returns true when the firewall turned out to be
-    /// unusable (unreachable, refusing our login or answering with an
-    /// error), which ends the attempts for this cycle.
-    fn flush_pending(&mut self, now: u64) -> bool {
+    /// Applies waiting bans. The firewall turning out to be unusable
+    /// (unreachable, refusing our login or answering with an error) ends the
+    /// attempts for this cycle.
+    fn flush_pending(&mut self, now: u64) {
         let bantime = self.cfg.bantime;
         let due = self.state.ledger.due(&Rules::of(&self.cfg), now);
-        let mut limited = false;
-        let mut unreachable = false;
-        let mut stopped = false;
+        let mut end = BansEnded::Complete;
         for ip in due {
             if self.stopping() {
-                stopped = true;
+                end = BansEnded::Stopped;
                 break;
             }
             let p = match self.state.ledger.next_ban(&Rules::of(&self.cfg), ip) {
                 Turn::Ban(p) => p,
                 Turn::Gone => continue,
                 Turn::RateLimited => {
-                    limited = true;
+                    end = BansEnded::RateLimited;
                     break;
                 }
             };
@@ -1006,10 +963,8 @@ impl Engine {
                 Some(fw) => match fw.ban(ip, bantime, &comment) {
                     Err(BanError::Refused(e)) => {
                         crate::error!("cannot ban {} on {}, will retry: {}", ip, fw.describe(), e);
-                        // A successful read does not clear this: only a
-                        // ban the firewall accepts does.
-                        let reason = format!("{}: {}", ip, e);
-                        self.alerts.fail(Check::BanRefused, &reason, now);
+                        self.health
+                            .ban_tried(BanAttempt::Refused { ip, error: &e }, now);
                         (String::new(), Outcome::NotApplied, false)
                     }
                     Err(e) => {
@@ -1017,27 +972,23 @@ impl Engine {
                         // or answers with an error: every further attempt
                         // would fail the same way (an unreachable one only
                         // after the same timeout, holding up the next poll).
-                        // One problem, one alert: the periodic check would
-                        // report the same login or router trouble.
                         crate::error!(
                             "cannot ban {} on {}, will retry next cycle: {}",
                             ip,
                             fw.describe(),
                             e
                         );
-                        self.alerts.fail(Check::Firewall, &e.to_string(), now);
-                        unreachable = true;
+                        self.health
+                            .ban_tried(BanAttempt::Unreachable(&e.to_string()), now);
+                        end = BansEnded::CutShort;
                         break;
                     }
                     Ok(true) => {
-                        self.alerts.pass(&Check::Firewall, now);
-                        self.alerts.pass(&Check::BanRefused, now);
+                        self.health.ban_tried(BanAttempt::Accepted, now);
                         crate::warn!("BAN {} {} ({})", shown, duration, comment);
                         (format!("banned {}", duration), Outcome::Banned, true)
                     }
                     Ok(false) => {
-                        self.alerts.pass(&Check::Firewall, now);
-                        self.alerts.pass(&Check::BanRefused, now);
                         // The router is the source of truth for bans. A
                         // listed address should not reach the NVR, unless
                         // these failures were logged just before our ban.
@@ -1052,19 +1003,18 @@ impl Engine {
                                 ip,
                                 fw.describe()
                             );
-                            let since = match banned_at {
-                                Some(at) => format!(
-                                    "has been in {} for {}",
-                                    fw.describe(),
-                                    crate::health::fmt_duration(now.saturating_sub(at))
-                                ),
-                                None => format!("is in {}", fw.describe()),
-                            };
-                            let reason = format!("{} {} and still reached {}", ip, since, p.nvr);
-                            self.alerts.fail(Check::Bypassed, &reason, now);
-                            self.last_bypass = Some(now);
+                            self.health.ban_tried(
+                                BanAttempt::Bypassed {
+                                    ip,
+                                    list: &fw.describe(),
+                                    banned_at,
+                                    nvr: &p.nvr,
+                                },
+                                now,
+                            );
                         } else {
                             crate::info!("{} is already in {}", ip, fw.describe());
+                            self.health.ban_tried(BanAttempt::Listed, now);
                         }
                         (String::new(), Outcome::AlreadyListed, false)
                     }
@@ -1094,22 +1044,8 @@ impl Engine {
                 self.queue_notification(text);
             }
         }
-        if limited {
-            let reason = format!(
-                "{} address(es) waiting, limit {} per hour",
-                self.state.ledger.waiting(),
-                self.cfg.max_bans_per_hour
-            );
-            self.alerts.fail(Check::RateLimit, &reason, now);
-        } else if !unreachable && !stopped {
-            self.alerts.pass(&Check::RateLimit, now);
-        }
-        if self.state.ledger.waiting() == 0 {
-            // Every refused ban expired or was dropped: nothing is left to
-            // show whether the firewall would accept one now.
-            self.alerts.withdraw(&Check::BanRefused, now);
-        }
-        unreachable
+        self.health
+            .bans_ended(end, self.state.ledger.waiting(), now);
     }
 
     /// Notifications never hold up a ban: they are sent afterwards and

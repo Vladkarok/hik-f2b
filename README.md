@@ -255,8 +255,9 @@ Run these commands the same way as you run the service. For the plain binary:
 
 ```bash
 # Every NVR (login, clock, log search), the router and its drop rule,
-# the own addresses, whether Telegram is configured, and the country
-# database if set. One line per item; exits non-zero if anything failed.
+# the own addresses, what each host name in ignoreip resolves to, whether
+# Telegram is configured, and the country database if set. One line per
+# item; exits non-zero if anything failed.
 # Bans nothing, sends nothing, does not touch the state file.
 hik-f2b --config hik-f2b.ini --check
 
@@ -414,7 +415,7 @@ See [hik-f2b.example.ini](hik-f2b.example.ini). The settings in `[general]`:
 | `maxretry` | 5 | 1–1000 | Failed-login log entries that trigger a ban. |
 | `findtime` | 3600 | 10–2592000 | Window in which they must happen. |
 | `bantime` | 86400 | 60–21474836 or `permanent` | Ban length; the router expires the entry itself. `permanent`: see [Permanent bans](#permanent-bans). |
-| `ignoreip` | private ranges | | Addresses and networks that are never banned. Setting it replaces the default list. The own addresses are never banned either, see [Own addresses](#own-addresses). |
+| `ignoreip` | private ranges | | Addresses, networks and host names that are never banned. Setting it replaces the default list. A host name stands for the addresses it resolves to, see [Host names in ignoreip](#host-names-in-ignoreip). The own addresses are never banned either, see [Own addresses](#own-addresses). |
 | `max_bans_per_hour` | 20 | 1–10000 | Upper limit on new bans (or reports) per hour. |
 | `poll_interval` | 30 | 5–3600 | Time between log polls. |
 | `lookback` | 120 | 10–172800 | Overlap between consecutive log queries. |
@@ -445,7 +446,9 @@ the setting you probably meant.
 The default `ignoreip` is `127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12,
 192.168.0.0/16`. If you set `ignoreip`, repeat the private ranges you still
 need. The own addresses of hik-f2b stay exempt whatever `ignoreip` says, see
-[Own addresses](#own-addresses).
+[Own addresses](#own-addresses). An item of `ignoreip` that is not an
+address or a network is a host name, for example `home.example.net`, see
+[Host names in ignoreip](#host-names-in-ignoreip).
 
 Failed logins are counted across all configured NVRs together.
 
@@ -526,6 +529,47 @@ The limit: with NAT between this host and a device, the device sees another
 address, which hik-f2b cannot know. Put that address into `ignoreip`. A
 host name in a URL is resolved by this host's resolver, so whoever controls
 the answer for that name also decides which address is exempt.
+
+### Host names in ignoreip
+
+If your own public address changes (a home connection), you cannot write it
+into `ignoreip`, and a few wrong passwords from it ban you for `bantime`.
+Write a host name instead that follows your address, for example a dynamic
+DNS name: `ignoreip = 192.168.0.0/16, home.example.net`.
+
+- An item of `ignoreip` that is not an address or a network is a host name.
+  It has at least one dot, and only letters, digits and hyphens. A name of
+  another form is a config error that names the item. A name that does not
+  resolve is no error: the resolver may be down when hik-f2b starts.
+- hik-f2b resolves each name when it starts and then at most every 5
+  minutes, IPv4 only, with the resolver of this host. An address the name
+  resolves to is exempt like an address written in `ignoreip`. Its failed
+  logins are not counted
+  (`never banned (ignoreip name home.example.net), not counted`). Its waiting ban and counted failed logins are dropped
+  (`the address is now what the ignoreip name home.example.net resolves to`),
+  also right before a ban is applied.
+- When the name moves to another address, the old address is no longer
+  exempt: its next failed logins are counted, from zero. The change is one
+  INFO line (`ignoreip: home.example.net now resolves to ...`).
+- If a look-up fails, the addresses found before stay exempt. One WARNING
+  says so, not again while the look-ups keep failing. A name that has never
+  resolved exempts nothing, and the start of the service says so in a
+  WARNING.
+- The start of the service logs each name and what it resolves to
+  (`ignoreip names, never banned: ...`). `--check` prints one line per name
+  (`ignoreip home.example.net: resolves to ...`). A name that does not
+  resolve is a failed check there, because it protects nobody.
+- These addresses are not own addresses. hik-f2b does not remove them from
+  the address-list and does not write them to the safe list. If such an
+  address is banned already, remove its entry on the router.
+
+The trade-off: whoever controls the answer for the name can exempt any
+address from bans. That is the DNS provider, whoever holds the account at
+the dynamic DNS service, and whoever can forge answers on the path between
+this host and its resolver. Use a name under your own control, and protect
+that account well. Where your address is stable, write the address instead:
+that is safer. Why hik-f2b offers names anyway:
+[ADR 0007](docs/adr/0007-host-names-in-ignoreip-only-exempt.md).
 
 ### Safe list
 
@@ -961,7 +1005,9 @@ than 5 minutes in the future (host time).
   covered by the default `ignoreip`. Some VPNs use 100.64.0.0/10 (Tailscale,
   carrier-grade NAT), which the default does not cover. Add such ranges to
   `ignoreip`. Also add your own public addresses (office, monitoring host).
-  Keep the private ranges in `ignoreip`.
+  If your address changes, add a host name that follows it, see
+  [Host names in ignoreip](#host-names-in-ignoreip). Keep the private ranges
+  in `ignoreip`.
 - A client app with a stale saved password retries on its own and reaches the
   threshold quickly. After you change a password, update the saved password
   in the client apps at once.
@@ -1043,8 +1089,9 @@ whatever they typed). It is built accordingly:
   for the router is checked against `ignoreip` again before it is applied,
   and at startup. So if you add an address to `ignoreip` and restart
   hik-f2b, its waiting ban and its counted failed logins are dropped, with an
-  INFO line for each address. The own addresses are never banned either,
-  see the next item.
+  INFO line for each address. The same holds for the addresses that the
+  host names in `ignoreip` resolve to, see the item after the next. The own
+  addresses are never banned either, see the next item.
 - **Never banning itself.** hik-f2b finds its own addresses (the router's,
   each NVR's and this host's toward each) from the config and from this
   host's own sockets and resolver only, never from a log entry. A failed
@@ -1053,6 +1100,13 @@ whatever they typed). It is built accordingly:
   own failed logins after a password change nor a forged entry with the
   host's address can get the host banned, so that the router would block
   hik-f2b itself. See [Own addresses](#own-addresses).
+- **Host names in ignoreip.** Whoever controls the answer for such a name
+  (the DNS provider, the account at the dynamic DNS service, or someone who
+  can forge answers on the path to the resolver) can exempt an address from
+  bans. A name only exempts: hik-f2b never removes a ban for it and never
+  writes its addresses to the safe list. Use a name
+  under your control, or the address itself where it is stable. See
+  [Host names in ignoreip](#host-names-in-ignoreip).
 - **Safe list (optional).** With `safe_list` and its accept rule, the
   router does not block the address of this host toward it, whatever the
   address-list holds. hik-f2b writes only that own address to the safe
@@ -1272,6 +1326,10 @@ Not yet tried:
   (also for a router user without the `write` policy) and the
   `own-address-listed` alert. Only the tests and the simulation make these
   happen.
+- The host names in `ignoreip` of 0.5.0 on a real host: none of it has
+  been tried yet. Not the look-up through a real resolver (with a dynamic
+  DNS name or otherwise), nor the start line and `--check` with a real
+  name. Only the tests and the simulation make these happen.
 - The safe list of 0.5.0 on a real router: none of it has been tried yet.
   Not the rule command of the setup (with `place-before`), the renewal of a
   timeout with `PATCH`, the answers of RouterOS to the safe-list requests,

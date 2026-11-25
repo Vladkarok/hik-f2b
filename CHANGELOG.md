@@ -48,6 +48,22 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   sent. Not tried on a real router yet; see "Not yet tried" in the README.
 - `--test-ban` refuses an own address of hik-f2b: it says why, exits with
   status 1 and sends nothing to the router.
+- `ignoreip` also takes host names, for example the dynamic DNS name of an
+  administrator whose address changes. hik-f2b resolves each name at
+  startup and then at most every 5 minutes, IPv4 only. An address that a
+  name resolves to is never banned, like an address written in `ignoreip`,
+  and its waiting ban is dropped; when the name moves on, the old address is
+  counted again. A failed look-up keeps the addresses found before; a name
+  that has never resolved exempts nothing. A name of a wrong form is a config
+  error, a name that does not resolve is not. The start of the service logs
+  what each name resolves to, a change is one INFO line, and `--check`
+  prints a line per name (a name that does not resolve fails the check).
+  Whoever controls the answer for the name can exempt an address: use a
+  name under your control, or the address itself where it is stable (see
+  "Host names in ignoreip" in the README). These addresses are not own
+  addresses: hik-f2b removes no ban and writes nothing to the safe list for
+  them. Without a name in `ignoreip` nothing changes. Not tried on a real
+  host yet.
 
 ## [0.4.1] - 2026-11-25
 

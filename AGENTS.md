@@ -72,6 +72,10 @@ Before a release, also run
   an own address (ADR 0005).
 - Only own addresses go into the safe list, and hik-f2b adds or changes no
   firewall rule (ADR 0006).
+- What a host name in `ignoreip` resolves to only exempts an address from
+  bans (`src/ignored.rs`, ADR 0007). It never becomes an own address, never
+  reaches the safe list and never makes hik-f2b remove a ban. Resolve no
+  other name than these and the hosts of the device URLs (ADR 0004).
 - Releases are made by tags, as [RELEASING.md](RELEASING.md) says. Try a
   release candidate on real hardware first.
 - There is no automatic deployment, by design: hik-f2b changes a firewall,

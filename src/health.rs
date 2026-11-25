@@ -280,9 +280,10 @@ pub enum BanAttempt<'a> {
     /// The firewall added the address.
     Accepted,
     /// The firewall already listed the address, within the grace period
-    /// after its ban began: the failed logins may predate the ban.
+    /// after its ban began or after the engine started: the failed logins
+    /// may predate the ban.
     Listed,
-    /// The firewall already listed the address, after the grace period:
+    /// The firewall already listed the address, after both grace periods:
     /// a banned address still reached an NVR.
     Bypassed {
         ip: Ipv4Addr,

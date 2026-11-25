@@ -732,9 +732,12 @@ and always in its log. It watches:
   for longer than two polls and a minute still reaches an NVR with
   `maxretry` failed logins. The drop rule exists but does not block, for
   example because it names the wrong interface list. Each time, hik-f2b logs
-  a WARNING (`... is already in ... but still reached the NVR`). The problem
-  lasts while such addresses keep coming back with pauses shorter than
-  `alert_after`. It is over once none has come back for `alert_after` while
+  a WARNING (`... is already in ... but still reached the NVR`). For two
+  polls and a minute after hik-f2b starts, it logs such an address at INFO
+  (`... is already in ...`) instead: after a restart with another `bantime`,
+  hik-f2b cannot tell when the ban began. A ban that does not block shows
+  again after that time. The problem lasts while such addresses keep coming
+  back with pauses shorter than `alert_after`. It is over once none has come back for `alert_after` while
   every NVR could be read. hik-f2b cannot tell a fixed rule from an attacker
   that has given up.
 - **The ban rate limit:** addresses are waiting because `max_bans_per_hour` has

@@ -171,7 +171,15 @@ fn dump(cfg: &Config, nvrs: &mut [Nvr], hours: i64, raw: bool) -> usize {
         let result = nvr.now().and_then(|now| {
             println!("device time: {}", util::fmt_ts(now));
             let sink = if raw { Some(&mut sink) } else { None };
-            nvr.search(now - hours * 3600, now + 86400, &meta_id, sink)
+            // Saturating, as in `--check`: `--hours` is at most 8760 and a
+            // device time at most the year 9999, so this cannot overflow
+            // today, but nothing here should rely on those bounds.
+            nvr.search(
+                now.saturating_sub(hours.saturating_mul(3600)),
+                now.saturating_add(86400),
+                &meta_id,
+                sink,
+            )
         });
         let search = match result {
             Ok(search) => search,

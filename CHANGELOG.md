@@ -57,6 +57,24 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 
 ### Fixed
 
+- After a restart with another `bantime`, failed logins that were logged
+  just before a ban and read just after the restart could raise a false
+  WARNING `... is already in ... but still reached the NVR` and the
+  `ban-bypassed` health alert: hik-f2b derives when a ban began from the
+  current `bantime`. For two polls and a minute after hik-f2b starts, an
+  address found already in the address-list is now logged at INFO
+  (`... is already in ...`). A ban that does not block is still reported,
+  from its next sighting after that time. The state file is unchanged
+  (version 2).
+- A user name read back from a waiting ban in the state file is cut to 32
+  characters, as a counted one is; it was cut to 64. No state file that
+  hik-f2b wrote holds a longer one, so nothing changes for a state file
+  you have.
+- No test checked the text of the ERROR line that says an NVR rejected the
+  login and what to check, so a change to it went unnoticed. The tests now
+  compare it exactly, and also the lines about a failed poll, a ban that
+  could not be applied, a failed firewall check, health alerts, reminders
+  and recoveries, and log entries that may have been skipped.
 - The tests' fake servers kept running after a test ended, each with its
   listening socket, so a long simulation run (4000 seeds per class on
   GitHub) reached the system's limit and could not start the next one; they

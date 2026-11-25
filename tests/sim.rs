@@ -95,7 +95,8 @@
 //!   ones the documented policy gives for what the engine observed (failed
 //!   and successful polls, ban attempts, firewall checks, the rate limit,
 //!   listed addresses that still reach an NVR well after their ban, which
-//!   is over once none has for `alert_after` while every NVR is read):
+//!   is over once none has for `alert_after` while every NVR is read; none
+//!   is such an address within `STARTUP_GRACE` after an engine start):
 //!   alert once after `alert_after`, reminder after 24 h, one recovery or
 //!   "unknown" when an alerted problem ends, nothing for a short one, state
 //!   lost on restart. `health/condition` (all): an unreachable firewall is
@@ -157,6 +158,10 @@ const TRACE_LINES: usize = 150;
 /// of 64 on the fake) less an overlap of at most 120 s at 12 entries a
 /// second.
 const PER_POLL: usize = 1600;
+/// For two polls and a minute after an engine starts (its first poll), an
+/// address found already listed is not a bypass (README, "Bans that do not
+/// block"); the simulation keeps the default `poll_interval` of 30 s.
+const STARTUP_GRACE: i64 = 2 * 30 + 60;
 
 const BASE_NETS: [&str; 4] = [
     "127.0.0.0/8",
@@ -642,6 +647,8 @@ struct Sim {
     /// When a listed address last reached an NVR well after its ban (see
     /// `health/model`).
     last_bypass: Option<i64>,
+    /// Host time of the first poll of the engine running now.
+    started_at: Option<i64>,
     /// Addresses the liveness check had a due ban or report for.
     musts: usize,
     trace: Vec<String>,
@@ -699,6 +706,7 @@ impl Sim {
             dropped: HashSet::new(),
             health: Health::default(),
             last_bypass: None,
+            started_at: None,
             musts: 0,
             trace: Vec::new(),
         }
@@ -1063,6 +1071,7 @@ impl Sim {
         self.configs.push(self.nets.clone());
         self.health = Health::default();
         self.last_bypass = None;
+        self.started_at = None;
         self.h.engine.startup_check(self.host as u64);
         self.startup_lines()
     }
@@ -1249,6 +1258,7 @@ impl Sim {
         let offsets = self.offsets();
         self.h.set_host(self.host);
         self.h.engine.cycle_at(self.host as u64);
+        let started_at = *self.started_at.get_or_insert(self.host);
         for (n, (before, after)) in offsets.iter().zip(self.offsets()).enumerate() {
             if *before != after {
                 self.nvr[n].offset_changes += 1;
@@ -1302,6 +1312,15 @@ impl Sim {
                             "[health/condition] {} reached the NVR \"already listed\", but the \
                              router does not list it",
                             ip
+                        ));
+                    }
+                    if self.host - started_at <= STARTUP_GRACE {
+                        return Err(format!(
+                            "[health/model] {} reported as a bypass {} s after the engine \
+                             started, within {} s",
+                            ip,
+                            self.host - started_at,
+                            STARTUP_GRACE
                         ));
                     }
                     self.on_ban(ip, Ban::Listed)?;

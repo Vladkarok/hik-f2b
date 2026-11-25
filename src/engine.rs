@@ -21,7 +21,7 @@ use crate::action::{render, BanError, BanInfo, Firewall, HealthError, Notifier};
 use crate::config::{Config, DEFAULT_MESSAGE};
 use crate::country::{self, Code};
 use crate::health::{BanAttempt, BansEnded, Health, Kind, Notice, NvrRead};
-use crate::ledger::{Outcome, Rules, Turn};
+use crate::ledger::{Outcome, Rules, Turn, MAX_USER};
 use crate::nvr::{Nvr, NvrError};
 use crate::outbox::Outbox;
 use crate::reader::{LogReader, Login, Logins, Poll};
@@ -52,7 +52,7 @@ pub struct Engine {
 /// Counts one failed login (host time) in the ledger, which queues the ban
 /// when the limit is reached.
 fn register(login: &Login, host_now: i64, rules: &Rules, state: &mut State, report_once: bool) {
-    let user = util::sanitize(&login.user, 32);
+    let user = util::sanitize(&login.user, MAX_USER);
     let ip = match login.ip {
         IpAddr::V4(ip) => ip,
         IpAddr::V6(ip) => {
@@ -352,8 +352,8 @@ impl Engine {
             // Display only, and looked up after every decision is made.
             let code = self.country(ip);
             // At the end: after the fixed-format time, where the user name
-            // (attacker-chosen, up to 32 characters) cannot reach. The whole
-            // comment stays within 110 characters.
+            // (attacker-chosen, up to `MAX_USER` characters) cannot reach. The
+            // whole comment stays within 110 characters.
             let comment = util::sanitize(
                 &format!(
                     "hik-f2b {} user={} {}{}",

@@ -57,6 +57,10 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 
 ### Fixed
 
+- A user name read back from a waiting ban in the state file is cut to 32
+  characters, as a counted one is; it was cut to 64. No state file that
+  hik-f2b wrote holds a longer one, so nothing changes for a state file
+  you have.
 - The tests' fake servers kept running after a test ended, each with its
   listening socket, so a long simulation run (4000 seeds per class on
   GitHub) reached the system's limit and could not start the next one; they

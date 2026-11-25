@@ -358,6 +358,40 @@ fn hostile_user_name_cannot_inject_anything() {
     );
 }
 
+/// A user name is cut to the same length whether it is counted from the
+/// NVR log or read back from a waiting ban in the state file.
+#[test]
+fn a_long_user_name_is_cut_alike_when_counted_and_when_loaded() {
+    let mut h = Harness::new(false);
+    let long = "abcdefghij".repeat(5);
+    h.fake.lock().unwrap().router_unreachable = true; // the ban waits
+    for second in 10..15 {
+        h.add_full(
+            &format!("10:01:{}", second),
+            ATTACKER,
+            &long,
+            "illlegealAccess",
+        );
+    }
+    h.cycle("10:02:00");
+    assert_eq!(h.engine.state().ledger.waiting(), 1);
+    let saved = h.engine.state().serialize();
+    let line = saved
+        .lines()
+        .find(|line| line.starts_with("pending "))
+        .unwrap()
+        .to_string();
+    assert!(
+        line.ends_with(&format!(" nvr1 {}", &long[..32])),
+        "{}",
+        line
+    );
+    // the same waiting ban with the whole user name in the state file
+    let whole = saved.replace(&line, &format!("{}{}", line, &long[32..]));
+    assert_ne!(whole, saved);
+    assert_eq!(State::parse(&whole), *h.engine.state());
+}
+
 #[test]
 fn ban_rate_limit_holds_back_a_flood() {
     let mut h = Harness::with(Opts {

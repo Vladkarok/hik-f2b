@@ -32,6 +32,10 @@ const MAX_TIMES: usize = 4096;
 pub const MAX_BANNED: usize = 100_000;
 /// Upper bound on the recent ban times read from a state file.
 pub(crate) const MAX_RATE: usize = 10_000;
+/// Longest user name kept for a failed login, in characters: when it is
+/// counted (`engine.rs`) and when a waiting ban is read from a state file.
+/// It goes into the router comment of the ban.
+pub const MAX_USER: usize = 32;
 /// Failed logins more than this far in the (host) future are not counted.
 pub const MAX_FUTURE: i64 = 300;
 /// With `bantime = permanent` the router keeps the ban for ever, but what
@@ -575,7 +579,7 @@ impl Ledger {
                         ts,
                         count,
                         nvr: nvr.to_string(),
-                        user: util::sanitize(&user.join(" "), 64),
+                        user: util::sanitize(&user.join(" "), MAX_USER),
                     },
                 );
                 true

@@ -6,7 +6,7 @@
 #
 # Use a static (musl) binary, see "No container" in README.md. The one in
 # the published image can be copied out with:
-#   podman create --name hik-f2b-copy ghcr.io/vladkarok/hik-f2b:0.4.1
+#   podman create --name hik-f2b-copy ghcr.io/vladkarok/hik-f2b:0.5.0
 #   podman cp hik-f2b-copy:/hik-f2b ./hik-f2b && podman rm hik-f2b-copy
 # Then, as root:
 #   install -m 755 hik-f2b /usr/local/bin/hik-f2b

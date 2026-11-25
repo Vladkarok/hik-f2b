@@ -47,6 +47,43 @@ pub struct Engine {
     /// Set (by a signal handler) when the service is to stop. A cycle
     /// looks at it between its steps (see `cycle_at`).
     stop: Arc<AtomicBool>,
+    /// The grace period after the engine started.
+    startup: Startup,
+}
+
+/// The first grace period (`Engine::grace`) after the engine started. The
+/// ledger does not store when a ban began, it derives it from the
+/// remembered end and the current `bantime` (see ADR 0003). After a restart
+/// with another `bantime` that start is wrong, so an address found already
+/// listed in this period is not taken for a bypass: a real bypass repeats,
+/// and is reported from the next sighting after the period.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Startup {
+    /// No poll yet.
+    NotPolled,
+    /// The period runs; the host time of the first poll.
+    Since(u64),
+    Over,
+}
+
+impl Startup {
+    /// A poll at host time `now`. The first poll starts the period. It is
+    /// over at the first poll more than `grace` after that one, or before
+    /// it: a host clock that went back must not make it last longer than
+    /// one grace period.
+    fn polled(&mut self, now: u64, grace: u64) {
+        if let Startup::NotPolled = self {
+            *self = Startup::Since(now);
+        } else if let Startup::Since(first) = *self {
+            if now < first || now - first > grace {
+                *self = Startup::Over;
+            }
+        }
+    }
+
+    fn running(self) -> bool {
+        matches!(self, Startup::Since(_))
+    }
 }
 
 /// Counts one failed login (host time) in the ledger, which queues the ban
@@ -101,6 +138,7 @@ impl Engine {
             template,
             country_failure: None,
             stop: Arc::new(AtomicBool::new(false)),
+            startup: Startup::NotPolled,
         };
         engine.state.ledger.fit(&Rules::of(&engine.cfg));
         Ok(engine)
@@ -264,6 +302,7 @@ impl Engine {
     /// waiting bans) is in the state, which the caller saves.
     pub fn cycle_at(&mut self, host_now: u64) {
         let now = host_i64(host_now);
+        self.startup.polled(host_now, self.grace());
         let report_once = self.firewall.is_none() || self.cfg.dry_run;
         for i in 0..self.readers.len() {
             if self.stopping() {
@@ -425,10 +464,12 @@ impl Engine {
                         // listed address should not reach the NVR, unless
                         // these failures were logged just before our ban.
                         // The time of the ban is kept (`Ledger::outcome`), so an
-                        // attacker that keeps going cannot hide this.
+                        // attacker that keeps going cannot hide this. Right
+                        // after the start that time may come from another
+                        // `bantime` (see `Startup`).
                         let banned_at = self.state.ledger.ban_began(&Rules::of(&self.cfg), ip);
-                        let grace = self.cfg.poll_interval.saturating_mul(2).saturating_add(60);
-                        if now.saturating_sub(banned_at.unwrap_or(0)) > grace {
+                        let recent = now.saturating_sub(banned_at.unwrap_or(0)) <= self.grace();
+                        if !recent && !self.startup.running() {
                             crate::warn!(
                                 "{} is already in {} but still reached the NVR; \
                                  if this repeats, check the firewall drop rule for that list",
@@ -480,6 +521,12 @@ impl Engine {
             .bans_ended(end, self.state.ledger.waiting(), now);
     }
 
+    /// How long after a ban (and after the start) failed logins of a listed
+    /// address may still come from before the ban: two polls and a minute.
+    fn grace(&self) -> u64 {
+        self.cfg.poll_interval.saturating_mul(2).saturating_add(60)
+    }
+
     fn cleanup(&mut self, host_now: u64) {
         self.state.ledger.cleanup(&Rules::of(&self.cfg), host_now);
     }
@@ -514,5 +561,46 @@ fn log_notice(notice: &Notice) {
         Kind::Reminder => crate::error!("health reminder [{}]: {}", key, text),
         Kind::Recovered => crate::info!("health recovered [{}]: {}", key, text),
         Kind::Unknown => crate::info!("health unknown [{}]: {}", key, text),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Startup;
+
+    const T0: u64 = 1_768_000_000;
+    const GRACE: u64 = 120;
+
+    fn after(polls: &[u64]) -> Startup {
+        let mut s = Startup::NotPolled;
+        for t in polls {
+            s.polled(*t, GRACE);
+        }
+        s
+    }
+
+    #[test]
+    fn the_period_runs_from_the_first_poll_for_one_grace_period() {
+        assert!(!Startup::NotPolled.running());
+        assert_eq!(after(&[T0]), Startup::Since(T0));
+        assert!(after(&[T0, T0 + 30, T0 + GRACE]).running());
+        assert_eq!(after(&[T0, T0 + GRACE + 1]), Startup::Over);
+        // a long pause between two polls ends it as well
+        assert_eq!(after(&[T0, T0 + 86400]), Startup::Over);
+    }
+
+    #[test]
+    fn the_period_never_comes_back() {
+        assert_eq!(after(&[T0, T0 + GRACE + 1, T0 + 30]), Startup::Over);
+        assert_eq!(after(&[T0, T0 + GRACE + 1, T0]), Startup::Over);
+    }
+
+    #[test]
+    fn a_host_clock_that_goes_back_ends_the_period() {
+        // counted from the time the clock went back to, the period would
+        // last until T0 - 3600 + GRACE: longer than one grace period
+        assert_eq!(after(&[T0, T0 + 30, T0 - 3600]), Startup::Over);
+        assert_eq!(after(&[T0, T0 - 1]), Startup::Over);
+        assert!(!after(&[T0, T0 - 3600, T0 - 3600 + 30]).running());
     }
 }

@@ -17,6 +17,12 @@ pub fn verbose() -> bool {
     VERBOSE.load(Ordering::Relaxed)
 }
 
+/// A host time as a signed number of seconds, for comparisons with times
+/// that may be before it (the largest value for one beyond `i64`).
+pub fn host_i64(host_now: u64) -> i64 {
+    i64::try_from(host_now).unwrap_or(i64::MAX)
+}
+
 pub fn unix_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

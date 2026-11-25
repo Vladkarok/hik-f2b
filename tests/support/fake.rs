@@ -1202,6 +1202,7 @@ impl Harness {
     pub fn fails(&self, address: &str) -> usize {
         self.engine
             .state
+            .ledger
             .fails
             .get(&ip(address))
             .map(|t| t.len())

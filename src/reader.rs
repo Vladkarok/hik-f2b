@@ -307,7 +307,8 @@ impl<L: LogSource> LogReader<L> {
         &self.name
     }
 
-    /// The client, for what is not a poll (`--check`, `--dump`, tests).
+    /// The log source, for what is not a poll (the unit tests set up their
+    /// log in memory through it).
     pub fn client(&mut self) -> &mut L {
         &mut self.log
     }

@@ -41,11 +41,6 @@ impl Outbox {
         }
     }
 
-    /// The notifier, for `--test-notify`, which sends one message itself.
-    pub fn notifier(&self) -> Option<&dyn Notifier> {
-        self.notifier.as_deref()
-    }
-
     /// Queues a text for the chat; counts it as dropped when
     /// `MAX_QUEUED_NOTIFICATIONS` already wait. Without a notifier the text
     /// is not kept.
@@ -453,7 +448,6 @@ mod tests {
         capture_log();
         let stop = AtomicBool::new(false);
         let mut outbox = Outbox::new(None);
-        assert!(outbox.notifier().is_none());
         for i in 0..MAX_QUEUED_NOTIFICATIONS + 5 {
             outbox.queue(format!("n{}", i));
         }

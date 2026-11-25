@@ -135,16 +135,33 @@ pub enum Outcome {
     NotApplied,
 }
 
+/// How much the ledger holds, or (`Ledger::caps`) may hold.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sizes {
+    /// Addresses with a failure counter.
+    pub tracked: usize,
+    /// Failure times of all addresses together.
+    pub fail_times: usize,
+    /// Failure times of the address with the most.
+    pub most_fail_times: usize,
+    /// Addresses remembered as banned (or reported).
+    pub remembered: usize,
+    /// Bans waiting to be applied.
+    pub waiting: usize,
+    /// Bans in the last hour.
+    pub recent_bans: usize,
+}
+
 #[derive(Default, Debug, PartialEq)]
 pub struct Ledger {
     /// Host times of recent failures per address.
-    pub fails: BTreeMap<Ipv4Addr, Vec<i64>>,
+    fails: BTreeMap<Ipv4Addr, Vec<i64>>,
     /// Host time until which an address counts as handled (banned, or
     /// reported in notify-only mode).
-    pub banned: BTreeMap<Ipv4Addr, u64>,
-    pub pending: BTreeMap<Ipv4Addr, Pending>,
+    banned: BTreeMap<Ipv4Addr, u64>,
+    pending: BTreeMap<Ipv4Addr, Pending>,
     /// Host times of the bans applied in the last hour (the rate limit).
-    pub recent_bans: Vec<u64>,
+    recent_bans: Vec<u64>,
 }
 
 impl Ledger {
@@ -447,6 +464,48 @@ impl Ledger {
         self.pending.len()
     }
 
+    /// Whether a ban of `ip` waits.
+    pub fn is_waiting(&self, ip: Ipv4Addr) -> bool {
+        self.pending.contains_key(&ip)
+    }
+
+    /// The failed logins of `ip` that are counted.
+    pub fn failed_logins(&self, ip: Ipv4Addr) -> usize {
+        self.fails.get(&ip).map_or(0, Vec::len)
+    }
+
+    /// The host time until which `ip` is remembered as banned (or
+    /// reported).
+    pub fn banned_until(&self, ip: Ipv4Addr) -> Option<u64> {
+        self.banned.get(&ip).copied()
+    }
+
+    /// How much the ledger holds.
+    pub fn sizes(&self) -> Sizes {
+        Sizes {
+            tracked: self.fails.len(),
+            fail_times: self.fails.values().map(Vec::len).sum(),
+            most_fail_times: self.fails.values().map(Vec::len).max().unwrap_or(0),
+            remembered: self.banned.len(),
+            waiting: self.pending.len(),
+            recent_bans: self.recent_bans.len(),
+        }
+    }
+
+    /// How much the ledger holds at most, once `fit` to rules with this
+    /// `maxretry` and `max_bans_per_hour`.
+    pub fn caps(maxretry: usize, max_bans_per_hour: usize) -> Sizes {
+        let (per_address, addresses) = fail_limits(maxretry);
+        Sizes {
+            tracked: addresses,
+            fail_times: MAX_FAIL_TIMES,
+            most_fail_times: per_address,
+            remembered: MAX_BANNED,
+            waiting: MAX_PENDING,
+            recent_bans: max_bans_per_hour,
+        }
+    }
+
     /// Writes the ledger's lines of the state file.
     pub fn write_to(&self, out: &mut impl Write) -> std::io::Result<()> {
         for (ip, times) in &self.fails {
@@ -540,5 +599,627 @@ impl Ledger {
         for times in self.fails.values_mut() {
             times.sort_unstable();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::State;
+    use crate::util::{capture_log, captured_log};
+
+    const T0: i64 = 1_768_000_000;
+    const NO_IGNORE: &[Net] = &[];
+
+    fn ip(text: &str) -> Ipv4Addr {
+        text.parse().unwrap()
+    }
+
+    /// Generated addresses, as in the end-to-end tests.
+    fn address(i: usize) -> Ipv4Addr {
+        Ipv4Addr::from(0x0B00_0000u32 + i as u32)
+    }
+
+    fn rules(ignore: &[Net]) -> Rules<'_> {
+        Rules {
+            maxretry: 3,
+            findtime: 600,
+            bantime: BanTime::Seconds(86400),
+            max_bans_per_hour: 2,
+            ignore,
+        }
+    }
+
+    fn at(t: i64) -> u64 {
+        t as u64
+    }
+
+    /// A ledger read from lines of a state file.
+    fn read(lines: &str) -> Ledger {
+        State::parse(&format!("hik-f2b-state 2\n{}", lines)).ledger
+    }
+
+    /// The ledger's lines of the state file.
+    fn lines(ledger: &Ledger) -> String {
+        let mut out = Vec::new();
+        ledger.write_to(&mut out).unwrap();
+        String::from_utf8(out).unwrap()
+    }
+
+    /// A failed login at host time `ts`, counted in the poll at `ts`.
+    fn fail(ledger: &mut Ledger, rules: &Rules, ip: Ipv4Addr, ts: i64) {
+        ledger.failed_login(rules, ip, ts, ts, "nvr1", "admin".to_string(), false);
+    }
+
+    /// `maxretry` failed logins of `ip`, the last at `ts`: a ban waits.
+    fn make_waiting(ledger: &mut Ledger, rules: &Rules, ip: Ipv4Addr, ts: i64) {
+        for k in (0..rules.maxretry).rev() {
+            fail(ledger, rules, ip, ts - k as i64);
+        }
+        assert!(ledger.is_waiting(ip), "{}", ip);
+    }
+
+    fn pending(ts: i64, count: usize) -> Pending {
+        Pending {
+            ts,
+            count,
+            nvr: "nvr1".to_string(),
+            user: "admin".to_string(),
+        }
+    }
+
+    fn within(sizes: Sizes, caps: Sizes) -> bool {
+        sizes.tracked <= caps.tracked
+            && sizes.fail_times <= caps.fail_times
+            && sizes.most_fail_times <= caps.most_fail_times
+            && sizes.remembered <= caps.remembered
+            && sizes.waiting <= caps.waiting
+            && sizes.recent_bans <= caps.recent_bans
+    }
+
+    #[test]
+    fn maxretry_failed_logins_within_findtime_make_a_ban_wait() {
+        let r = rules(NO_IGNORE);
+        let mut l = Ledger::default();
+        let a = ip("198.51.100.7");
+        capture_log();
+        fail(&mut l, &r, a, T0);
+        fail(&mut l, &r, a, T0 + 100);
+        assert_eq!(l.failed_logins(a), 2);
+        assert!(!l.is_waiting(a));
+        // the first is exactly `findtime` before: still counted
+        fail(&mut l, &r, a, T0 + 600);
+        assert_eq!(l.failed_logins(a), 3);
+        assert!(l.is_waiting(a));
+        let log = captured_log();
+        assert_eq!(log.len(), 3, "{:?}", log);
+        assert_eq!(
+            log[2],
+            format!(
+                "INFO nvr1: failed login from 198.51.100.7 (user=\"admin\") at {} [3/3]",
+                util::fmt_ts(T0 + 600)
+            )
+        );
+        assert_eq!(l.due(&r, at(T0 + 600)), vec![a]);
+        assert_eq!(l.next_ban(&r, a), Turn::Ban(pending(T0 + 600, 3)));
+    }
+
+    #[test]
+    fn failed_logins_outside_findtime_are_not_counted() {
+        let r = rules(NO_IGNORE);
+        let mut l = Ledger::default();
+        let a = ip("198.51.100.7");
+        fail(&mut l, &r, a, T0);
+        fail(&mut l, &r, a, T0 + 300);
+        // the first is now older than findtime
+        fail(&mut l, &r, a, T0 + 601);
+        assert_eq!(l.failed_logins(a), 2);
+        assert!(!l.is_waiting(a));
+        assert_eq!(l.waiting(), 0);
+        fail(&mut l, &r, a, T0 + 700);
+        assert_eq!(l.failed_logins(a), 3);
+        assert!(l.is_waiting(a));
+    }
+
+    #[test]
+    fn a_waiting_ban_counts_no_further_failed_logins() {
+        let r = rules(NO_IGNORE);
+        let mut l = Ledger::default();
+        let a = ip("198.51.100.7");
+        make_waiting(&mut l, &r, a, T0);
+        capture_log();
+        fail(&mut l, &r, a, T0 + 1);
+        assert!(captured_log().is_empty());
+        assert_eq!(l.failed_logins(a), 3);
+        assert_eq!(l.next_ban(&r, a), Turn::Ban(pending(T0, 3)));
+    }
+
+    #[test]
+    fn bans_are_attempted_oldest_first() {
+        let r = rules(NO_IGNORE);
+        let mut l = Ledger::default();
+        make_waiting(&mut l, &r, ip("198.51.100.9"), T0 + 20);
+        make_waiting(&mut l, &r, ip("198.51.100.8"), T0 + 10);
+        make_waiting(&mut l, &r, ip("198.51.100.7"), T0 + 10);
+        make_waiting(&mut l, &r, ip("198.51.100.6"), T0 + 30);
+        assert_eq!(
+            l.due(&r, at(T0 + 40)),
+            vec![
+                ip("198.51.100.7"),
+                ip("198.51.100.8"),
+                ip("198.51.100.9"),
+                ip("198.51.100.6")
+            ]
+        );
+    }
+
+    #[test]
+    fn an_applied_ban_is_remembered_and_uses_the_allowance() {
+        let r = rules(NO_IGNORE);
+        let mut l = Ledger::default();
+        let a = ip("198.51.100.7");
+        make_waiting(&mut l, &r, a, T0);
+        assert_eq!(l.due(&r, at(T0 + 5)), vec![a]);
+        l.outcome(&r, a, at(T0 + 5), Outcome::Banned);
+        assert!(!l.is_waiting(a));
+        assert_eq!(l.next_ban(&r, a), Turn::Gone);
+        assert_eq!(l.failed_logins(a), 0);
+        assert_eq!(l.banned_until(a), Some(at(T0 + 5 + 86400)));
+        assert_eq!(l.ban_began(&r, a), Some(at(T0 + 5)));
+        assert_eq!(l.sizes().recent_bans, 1);
+    }
+
+    #[test]
+    fn an_address_already_listed_uses_no_allowance() {
+        let r = rules(NO_IGNORE);
+        let mut l = Ledger::default();
+        // listed by hand: remembered from now
+        let a = ip("198.51.100.7");
+        make_waiting(&mut l, &r, a, T0);
+        l.outcome(&r, a, at(T0 + 5), Outcome::AlreadyListed);
+        assert!(!l.is_waiting(a));
+        assert_eq!(l.failed_logins(a), 0);
+        assert_eq!(l.banned_until(a), Some(at(T0 + 5 + 86400)));
+        assert_eq!(l.ban_began(&r, a), Some(at(T0 + 5)));
+        assert_eq!(l.sizes().recent_bans, 0);
+        // banned by hik-f2b before: the time of that ban is kept
+        let b = ip("198.51.100.8");
+        make_waiting(&mut l, &r, b, T0);
+        l.outcome(&r, b, at(T0 + 5), Outcome::Banned);
+        make_waiting(&mut l, &r, b, T0 + 1000);
+        l.outcome(&r, b, at(T0 + 1005), Outcome::AlreadyListed);
+        assert_eq!(l.banned_until(b), Some(at(T0 + 5 + 86400)));
+        assert_eq!(l.ban_began(&r, b), Some(at(T0 + 5)));
+        assert_eq!(l.sizes().recent_bans, 1);
+        // so the allowance is still there for one more
+        let c = ip("198.51.100.9");
+        make_waiting(&mut l, &r, c, T0 + 1000);
+        assert_eq!(l.due(&r, at(T0 + 1010)), vec![c]);
+        assert_eq!(l.next_ban(&r, c), Turn::Ban(pending(T0 + 1000, 3)));
+    }
+
+    #[test]
+    fn a_refused_ban_keeps_waiting_and_uses_no_allowance() {
+        let r = rules(NO_IGNORE);
+        let mut l = Ledger::default();
+        let a = ip("198.51.100.7");
+        make_waiting(&mut l, &r, a, T0);
+        for n in 0..5 {
+            assert_eq!(l.due(&r, at(T0 + n)), vec![a]);
+            assert_eq!(l.next_ban(&r, a), Turn::Ban(pending(T0, 3)));
+            l.outcome(&r, a, at(T0 + n), Outcome::NotApplied);
+        }
+        assert!(l.is_waiting(a));
+        assert_eq!(l.failed_logins(a), 3);
+        assert_eq!(l.banned_until(a), None);
+        assert_eq!(l.sizes().recent_bans, 0);
+    }
+
+    #[test]
+    fn the_hourly_rate_limit_holds_bans_back() {
+        let r = rules(NO_IGNORE);
+        let mut l = Ledger::default();
+        let (a, b, c) = (ip("198.51.100.1"), ip("198.51.100.2"), ip("198.51.100.3"));
+        make_waiting(&mut l, &r, a, T0);
+        make_waiting(&mut l, &r, b, T0 + 1);
+        make_waiting(&mut l, &r, c, T0 + 2);
+        assert_eq!(l.due(&r, at(T0 + 10)), vec![a, b, c]);
+        for x in [a, b] {
+            assert!(matches!(l.next_ban(&r, x), Turn::Ban(_)));
+            l.outcome(&r, x, at(T0 + 10), Outcome::Banned);
+        }
+        capture_log();
+        assert_eq!(l.next_ban(&r, c), Turn::RateLimited);
+        assert_eq!(
+            captured_log(),
+            vec!["WARNING ban rate limit reached (2 per hour), 1 address(es) are waiting"]
+        );
+        // a reported address counts as a ban too
+        let mut reported = Ledger::default();
+        make_waiting(&mut reported, &r, a, T0);
+        make_waiting(&mut reported, &r, b, T0);
+        reported.outcome(&r, a, at(T0), Outcome::Reported);
+        reported.outcome(&r, b, at(T0), Outcome::Reported);
+        make_waiting(&mut reported, &r, c, T0);
+        assert_eq!(reported.next_ban(&r, c), Turn::RateLimited);
+        // until an hour has passed since the first ban
+        assert_eq!(l.due(&r, at(T0 + 10 + 3599)), vec![c]);
+        assert_eq!(l.next_ban(&r, c), Turn::RateLimited);
+        assert_eq!(l.due(&r, at(T0 + 10 + 3600)), vec![c]);
+        assert_eq!(l.sizes().recent_bans, 0);
+        assert_eq!(l.next_ban(&r, c), Turn::Ban(pending(T0 + 2, 3)));
+    }
+
+    #[test]
+    fn the_rate_limit_survives_a_save_and_load() {
+        let r = rules(NO_IGNORE);
+        let mut l = Ledger::default();
+        let (a, b, c) = (ip("198.51.100.1"), ip("198.51.100.2"), ip("198.51.100.3"));
+        for x in [a, b] {
+            make_waiting(&mut l, &r, x, T0);
+            l.outcome(&r, x, at(T0 + 10), Outcome::Banned);
+        }
+        make_waiting(&mut l, &r, c, T0);
+        let text = lines(&l);
+        assert!(
+            text.ends_with(&format!("rate {}\nrate {}\n", T0 + 10, T0 + 10)),
+            "{}",
+            text
+        );
+        let mut loaded = read(&text);
+        assert_eq!(loaded, l);
+        assert_eq!(loaded.due(&r, at(T0 + 20)), vec![c]);
+        assert_eq!(loaded.next_ban(&r, c), Turn::RateLimited);
+    }
+
+    #[test]
+    fn a_timed_waiting_ban_expires_after_bantime() {
+        let r = Rules {
+            bantime: BanTime::Seconds(600),
+            ..rules(NO_IGNORE)
+        };
+        let mut l = Ledger::default();
+        let a = ip("198.51.100.7");
+        make_waiting(&mut l, &r, a, T0);
+        assert_eq!(l.due(&r, at(T0 + 600)), vec![a]);
+        capture_log();
+        assert!(l.due(&r, at(T0 + 601)).is_empty());
+        assert_eq!(
+            captured_log(),
+            vec![
+                "WARNING 198.51.100.7: the ban could not be applied within bantime (600 s) and \
+                 is dropped"
+            ]
+        );
+        assert_eq!(l.waiting(), 0);
+        // what was counted stays until the cleanup forgets it
+        assert_eq!(l.failed_logins(a), 3);
+    }
+
+    #[test]
+    fn a_permanent_waiting_ban_expires_after_a_day() {
+        let r = Rules {
+            bantime: BanTime::Permanent,
+            ..rules(NO_IGNORE)
+        };
+        let mut l = Ledger::default();
+        let a = ip("198.51.100.7");
+        make_waiting(&mut l, &r, a, T0);
+        assert_eq!(l.due(&r, at(T0 + 86400)), vec![a]);
+        capture_log();
+        assert!(l.due(&r, at(T0 + 86401)).is_empty());
+        assert_eq!(
+            captured_log(),
+            vec![
+                "WARNING 198.51.100.7: the ban could not be applied within 86400 s and is dropped"
+            ]
+        );
+        // a permanent ban is remembered for a day
+        let b = ip("198.51.100.8");
+        make_waiting(&mut l, &r, b, T0);
+        l.outcome(&r, b, at(T0), Outcome::Banned);
+        assert_eq!(l.banned_until(b), Some(at(T0 + 86400)));
+        assert_eq!(l.ban_began(&r, b), Some(at(T0)));
+    }
+
+    #[test]
+    fn exempt_addresses_are_never_counted() {
+        let ignore = [Net::parse("203.0.113.16/29").unwrap()];
+        let r = rules(&ignore);
+        let mut l = Ledger::default();
+        capture_log();
+        fail(&mut l, &r, ip("203.0.113.17"), T0);
+        assert_eq!(
+            captured_log(),
+            vec![
+                "INFO nvr1: failed login from 203.0.113.17 (user=\"admin\"): never banned \
+                 (ignoreip or reserved), not counted"
+            ]
+        );
+        let reserved = [
+            Ipv4Addr::LOCALHOST,
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+            Ipv4Addr::new(224, 0, 0, 1),
+            Ipv4Addr::new(169, 254, 0, 1),
+            Ipv4Addr::new(0, 1, 2, 3),
+            Ipv4Addr::new(240, 0, 0, 1),
+        ];
+        for x in reserved.into_iter().chain([ip("203.0.113.23")]) {
+            for k in 0..3 {
+                fail(&mut l, &r, x, T0 + k);
+            }
+            assert_eq!(l.failed_logins(x), 0, "{}", x);
+            assert!(!l.is_waiting(x), "{}", x);
+        }
+        assert_eq!(l.sizes(), Sizes::default());
+        // just outside ignoreip
+        make_waiting(&mut l, &r, ip("203.0.113.24"), T0);
+    }
+
+    #[test]
+    fn addresses_that_became_exempt_are_dropped() {
+        let text = format!(
+            "fail 198.51.100.7 {t}\n\
+             fail 203.0.113.17 {t}\nfail 203.0.113.17 {t}\nfail 203.0.113.17 {t}\n\
+             fail 203.0.113.18 {t}\n\
+             pending 203.0.113.17 {t} 3 nvr1 admin\npending 203.0.113.19 {t} 3 nvr1 admin\n",
+            t = T0
+        );
+        let ignore = [Net::parse("203.0.113.16/29").unwrap()];
+        let r = rules(&ignore);
+        let expected = vec![
+            "INFO 203.0.113.17: waiting ban dropped, 3 counted failed login(s) forgotten: the \
+             address is in ignoreip or a reserved range and is never banned",
+            "INFO 203.0.113.18: 1 counted failed login(s) forgotten: the address is in ignoreip \
+             or a reserved range and is never banned",
+            "INFO 203.0.113.19: waiting ban dropped: the address is in ignoreip or a reserved \
+             range and is never banned",
+        ];
+        // at the start
+        let mut l = read(&text);
+        assert_eq!(l.waiting(), 2);
+        capture_log();
+        l.fit(&r);
+        assert_eq!(captured_log(), expected);
+        assert_eq!(l.waiting(), 0);
+        assert_eq!(l.sizes().tracked, 1);
+        assert_eq!(l.failed_logins(ip("198.51.100.7")), 1);
+        // and before bans are attempted
+        let mut l = read(&text);
+        capture_log();
+        assert!(l.due(&r, at(T0 + 10)).is_empty());
+        assert_eq!(captured_log(), expected);
+        assert_eq!(l.sizes().tracked, 1);
+    }
+
+    #[test]
+    fn a_host_clock_that_went_back() {
+        let r = Rules {
+            max_bans_per_hour: 1,
+            ..rules(NO_IGNORE)
+        };
+        // a ban time in the future counts as now, for an hour
+        let mut l = read(&format!("rate {}\n", T0 + 5000));
+        let a = ip("198.51.100.7");
+        make_waiting(&mut l, &r, a, T0 - 10);
+        assert_eq!(l.due(&r, at(T0)), vec![a]);
+        assert_eq!(l.next_ban(&r, a), Turn::RateLimited);
+        assert!(lines(&l).ends_with(&format!("rate {}\n", T0)));
+        assert_eq!(l.due(&r, at(T0 + 3599)), vec![a]);
+        assert_eq!(l.next_ban(&r, a), Turn::RateLimited);
+        assert_eq!(l.due(&r, at(T0 + 3600)), vec![a]);
+        assert!(matches!(l.next_ban(&r, a), Turn::Ban(_)));
+        // a waiting ban from the future is not dropped as expired
+        let mut l = read(&format!(
+            "pending 198.51.100.8 {} 3 nvr1 admin\n",
+            T0 + 100_000
+        ));
+        assert_eq!(l.due(&r, at(T0)), vec![ip("198.51.100.8")]);
+        // a remembered ban that ends further away than bantime is forgotten
+        let mut l = read(&format!(
+            "ban 198.51.100.8 {}\nban 198.51.100.9 {}\n",
+            T0 + 86400,
+            T0 + 86401
+        ));
+        l.cleanup(&r, at(T0));
+        assert_eq!(l.banned_until(ip("198.51.100.8")), Some(at(T0 + 86400)));
+        assert_eq!(l.banned_until(ip("198.51.100.9")), None);
+        // so are failed logins too far in the future
+        let mut l = read(&format!(
+            "fail 198.51.100.10 {}\nfail 198.51.100.11 {}\n",
+            T0 + MAX_FUTURE,
+            T0 + MAX_FUTURE + 1
+        ));
+        l.cleanup(&r, at(T0));
+        assert_eq!(l.failed_logins(ip("198.51.100.10")), 1);
+        assert_eq!(l.failed_logins(ip("198.51.100.11")), 0);
+    }
+
+    /// Notify-only mode and dry runs (`report_once`): an address is
+    /// reported once while it is remembered.
+    #[test]
+    fn a_reported_address_is_not_counted_again_while_remembered() {
+        let r = rules(NO_IGNORE);
+        let mut l = Ledger::default();
+        let a = ip("198.51.100.7");
+        make_waiting(&mut l, &r, a, T0);
+        l.outcome(&r, a, at(T0), Outcome::Reported);
+        assert_eq!(l.banned_until(a), Some(at(T0 + 86400)));
+        assert_eq!(l.sizes().recent_bans, 1);
+        assert_eq!(l.failed_logins(a), 0);
+        capture_log();
+        l.failed_login(&r, a, T0 + 10, T0 + 10, "nvr1", "admin".to_string(), true);
+        assert_eq!(
+            captured_log(),
+            vec!["INFO nvr1: failed login from 198.51.100.7 (user=\"admin\"): already reported"]
+        );
+        assert_eq!(l.failed_logins(a), 0);
+        // with a firewall it would be counted
+        fail(&mut l, &r, a, T0 + 10);
+        assert_eq!(l.failed_logins(a), 1);
+        // and once the time it is remembered for is over, it is reported
+        // again
+        let at_end = T0 + 86400;
+        l.failed_login(&r, a, at_end, at_end, "nvr1", "admin".to_string(), true);
+        assert_eq!(l.failed_logins(a), 1);
+        l.failed_login(&r, a, at_end, at_end, "nvr1", "admin".to_string(), true);
+        l.failed_login(&r, a, at_end, at_end, "nvr1", "admin".to_string(), true);
+        assert!(l.is_waiting(a));
+    }
+
+    #[test]
+    fn the_cleanup_forgets_ended_bans_and_old_failed_logins() {
+        let r = rules(NO_IGNORE);
+        let mut l = read(&format!(
+            "fail 198.51.100.1 {}\nfail 198.51.100.2 {}\nfail 198.51.100.2 {}\n\
+             ban 198.51.100.3 {}\nban 198.51.100.4 {}\n",
+            T0 - 601,
+            T0 - 601,
+            T0 - 600,
+            T0,
+            T0 + 1
+        ));
+        l.cleanup(&r, at(T0));
+        assert_eq!(l.failed_logins(ip("198.51.100.1")), 0);
+        assert_eq!(l.failed_logins(ip("198.51.100.2")), 1);
+        assert_eq!(l.sizes().tracked, 1);
+        assert_eq!(l.banned_until(ip("198.51.100.3")), None);
+        assert_eq!(l.banned_until(ip("198.51.100.4")), Some(at(T0 + 1)));
+    }
+
+    /// Loading a state file and inserting give the same bounds: a ledger
+    /// read from a file and fit to the rules holds no more than one filled
+    /// by failed logins and bans.
+    #[test]
+    fn loading_and_inserting_enforce_the_same_caps() {
+        let r = Rules {
+            findtime: 1_000_000,
+            ..rules(NO_IGNORE)
+        };
+        let caps = Ledger::caps(r.maxretry, r.max_bans_per_hour);
+        assert_eq!(caps.most_fail_times, 16);
+        assert_eq!(caps.tracked, MAX_TRACKED);
+
+        // waiting bans: the line beyond the bound is ignored...
+        let text: String = (0..MAX_PENDING)
+            .map(|i| format!("pending {} {} 3 nvr1 admin\n", address(i), T0 + i as i64))
+            .collect();
+        let extra = format!(
+            "pending {} {} 3 nvr1 admin\n",
+            address(MAX_PENDING),
+            T0 + 5000
+        );
+        let l = read(&(text.clone() + &extra));
+        assert_eq!(l.waiting(), MAX_PENDING);
+        assert!(!l.is_waiting(address(MAX_PENDING)));
+        // ...and a new one drops the oldest
+        let mut l = read(&text);
+        capture_log();
+        make_waiting(&mut l, &r, address(MAX_PENDING), T0 + 5000);
+        assert_eq!(l.waiting(), MAX_PENDING);
+        assert!(!l.is_waiting(address(0)));
+        assert!(l.is_waiting(address(1)));
+        assert!(captured_log().contains(&format!(
+            "WARNING {} bans are already waiting; the oldest ({}) is dropped",
+            MAX_PENDING,
+            address(0)
+        )));
+
+        // remembered bans: the same
+        let text: String = (0..MAX_BANNED)
+            .map(|i| format!("ban {} {}\n", address(i), T0 + 1000 + i as i64))
+            .collect();
+        let extra = format!("ban {} {}\n", address(MAX_BANNED), T0 + 5000);
+        let l = read(&(text.clone() + &extra));
+        assert_eq!(l.sizes().remembered, MAX_BANNED);
+        assert_eq!(l.banned_until(address(MAX_BANNED)), None);
+        let mut l = read(&text);
+        let a = ip("198.51.100.7");
+        make_waiting(&mut l, &r, a, T0);
+        l.outcome(&r, a, at(T0), Outcome::Banned);
+        assert_eq!(l.sizes().remembered, MAX_BANNED);
+        assert!(l.banned_until(a).is_some());
+        // the one whose end is nearest is forgotten
+        assert_eq!(l.banned_until(address(0)), None);
+        assert!(l.banned_until(address(1)).is_some());
+        assert!(within(l.sizes(), caps));
+
+        // failure times of one address: what a file holds is cut down to
+        // what failed logins can fill
+        let text = format!("fail 198.51.100.7 {}\n", T0).repeat(5000);
+        let mut l = read(&text);
+        assert_eq!(l.failed_logins(a), MAX_TIMES);
+        l.fit(&r);
+        assert_eq!(l.failed_logins(a), caps.most_fail_times);
+        // and so does a failed login counted on top of them
+        let mut l = read(&text);
+        fail(&mut l, &r, a, T0 + 1);
+        assert_eq!(l.failed_logins(a), caps.most_fail_times);
+        assert!(l.is_waiting(a));
+
+        // tracked addresses: with maxretry 100 only 500 are kept
+        let r = Rules { maxretry: 100, ..r };
+        let caps = Ledger::caps(r.maxretry, r.max_bans_per_hour);
+        assert_eq!((caps.tracked, caps.most_fail_times), (500, 400));
+        let text: String = (0..=MAX_TRACKED)
+            .map(|i| format!("fail {} {}\n", address(i), T0 + i as i64))
+            .collect();
+        let mut l = read(&text);
+        assert_eq!(l.sizes().tracked, MAX_TRACKED);
+        l.fit(&r);
+        assert_eq!(l.sizes().tracked, caps.tracked);
+        // the newest stay
+        assert_eq!(l.failed_logins(address(MAX_TRACKED - 1)), 1);
+        assert_eq!(l.failed_logins(address(MAX_TRACKED - 500)), 1);
+        assert_eq!(l.failed_logins(address(MAX_TRACKED - 501)), 0);
+        assert!(within(l.sizes(), caps));
+        // a new address makes the one with the oldest failed login go
+        let b = ip("198.51.100.8");
+        fail(&mut l, &r, b, T0 + 20_000);
+        assert_eq!(l.sizes().tracked, caps.tracked);
+        assert_eq!(l.failed_logins(b), 1);
+        assert_eq!(l.failed_logins(address(MAX_TRACKED - 500)), 0);
+        assert!(within(l.sizes(), caps));
+    }
+
+    #[test]
+    fn the_ledger_lines_are_written_and_read_back() {
+        let r = rules(NO_IGNORE);
+        let mut l = Ledger::default();
+        let (a, b, c) = (ip("198.51.100.1"), ip("198.51.100.2"), ip("198.51.100.3"));
+        make_waiting(&mut l, &r, a, T0);
+        l.outcome(&r, a, at(T0 + 5), Outcome::Banned);
+        make_waiting(&mut l, &r, b, T0 + 1);
+        l.failed_login(
+            &r,
+            c,
+            T0 + 2,
+            T0 + 2,
+            "nvr2",
+            "no such user".to_string(),
+            false,
+        );
+        let text = lines(&l);
+        assert_eq!(
+            text,
+            format!(
+                "fail 198.51.100.2 {}\nfail 198.51.100.2 {}\nfail 198.51.100.2 {}\n\
+                 fail 198.51.100.3 {}\n\
+                 ban 198.51.100.1 {}\n\
+                 pending 198.51.100.2 {} 3 nvr1 admin\n\
+                 rate {}\n",
+                T0 - 1,
+                T0,
+                T0 + 1,
+                T0 + 2,
+                T0 + 5 + 86400,
+                T0 + 1,
+                T0 + 5
+            )
+        );
+        let loaded = read(&text);
+        assert_eq!(loaded, l);
+        assert_eq!(lines(&loaded), text);
     }
 }

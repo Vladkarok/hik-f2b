@@ -132,7 +132,7 @@ mod fake;
 
 use fake::{Entry, Fake, Harness, Opts, SKEW};
 use hik_f2b::engine::CLOCK_JUMP;
-use hik_f2b::ledger::{fail_limits, MAX_BANNED, MAX_FAIL_TIMES, MAX_PENDING};
+use hik_f2b::ledger::Ledger;
 use hik_f2b::state::{State, MAX_SEEN};
 use hik_f2b::util;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -1209,7 +1209,7 @@ impl Sim {
             self.cycle()?;
         }
         let mut rounds = 0;
-        while !self.h.engine.state.ledger.pending.is_empty() && rounds < 48 {
+        while self.h.engine.state.ledger.waiting() > 0 && rounds < 48 {
             self.host += 600;
             self.cycle()?;
             rounds += 1;
@@ -1267,7 +1267,7 @@ impl Sim {
             instance: self.instance,
             nvr_ok,
             router: self.router,
-            pending_after: !self.h.engine.state.ledger.pending.is_empty(),
+            pending_after: self.h.engine.state.ledger.waiting() > 0,
             transport: false,
             refused: false,
             ban_pass: false,
@@ -1630,18 +1630,14 @@ impl Sim {
         if State::parse(&state.serialize()) != *state {
             return Err("[state] the state does not load back from its file format".to_string());
         }
-        let (per_address, addresses) = fail_limits(self.p.maxretry);
-        let times: usize = state.ledger.fails.values().map(Vec::len).sum();
+        let held = state.ledger.sizes();
+        let cap = Ledger::caps(self.p.maxretry, self.p.max_per_hour);
         let caps = [
-            ("tracked addresses", state.ledger.fails.len(), addresses),
-            ("failure times", times, MAX_FAIL_TIMES),
-            ("remembered bans", state.ledger.banned.len(), MAX_BANNED),
-            ("waiting bans", state.ledger.pending.len(), MAX_PENDING),
-            (
-                "recent bans",
-                state.ledger.recent_bans.len(),
-                self.p.max_per_hour,
-            ),
+            ("tracked addresses", held.tracked, cap.tracked),
+            ("failure times", held.fail_times, cap.fail_times),
+            ("remembered bans", held.remembered, cap.remembered),
+            ("waiting bans", held.waiting, cap.waiting),
+            ("recent bans", held.recent_bans, cap.recent_bans),
             (
                 "queued notifications",
                 self.h.engine.queued_notifications(),
@@ -1653,10 +1649,11 @@ impl Sim {
                 return Err(format!("[caps] {} {} > {}", n, what, cap));
             }
         }
-        for (ip, times) in &state.ledger.fails {
-            if times.len() > per_address {
-                return Err(format!("[caps] {} failure times for {}", times.len(), ip));
-            }
+        if held.most_fail_times > cap.most_fail_times {
+            return Err(format!(
+                "[caps] {} failure times for one address",
+                held.most_fail_times
+            ));
         }
         for (name, st) in &state.nvr {
             if st.seen.len() > MAX_SEEN {

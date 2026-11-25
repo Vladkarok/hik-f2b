@@ -24,6 +24,14 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   class and the replay command. The steps are in
   `.github/scripts/sim-long.sh`, which can also be run locally.
 
+### Changed
+
+- The rules that decide whether and when an address is banned (counting
+  failed logins, waiting bans, the hourly rate limit, what is remembered
+  about banned addresses) moved into their own module, `src/ledger.rs`,
+  with unit tests of their own. hik-f2b behaves as before: the hik-f2b log,
+  the notifications, the config and the state file are unchanged.
+
 ### Fixed
 
 - The tests' fake servers kept running after a test ended, each with its

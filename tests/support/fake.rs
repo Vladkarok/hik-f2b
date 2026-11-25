@@ -1200,13 +1200,7 @@ impl Harness {
     }
 
     pub fn fails(&self, address: &str) -> usize {
-        self.engine
-            .state
-            .ledger
-            .fails
-            .get(&ip(address))
-            .map(|t| t.len())
-            .unwrap_or(0)
+        self.engine.state.ledger.failed_logins(ip(address))
     }
 
     pub fn since(&self, nvr: &str) -> String {

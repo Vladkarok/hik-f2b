@@ -54,7 +54,7 @@ fn failed_logins_just_before_the_start_are_not_counted() {
     run(&mut h, 4, 30);
     assert_eq!(h.fails(ATTACKER), 1);
     assert!(h.banned().is_empty());
-    assert!(h.engine.state.ledger.pending.is_empty());
+    assert_eq!(h.engine.state.ledger.waiting(), 0);
     // five after the start are a ban
     h.burst("10:03", "198.51.100.8", 5);
     h.cycle("10:04:00");
@@ -92,7 +92,7 @@ fn ban_on_fifth_failure() {
     h.cycle("10:05:00");
     h.cycle("10:05:30"); // the overlapping window must not be counted twice
     assert!(h.banned().is_empty());
-    assert_eq!(h.engine.state.ledger.fails[&attacker()].len(), 4);
+    assert_eq!(h.engine.state.ledger.failed_logins(attacker()), 4);
 
     h.add("10:06:00", ATTACKER);
     h.cycle("10:06:30");
@@ -106,8 +106,8 @@ fn ban_on_fifth_failure() {
         "{}",
         body
     );
-    assert!(h.engine.state.ledger.fails.is_empty());
-    assert!(h.engine.state.ledger.pending.is_empty());
+    assert_eq!(h.engine.state.ledger.sizes().tracked, 0);
+    assert_eq!(h.engine.state.ledger.waiting(), 0);
 }
 
 #[test]
@@ -144,7 +144,7 @@ fn ignored_addresses_and_unrelated_entries() {
     }
     h.cycle("10:02:00");
     assert!(h.banned().is_empty());
-    assert!(h.engine.state.ledger.fails.is_empty());
+    assert_eq!(h.engine.state.ledger.sizes().tracked, 0);
 }
 
 #[test]
@@ -169,11 +169,11 @@ fn ban_is_retried_when_router_is_down() {
     h.burst("10:01", ATTACKER, 5);
     h.cycle("10:02:00");
     assert!(h.banned().is_empty());
-    assert_eq!(h.engine.state.ledger.pending.len(), 1);
+    assert_eq!(h.engine.state.ledger.waiting(), 1);
     h.fake.lock().unwrap().router_down = false;
     h.cycle("10:02:30");
     assert_eq!(h.banned(), vec![ATTACKER]);
-    assert!(h.engine.state.ledger.pending.is_empty());
+    assert_eq!(h.engine.state.ledger.waiting(), 0);
 }
 
 /// A waiting ban is checked against `ignoreip` again before it is applied:
@@ -188,8 +188,8 @@ fn waiting_ban_of_an_address_now_in_ignoreip_is_dropped() {
     h.burst("10:01", ATTACKER, 5);
     h.add("10:01:30", NEIGHBOUR);
     h.cycle("10:02:00");
-    assert!(h.engine.state.ledger.pending.contains_key(&ip(OWNER)));
-    assert!(h.engine.state.ledger.pending.contains_key(&attacker()));
+    assert!(h.engine.state.ledger.is_waiting(ip(OWNER)));
+    assert!(h.engine.state.ledger.is_waiting(attacker()));
     assert_eq!(h.fails(NEIGHBOUR), 1);
 
     // OWNER and NEIGHBOUR are in 203.0.113.16/29
@@ -218,14 +218,14 @@ fn waiting_ban_of_an_address_now_in_ignoreip_is_dropped() {
         "{:?}",
         log
     );
-    assert!(!h.engine.state.ledger.pending.contains_key(&ip(OWNER)));
+    assert!(!h.engine.state.ledger.is_waiting(ip(OWNER)));
     assert_eq!(h.fails(OWNER), 0);
     assert_eq!(h.fails(NEIGHBOUR), 0);
 
     h.fake.lock().unwrap().router_unreachable = false;
     h.advance(30);
     assert_eq!(h.banned(), vec![ATTACKER], "no ban request for the owner");
-    assert!(h.engine.state.ledger.pending.is_empty());
+    assert_eq!(h.engine.state.ledger.waiting(), 0);
     assert!(h.fake.lock().unwrap().lookups.is_empty());
     let path = h.dir.join("state");
     h.engine.state.save(&path).unwrap();
@@ -287,7 +287,7 @@ fn dry_run_does_not_touch_the_router() {
     h.burst("10:01", ATTACKER, 5);
     h.cycle("10:02:00");
     assert!(h.banned().is_empty());
-    assert!(h.engine.state.ledger.banned.contains_key(&attacker()));
+    assert!(h.engine.state.ledger.banned_until(attacker()).is_some());
     let sent = h.fake.lock().unwrap().tg_sent.clone();
     assert_eq!(sent.len(), 1);
     let text = text_of(&sent[0]);
@@ -358,7 +358,7 @@ fn ban_rate_limit_holds_back_a_flood() {
     }
     h.cycle("10:02:00");
     assert_eq!(h.banned().len(), 2);
-    assert_eq!(h.engine.state.ledger.pending.len(), 1);
+    assert_eq!(h.engine.state.ledger.waiting(), 1);
 }
 
 #[test]
@@ -506,7 +506,7 @@ fn state_survives_a_restart() {
     h.engine.state.save(&path).unwrap();
     let restored = State::load(&path).unwrap();
     assert_eq!(restored, h.engine.state);
-    assert_eq!(restored.ledger.fails[&attacker()].len(), 4);
+    assert_eq!(restored.ledger.failed_logins(attacker()), 4);
 }
 
 // ---------------------------------------------------------- device clocks
@@ -580,7 +580,7 @@ fn dst_end_on_a_quiet_nvr_after_an_outage_is_a_resync() {
     );
     // the old entries are recorded as seen, not counted an hour late
     assert_eq!(h.fails(ATTACKER), 0);
-    assert!(h.engine.state.ledger.pending.is_empty());
+    assert_eq!(h.engine.state.ledger.waiting(), 0);
     assert!(h.banned().is_empty());
     assert_eq!(h.engine.state.nvr["nvr1"].offset, Some(SKEW - 3600));
     // after the step, failed logins count as usual
@@ -915,8 +915,8 @@ fn address_typed_as_user_name_is_not_used() {
     h.cycle("10:02:00");
     h.cycle("10:02:30");
     assert!(h.banned().is_empty());
-    assert!(h.engine.state.ledger.fails.is_empty());
-    assert!(h.engine.state.ledger.pending.is_empty());
+    assert_eq!(h.engine.state.ledger.sizes().tracked, 0);
+    assert_eq!(h.engine.state.ledger.waiting(), 0);
 }
 
 /// Firmware that copies the login name into its log without escaping `<`:
@@ -939,7 +939,7 @@ fn markup_injected_as_user_name_cannot_target_a_victim() {
     h.cycle("10:02:30");
     assert!(h.banned().is_empty());
     assert!(
-        h.engine.state.ledger.fails.is_empty(),
+        h.engine.state.ledger.sizes().tracked == 0,
         "ambiguous entries are not counted"
     );
 
@@ -960,7 +960,7 @@ fn markup_injected_as_user_name_cannot_target_a_victim() {
     h.cycle("10:04:30");
     assert_eq!(h.fails(VICTIM), 0);
     assert!(!h.banned().contains(&VICTIM.to_string()));
-    assert!(h.engine.state.ledger.pending.is_empty());
+    assert_eq!(h.engine.state.ledger.waiting(), 0);
 }
 
 /// C7: IPv4-mapped IPv6 in the address field.
@@ -1013,7 +1013,7 @@ fn ignored_position_newest_first_reads_the_older_part() {
     // the next polls count nothing twice
     run(&mut h, 3, 30);
     assert_eq!(h.banned(), vec![ATTACKER]);
-    assert!(h.engine.state.ledger.fails.is_empty());
+    assert_eq!(h.engine.state.ledger.sizes().tracked, 0);
 }
 
 /// A paging status with a namespace prefix is read; a page without one is
@@ -1252,7 +1252,7 @@ fn pending_bans_oldest_first() {
     h.burst("10:01", "198.51.100.3", 5);
     h.cycle("10:04:00");
     assert_eq!(h.banned(), vec!["198.51.100.3"]);
-    assert_eq!(h.engine.state.ledger.pending.len(), 2);
+    assert_eq!(h.engine.state.ledger.waiting(), 2);
 }
 
 /// A stop signal arrives while the first of three bans is sent: the cycle
@@ -1273,8 +1273,8 @@ fn a_stop_ends_the_cycle_after_its_current_step() {
     assert_eq!(f.rule_queries.len(), 1, "only the first cycle's check");
     assert_eq!(f.tg_attempts, 0);
     drop(f);
-    assert_eq!(h.engine.state.ledger.pending.len(), 2);
-    assert_eq!(h.engine.state.ledger.banned.len(), 1);
+    assert_eq!(h.engine.state.ledger.waiting(), 2);
+    assert_eq!(h.engine.state.ledger.sizes().remembered, 1);
     assert_eq!(h.engine.queued_notifications(), 1);
     let log = util::captured_log();
     assert_eq!(
@@ -1287,28 +1287,27 @@ fn a_stop_ends_the_cycle_after_its_current_step() {
     let before = h.fake.lock().unwrap().search_requests;
     h.advance(30);
     assert_eq!(h.fake.lock().unwrap().search_requests, before);
-    assert_eq!(h.engine.state.ledger.pending.len(), 2);
+    assert_eq!(h.engine.state.ledger.waiting(), 2);
 }
 
 /// `Engine::run` saves the state of a cycle that a stop cut short, and does
 /// not start another.
 #[test]
 fn a_stop_during_the_service_saves_the_state() {
-    use hik_f2b::ledger::Pending;
     let mut h = Harness::new(false);
     let path = h.dir.join("service-state");
     let now = util::unix_now() as i64;
+    // three waiting bans, as a state file holds them
+    let mut text = h.engine.state.serialize();
     for n in 1..=3 {
-        h.engine.state.ledger.pending.insert(
-            ip(&format!("198.51.100.{}", n)),
-            Pending {
-                ts: now - 10 + n,
-                count: 5,
-                nvr: "nvr1".to_string(),
-                user: "admin".to_string(),
-            },
-        );
+        text.push_str(&format!(
+            "pending 198.51.100.{} {} 5 nvr1 admin\n",
+            n,
+            now - 10 + n
+        ));
     }
+    h.engine.state = State::parse(&text);
+    assert_eq!(h.engine.state.serialize(), text);
     let stop = h.engine.stop_flag();
     h.fake.lock().unwrap().stop_on_put = Some(stop.clone());
     let started = std::time::Instant::now();
@@ -1319,9 +1318,9 @@ fn a_stop_during_the_service_saves_the_state() {
     );
     let saved = State::load(&path).unwrap();
     assert_eq!(saved, h.engine.state);
-    assert_eq!(saved.ledger.pending.len(), 2);
-    assert_eq!(saved.ledger.banned.len(), 1);
-    assert_eq!(saved.ledger.recent_bans.len(), 1);
+    assert_eq!(saved.ledger.waiting(), 2);
+    assert_eq!(saved.ledger.sizes().remembered, 1);
+    assert_eq!(saved.ledger.sizes().recent_bans, 1);
     assert_eq!(h.fake.lock().unwrap().put_log.len(), 1);
     // stopped before it starts: no cycle at all
     let requests = h.fake.lock().unwrap().isapi_requests;
@@ -1385,17 +1384,21 @@ fn remembered_bans_are_bounded() {
     let mut h = Harness::new(false);
     let now = h.host as u64;
     let address = |i: usize| std::net::Ipv4Addr::from(0x0B00_0000u32 + i as u32);
+    // as many remembered bans as a state file may hold
+    let mut text = h.engine.state.serialize();
     for i in 0..MAX_BANNED {
         // address(0) has the nearest end
         let until = if i == 0 { now + 1000 } else { now + 2000 };
-        h.engine.state.ledger.banned.insert(address(i), until);
+        text.push_str(&format!("ban {} {}\n", address(i), until));
     }
+    h.engine.state = State::parse(&text);
+    assert_eq!(h.engine.state.serialize(), text);
     h.burst("10:01", ATTACKER, 5);
     h.cycle("10:02:00");
     assert_eq!(h.banned(), vec![ATTACKER]);
-    assert_eq!(h.engine.state.ledger.banned.len(), MAX_BANNED);
-    assert!(h.engine.state.ledger.banned.contains_key(&attacker()));
-    assert!(!h.engine.state.ledger.banned.contains_key(&address(0)));
+    assert_eq!(h.engine.state.ledger.sizes().remembered, MAX_BANNED);
+    assert!(h.engine.state.ledger.banned_until(attacker()).is_some());
+    assert!(h.engine.state.ledger.banned_until(address(0)).is_none());
 }
 
 /// The failure times of all addresses together are bounded: with a large
@@ -1415,34 +1418,38 @@ fn failure_times_are_bounded_in_total() {
     });
     let address = |i: usize| std::net::Ipv4Addr::from(0x0B00_0000u32 + i as u32);
     let now = h.host;
+    // as a state file holds them
+    let mut text = h.engine.state.serialize();
     for i in 0..500 {
-        h.engine
-            .state
-            .ledger
-            .fails
-            .insert(address(i), vec![now - 600 + i as i64]);
+        text.push_str(&format!("fail {} {}\n", address(i), now - 600 + i as i64));
     }
+    h.engine.state = State::parse(&text);
+    assert_eq!(h.engine.state.serialize(), text);
     h.add("10:00:40", ATTACKER);
     h.cycle("10:01:00");
-    assert_eq!(h.engine.state.ledger.fails.len(), 500);
+    assert_eq!(h.engine.state.ledger.sizes().tracked, 500);
     assert_eq!(h.fails(ATTACKER), 1);
-    assert!(
-        !h.engine.state.ledger.fails.contains_key(&address(0)),
+    assert_eq!(
+        h.engine.state.ledger.failed_logins(address(0)),
+        0,
         "the oldest goes"
     );
     // more than this config allows, from the state file
+    let mut text = h.engine.state.serialize();
     for i in 0..700 {
-        h.engine
-            .state
-            .ledger
-            .fails
-            .insert(address(i), vec![now - 60; 450]);
+        for _ in 0..450 {
+            text.push_str(&format!("fail {} {}\n", address(i), now - 60));
+        }
+    }
+    h.engine.state = State::parse(&text);
+    for i in 0..700 {
+        assert!(h.engine.state.ledger.failed_logins(address(i)) >= 450);
     }
     h.restart();
-    let total: usize = h.engine.state.ledger.fails.values().map(Vec::len).sum();
-    assert_eq!(h.engine.state.ledger.fails.len(), 500);
-    assert!(h.engine.state.ledger.fails.values().all(|t| t.len() <= 400));
-    assert!(total <= MAX_FAIL_TIMES);
+    let sizes = h.engine.state.ledger.sizes();
+    assert_eq!(sizes.tracked, 500);
+    assert!(sizes.most_fail_times <= 400);
+    assert!(sizes.fail_times <= MAX_FAIL_TIMES);
 }
 
 /// C11b: the rate limit survives a restart.
@@ -1463,7 +1470,7 @@ fn rate_limit_survives_a_restart() {
         vec!["198.51.100.1"],
         "fresh allowance after restart"
     );
-    assert_eq!(h.engine.state.ledger.pending.len(), 1);
+    assert_eq!(h.engine.state.ledger.waiting(), 1);
     // an hour later the next one goes through
     h.cycle("11:03:30");
     assert_eq!(h.banned(), vec!["198.51.100.1", "198.51.100.2"]);
@@ -1481,7 +1488,7 @@ fn already_listed_uses_no_allowance() {
     h.burst("10:02", "198.51.100.5", 5);
     h.cycle("10:03:00");
     assert_eq!(h.banned(), vec!["198.51.100.4", "198.51.100.5"]);
-    assert!(h.engine.state.ledger.pending.is_empty());
+    assert_eq!(h.engine.state.ledger.waiting(), 0);
 }
 
 /// Bans that cannot be applied are not kept for ever.
@@ -1491,10 +1498,10 @@ fn pending_ban_expires_after_bantime() {
     h.fake.lock().unwrap().router_down = true;
     h.burst("10:01", ATTACKER, 5);
     h.cycle("10:02:00");
-    assert_eq!(h.engine.state.ledger.pending.len(), 1);
+    assert_eq!(h.engine.state.ledger.waiting(), 1);
     h.set_host(h.host + 86400 + 60);
     h.tick();
-    assert!(h.engine.state.ledger.pending.is_empty());
+    assert_eq!(h.engine.state.ledger.waiting(), 0);
 }
 
 /// A8: a router that cannot be reached costs one attempt per cycle, not
@@ -1522,8 +1529,8 @@ fn unreachable_router_is_tried_once_per_cycle() {
         h.burst("10:01", &format!("198.51.100.{}", n), 5);
     }
     h.cycle("10:02:00");
-    assert_eq!(h.engine.state.ledger.pending.len(), 3);
-    assert!(h.engine.state.ledger.recent_bans.is_empty());
+    assert_eq!(h.engine.state.ledger.waiting(), 3);
+    assert_eq!(h.engine.state.ledger.sizes().recent_bans, 0);
     assert_eq!(connections.load(Ordering::SeqCst), 1);
     h.advance(30);
     assert_eq!(connections.load(Ordering::SeqCst), 2);
@@ -1713,7 +1720,7 @@ fn notify_only_mode() {
         "{}",
         text
     );
-    assert!(h.engine.state.ledger.banned.contains_key(&attacker()));
+    assert!(h.engine.state.ledger.banned_until(attacker()).is_some());
     // the same address is not reported again on its next burst
     h.burst("10:20", ATTACKER, 5);
     h.cycle("10:21:00");
@@ -1740,7 +1747,7 @@ fn log_only_mode() {
     });
     h.burst("10:01", ATTACKER, 5);
     h.cycle("10:02:00");
-    assert!(h.engine.state.ledger.banned.contains_key(&attacker()));
+    assert!(h.engine.state.ledger.banned_until(attacker()).is_some());
     assert_eq!(h.engine.queued_notifications(), 0);
     assert_eq!(h.fake.lock().unwrap().router_requests, 0);
 }
@@ -1805,7 +1812,7 @@ fn permanent_ban_has_no_timeout() {
         vec!["198.51.100.7 banned permanently|permanent"]
     );
     // the engine itself remembers the ban for 24 hours
-    let until = h.engine.state.ledger.banned[&attacker()];
+    let until = h.engine.state.ledger.banned_until(attacker()).unwrap();
     assert_eq!(until, host_of("10:02:00") as u64 + 86400);
 }
 
@@ -1901,13 +1908,13 @@ fn permanent_pending_ban_expires_after_a_day() {
     h.fake.lock().unwrap().router_down = true;
     h.burst("10:01", ATTACKER, 5);
     h.cycle("10:02:00");
-    assert_eq!(h.engine.state.ledger.pending.len(), 1);
+    assert_eq!(h.engine.state.ledger.waiting(), 1);
     h.set_host(h.host + 23 * 3600);
     h.tick();
-    assert_eq!(h.engine.state.ledger.pending.len(), 1);
+    assert_eq!(h.engine.state.ledger.waiting(), 1);
     h.set_host(h.host + 3600 + 60);
     h.tick();
-    assert!(h.engine.state.ledger.pending.is_empty());
+    assert_eq!(h.engine.state.ledger.waiting(), 0);
     assert!(h.banned().is_empty());
 }
 
@@ -1986,7 +1993,7 @@ fn router_outage_is_alerted_and_bans_still_reported() {
     h.fake.lock().unwrap().router_unreachable = true;
     h.burst("10:01", ATTACKER, 5);
     h.cycle("10:02:00"); // the ban fails: the outage starts now
-    assert_eq!(h.engine.state.ledger.pending.len(), 1);
+    assert_eq!(h.engine.state.ledger.waiting(), 1);
     run(&mut h, 19, 30);
     assert!(telegram_texts(&h).is_empty());
     h.advance(30); // 10:12:00
@@ -2245,7 +2252,7 @@ fn router_errors_are_classified_and_bound_the_requests() {
         assert_eq!(f.rest_requests - before, 1, "HTTP {}", status);
         assert!(f.lookups.is_empty(), "HTTP {}", status);
         drop(f);
-        assert_eq!(h.engine.state.ledger.pending.len(), 5);
+        assert_eq!(h.engine.state.ledger.waiting(), 5);
         // a cycle with the periodic check: at most one more request per table
         let before = h.fake.lock().unwrap().rest_requests;
         h.cycle("10:05:00");
@@ -2298,7 +2305,7 @@ fn a_refused_ban_costs_two_requests_per_address() {
     assert_eq!(f.rest_requests - before, 6);
     assert_eq!(f.lookups.len(), 3);
     drop(f);
-    assert_eq!(h.engine.state.ledger.pending.len(), 3);
+    assert_eq!(h.engine.state.ledger.waiting(), 3);
     assert_eq!(h.engine.alerted_problems(), Vec::<String>::new());
 }
 
@@ -2405,7 +2412,7 @@ fn refused_bans_are_alerted_until_a_ban_is_accepted() {
     h.fake.lock().unwrap().refuse_writes = true;
     h.burst("10:01", ATTACKER, 5);
     h.cycle("10:02:00"); // refused: the problem starts now
-    assert_eq!(h.engine.state.ledger.pending.len(), 1);
+    assert_eq!(h.engine.state.ledger.waiting(), 1);
     run(&mut h, 19, 30); // read checks at 10:05 and 10:10 pass
     assert!(telegram_texts(&h).is_empty());
     h.advance(30); // 10:12:00
@@ -2474,7 +2481,7 @@ fn refused_bans_that_expire_end_the_alert_without_a_recovery() {
     // the ban waits for bantime (24 hours), then is dropped
     h.set_host(host_of("10:02:00") + 86400 + 60);
     h.tick();
-    assert!(h.engine.state.ledger.pending.is_empty());
+    assert_eq!(h.engine.state.ledger.waiting(), 0);
     let texts = telegram_texts(&h);
     assert_eq!(texts.len(), 2, "{:?}", texts);
     assert_eq!(
@@ -2527,7 +2534,7 @@ fn already_listed_is_recognised_whatever_the_wording() {
     h.burst("10:02", "198.51.100.5", 5);
     h.cycle("10:03:00");
     assert_eq!(h.banned(), vec!["198.51.100.4", "198.51.100.5"]);
-    assert!(h.engine.state.ledger.pending.is_empty());
+    assert_eq!(h.engine.state.ledger.waiting(), 0);
     assert_eq!(
         h.fake.lock().unwrap().lookups,
         vec!["list=cctv_ban&address=198.51.100.4&.proplist=.id"]
@@ -2541,7 +2548,7 @@ fn refused_ban_of_an_unlisted_address_is_retried() {
     h.burst("10:01", ATTACKER, 5);
     h.cycle("10:02:00");
     assert!(h.banned().is_empty());
-    assert_eq!(h.engine.state.ledger.pending.len(), 1);
+    assert_eq!(h.engine.state.ledger.waiting(), 1);
     assert_eq!(h.fake.lock().unwrap().lookups.len(), 1);
     h.fake.lock().unwrap().refuse_writes = false;
     h.advance(30);
@@ -2557,7 +2564,7 @@ fn server_error_is_retried_without_a_lookup() {
     h.burst("10:01", ATTACKER, 5);
     h.cycle("10:02:00");
     assert!(h.banned().is_empty());
-    assert_eq!(h.engine.state.ledger.pending.len(), 1);
+    assert_eq!(h.engine.state.ledger.waiting(), 1);
     assert!(h.fake.lock().unwrap().lookups.is_empty());
 }
 
@@ -2590,7 +2597,7 @@ fn bypass_run(gap: i64, attacks: i64) -> (Harness, Vec<String>, usize) {
         }
         h.advance(30);
     }
-    assert!(h.engine.state.ledger.pending.is_empty());
+    assert_eq!(h.engine.state.ledger.waiting(), 0);
     let warnings = logged(&util::captured_log(), "but still reached the NVR");
     let texts = telegram_texts(&h);
     (h, texts, warnings)
@@ -2668,22 +2675,40 @@ fn already_listed_keeps_the_time_of_the_ban() {
     let mut h = Harness::new(false);
     h.burst("10:01", ATTACKER, 5);
     h.cycle("10:02:00");
-    let until = h.engine.state.ledger.banned[&attacker()];
+    let until = h.engine.state.ledger.banned_until(attacker()).unwrap();
     h.burst("10:05", ATTACKER, 5);
     h.cycle("10:06:00");
-    assert_eq!(h.engine.state.ledger.banned[&attacker()], until);
+    assert_eq!(
+        h.engine.state.ledger.banned_until(attacker()).unwrap(),
+        until
+    );
     h.restart();
     h.burst("10:08", ATTACKER, 5);
     h.cycle("10:09:00");
-    assert_eq!(h.engine.state.ledger.banned[&attacker()], until);
+    assert_eq!(
+        h.engine.state.ledger.banned_until(attacker()).unwrap(),
+        until
+    );
     // an address listed by hand counts from the first time it is seen
     h.fake.lock().unwrap().bans.push("198.51.100.8".to_string());
     h.burst("10:10", "198.51.100.8", 5);
     h.cycle("10:11:00");
-    let first = h.engine.state.ledger.banned[&ip("198.51.100.8")];
+    let first = h
+        .engine
+        .state
+        .ledger
+        .banned_until(ip("198.51.100.8"))
+        .unwrap();
     h.burst("10:12", "198.51.100.8", 5);
     h.cycle("10:13:00");
-    assert_eq!(h.engine.state.ledger.banned[&ip("198.51.100.8")], first);
+    assert_eq!(
+        h.engine
+            .state
+            .ledger
+            .banned_until(ip("198.51.100.8"))
+            .unwrap(),
+        first
+    );
 }
 
 #[test]
@@ -2692,7 +2717,7 @@ fn todays_wording_needs_no_lookup() {
     h.fake.lock().unwrap().bans.push(ATTACKER.to_string());
     h.burst("10:01", ATTACKER, 5);
     h.cycle("10:02:00");
-    assert!(h.engine.state.ledger.pending.is_empty());
+    assert_eq!(h.engine.state.ledger.waiting(), 0);
     assert!(h.fake.lock().unwrap().lookups.is_empty());
 }
 
@@ -3065,7 +3090,7 @@ fn missing_country_db_never_holds_up_a_ban() {
     h.cycle("10:02:00");
     h.cycle("10:02:30");
     h.cycle("10:03:00");
-    assert_eq!(h.engine.state.ledger.pending.len(), 1);
+    assert_eq!(h.engine.state.ledger.waiting(), 1);
     h.fake.lock().unwrap().router_down = false;
     h.cycle("10:03:30");
     assert_eq!(h.banned(), vec![ATTACKER]);

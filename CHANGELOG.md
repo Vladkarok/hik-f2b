@@ -8,6 +8,32 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 
 ## [Unreleased]
 
+### Added
+
+- hik-f2b never bans its own addresses: the addresses of the router and of
+  each NVR (from the URLs in the config, a host name resolved) and the
+  address this host uses to reach each of them. It finds them at startup
+  and again in every poll. A failed login from one is not counted, and the
+  log line says that it came from an own address of hik-f2b, which is what
+  the NVR logs when hik-f2b's own NVR password is wrong. Before, those
+  failed logins could get the host banned once the password was right
+  again, or a forged log entry with the host's address could. A waiting ban
+  of an address that becomes an own address is dropped, as for `ignoreip`.
+  The start of the service logs the own addresses, `--check` prints them as
+  a line of its own, and a change is one INFO line. With NAT between the
+  host and a device, put the address the device sees into `ignoreip`.
+- With every firewall check (at startup and every 5 minutes) hik-f2b asks
+  the router whether an own address is in `address_list`, one request per
+  own address outside loopback and the other ranges that are never banned.
+  If one is, it removes the entry, logs a WARNING and sends a notification
+  at once. This is the only case in which hik-f2b removes a ban. In a dry
+  run it reports the entry once and removes nothing. A removal that fails is
+  the new health alert `own-address-listed`, until no own address is listed.
+- Both are always on, with no setting: a config that worked with 0.4.1
+  works as before, except that own addresses are never banned and are
+  removed from the address-list. Neither has been tried on real devices
+  yet; see "Not yet tried" in the README.
+
 ## [0.4.1] - 2026-11-25
 
 ### Added

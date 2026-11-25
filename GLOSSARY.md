@@ -15,6 +15,7 @@ documentation uses the same word.
 | router | роутер | The MikroTik router that bans addresses. | Роутер MikroTik, на якому діють бани. | маршрутизатор |
 | host | хост | The Linux machine that runs hik-f2b. | Linux-машина, на якій працює hik-f2b. | server, machine; сервер |
 | address | адреса | The source IPv4 address of a failed login. | IPv4-адреса джерела невдалого входу. | IP (in prose); IP, айпі (у тексті) |
+| own address | власна адреса | An IPv4 address of the router or an NVR of the config, or the host's address toward one of them. hik-f2b finds them at run time and never bans them. | IPv4-адреса роутера чи реєстратора з конфігу або адреса хоста в бік одного з них. hik-f2b знаходить їх під час роботи й ніколи не банить. | self address, host address (for the whole set); своя адреса, адреса хоста (про весь набір) |
 | failed login | невдалий вхід | One login to an NVR with a wrong password or user name. | Один вхід на реєстратор із неправильним паролем чи іменем. | failure, failed attempt; невдала спроба, помилка входу |
 | log entry | запис журналу | One record in the NVR log. | Один запис у журналі реєстратора. | event, line; подія |
 | NVR log | журнал реєстратора | The log that the NVR keeps and hik-f2b reads. | Журнал, який веде реєстратор і читає hik-f2b. | лог |

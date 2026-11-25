@@ -67,6 +67,9 @@ Before a release, also run
   changes.
 - A change to how a ban is decided or applied needs a test that reproduces
   the scenario.
+- Nothing read from an NVR log may reach the set of own addresses
+  (`src/own.rs`, ADR 0004). hik-f2b removes an address-list entry only for
+  an own address (ADR 0005).
 - Releases are made by tags, as [RELEASING.md](RELEASING.md) says. Try a
   release candidate on real hardware first.
 - There is no automatic deployment, by design: hik-f2b changes a firewall,

@@ -29,6 +29,10 @@ host | сервер | uk | \bсервер(а|у|ом|і|и|ів)?\b
 address | IP (in prose) | en | (?<!DB-)\bIP\b(?! address| geolocation| to Country)
 address | IP | uk | (?<!DB-)\bIP\b(?!-адрес| geolocation| to Country)
 address | айпі (у тексті) | uk | \bайпі\b
+own address | self address | en | \bself[- ]address(es)?\b
+own address | host address (for the whole set) | skip | right for the host's address toward one device; only the meaning tells them apart
+own address | своя адреса | uk | \bсво(я|єї|ю|ї|їх|їм|ями|ій) адрес\w*
+own address | адреса хоста (про весь набір) | skip | right for the host's address toward one device; only the meaning tells them apart
 failed login | failure | en | \bfailures?\b
 failed login | failed attempt | en | \bfailed attempts?\b
 failed login | невдала спроба | uk | \bневдал\w* спроб\w*

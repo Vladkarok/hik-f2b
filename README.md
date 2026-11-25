@@ -1171,8 +1171,9 @@ seed and print its trace, set `HIK_F2B_SIM_SEED`.
 The engine (`src/engine.rs`) talks to the router and to Telegram only
 through the `Firewall` and `Notifier` traits in `src/action.rs`, so another
 firewall or messenger can be added by implementing one trait. Which bans are
-due is decided in `src/ledger.rs`, and when a problem is worth a health alert
-in `src/health.rs`. Neither does I/O, and each is tested on its own.
+due is decided in `src/ledger.rs`. Which health check what happened in a poll
+opens or ends, and when a problem is worth a health alert, is decided in
+`src/health.rs`. Neither does I/O, and each is tested on its own.
 
 CI also runs `.github/scripts/repo-guard.sh`, which keeps addresses of real
 devices and other private data out of the repository, and

@@ -491,6 +491,7 @@ fn telegram_errors_never_reveal_the_token() {
     h.fake.lock().unwrap().tg_fail = true;
     let err = h
         .engine
+        .outbox
         .notifier
         .as_ref()
         .unwrap()

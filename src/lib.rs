@@ -43,6 +43,7 @@ pub mod http;
 pub mod ledger;
 pub mod mikrotik;
 pub mod nvr;
+pub mod outbox;
 pub mod reader;
 pub mod state;
 pub mod telegram;

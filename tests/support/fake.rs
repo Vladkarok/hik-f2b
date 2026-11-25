@@ -1007,7 +1007,7 @@ impl Drop for Harness {
         // blocked reading.
         self.engine.readers.clear();
         self.engine.firewall = None;
-        self.engine.notifier = None;
+        self.engine.outbox.notifier = None;
         sample_conntrack();
         let deadline = Instant::now() + STOP_TIMEOUT;
         let stuck: Vec<String> = self

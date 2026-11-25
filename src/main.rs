@@ -371,6 +371,7 @@ fn run() -> Result<(), String> {
     }
     if args.test_notify {
         let notifier = engine
+            .outbox
             .notifier
             .as_ref()
             .ok_or_else(|| "no [telegram] section in the config".to_string())?;

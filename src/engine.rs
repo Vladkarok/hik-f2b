@@ -13,13 +13,14 @@
 //! the poll ends; that module decides which health check this opens or ends
 //! and when it is worth an alert.
 
-use crate::action::{render, BanError, BanInfo, Firewall, HealthError, Notifier, NotifyError};
+use crate::action::{render, BanError, BanInfo, Firewall, HealthError, Notifier};
 use crate::config::{Config, DEFAULT_MESSAGE};
 use crate::country::{self, Code};
 use crate::health::{BanAttempt, BansEnded, CheckLine, Health, Kind, Notice, NvrRead, Status};
 use crate::ledger::{Outcome, Rules, Turn};
 use crate::mikrotik::Mikrotik;
 use crate::nvr::{Nvr, NvrError, Search};
+use crate::outbox::Outbox;
 use crate::reader::{LogReader, Login, Logins, Poll};
 use crate::state::State;
 use crate::telegram::Telegram;
@@ -30,11 +31,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-const MAX_QUEUED_NOTIFICATIONS: usize = 100;
-const NOTIFY_ATTEMPTS: u32 = 5;
-/// The longest wait for the messenger that is kept: one further away can
-/// only come from the host clock having gone back.
-const MAX_NOTIFY_WAIT: u64 = 3600;
 /// `--check` searches the log of the last day before the device time...
 const CHECK_WINDOW: i64 = 86400;
 /// ...and reads at most this many pages of it, so it stays quick on a busy
@@ -85,9 +81,8 @@ pub struct Engine {
     pub state: State,
     pub readers: Vec<LogReader>,
     pub firewall: Option<Box<dyn Firewall>>,
-    pub notifier: Option<Box<dyn Notifier>>,
+    pub outbox: Outbox,
     template: String,
-    notifications: Vec<(String, u32)>,
     health: Health,
     /// The reason the last country lookup failed, if it did: a failure is
     /// logged when its reason changes, a recovery once.
@@ -95,10 +90,6 @@ pub struct Engine {
     /// Set (by a signal handler) when the service is to stop. A cycle
     /// looks at it between its steps (see `cycle_at`).
     stop: Arc<AtomicBool>,
-    /// Notifications not queued in this cycle because the queue was full.
-    dropped_notifications: usize,
-    /// Host time before which the messenger asked not to be sent anything.
-    notify_after: u64,
 }
 
 /// Counts one failed login (host time) in the ledger, which queues the ban
@@ -160,13 +151,10 @@ impl Engine {
             state,
             readers,
             firewall,
-            notifier,
+            outbox: Outbox::new(notifier),
             template,
-            notifications: Vec::new(),
             country_failure: None,
             stop: Arc::new(AtomicBool::new(false)),
-            dropped_notifications: 0,
-            notify_after: 0,
         };
         engine.state.ledger.fit(&Rules::of(&engine.cfg));
         Ok(engine)
@@ -299,23 +287,13 @@ impl Engine {
 
     /// Logs the health notices that are due and queues them for the chat.
     fn report_health(&mut self, host_now: u64) {
-        let to_chat =
-            self.notifier.is_some() && self.cfg.telegram.as_ref().is_none_or(|t| t.health_alerts);
+        let to_chat = self.outbox.notifier.is_some()
+            && self.cfg.telegram.as_ref().is_none_or(|t| t.health_alerts);
         for notice in self.health.due(host_now) {
             log_notice(&notice);
             if to_chat {
-                self.queue_notification(notice.text());
+                self.outbox.queue_notification(notice.text());
             }
-        }
-    }
-
-    /// Queues a message for the chat; counts it as dropped when
-    /// `MAX_QUEUED_NOTIFICATIONS` already wait.
-    fn queue_notification(&mut self, text: String) {
-        if self.notifications.len() < MAX_QUEUED_NOTIFICATIONS {
-            self.notifications.push((text, 0));
-        } else {
-            self.dropped_notifications += 1;
         }
     }
 
@@ -483,7 +461,7 @@ impl Engine {
             self.periodic_check(host_now);
         }
         self.report_health(host_now);
-        self.flush_notifications(host_now);
+        self.outbox.flush_notifications(host_now, &self.stop);
         self.cleanup(host_now);
         if self.stopping() {
             crate::info!(
@@ -628,7 +606,7 @@ impl Engine {
             self.state
                 .ledger
                 .outcome(&Rules::of(&self.cfg), ip, now, outcome);
-            if notify && self.notifier.is_some() {
+            if notify && self.outbox.notifier.is_some() {
                 // The flag only goes to the chat.
                 let country = code
                     .map(|c| format!(" ({} {})", c.flag(), c))
@@ -646,73 +624,11 @@ impl Engine {
                         findtime: self.cfg.findtime,
                     },
                 );
-                self.queue_notification(text);
+                self.outbox.queue_notification(text);
             }
         }
         self.health
             .bans_ended(end, self.state.ledger.waiting(), now);
-    }
-
-    /// Notifications never hold up a ban: they are sent afterwards and
-    /// retried on later cycles if the messenger is unreachable. The first
-    /// failure ends the attempt for this cycle, so an unreachable service
-    /// costs at most one timeout per cycle. When the messenger asks to wait
-    /// (too many messages), nothing is sent until then, and that wait is not
-    /// a failed attempt.
-    fn flush_notifications(&mut self, now: u64) {
-        if self.dropped_notifications > 0 {
-            crate::warn!(
-                "{} notification(s) dropped: {} already wait to be sent",
-                self.dropped_notifications,
-                MAX_QUEUED_NOTIFICATIONS
-            );
-            self.dropped_notifications = 0;
-        }
-        let Some(notifier) = &self.notifier else {
-            self.notifications.clear();
-            return;
-        };
-        if self.notify_after > now {
-            if self.notify_after - now <= MAX_NOTIFY_WAIT {
-                return;
-            }
-            self.notify_after = 0;
-        }
-        while let Some((text, attempts)) = self.notifications.first().cloned() {
-            if self.stop.load(Ordering::Relaxed) {
-                break;
-            }
-            match notifier.send(&text) {
-                Ok(()) => {
-                    crate::debug!("notification sent");
-                    self.notifications.remove(0);
-                }
-                Err(NotifyError::RateLimited(wait)) => {
-                    crate::info!(
-                        "Telegram asks to wait {} s before the next message; {} notification(s) \
-                         wait",
-                        wait,
-                        self.notifications.len()
-                    );
-                    self.notify_after = now.saturating_add(wait);
-                    break;
-                }
-                Err(NotifyError::Failed(e)) => {
-                    if attempts + 1 >= NOTIFY_ATTEMPTS {
-                        crate::error!(
-                            "notification dropped after {} attempts: {}",
-                            NOTIFY_ATTEMPTS,
-                            e
-                        );
-                        self.notifications.remove(0);
-                    } else {
-                        crate::warn!("notification failed, will retry: {}", e);
-                        self.notifications[0].1 = attempts + 1;
-                    }
-                    break;
-                }
-            }
-        }
     }
 
     fn cleanup(&mut self, host_now: u64) {
@@ -721,7 +637,7 @@ impl Engine {
 
     /// Notifications waiting to be sent (for tests and diagnostics).
     pub fn queued_notifications(&self) -> usize {
-        self.notifications.len()
+        self.outbox.notifications.len()
     }
 }
 

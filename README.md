@@ -1048,6 +1048,11 @@ candidate 0.3.0-rc.1) and run against both NVRs and the router with `--check`,
 `--country` and `--dump`, and 0.3.0 runs as the service; the earlier tries
 above used an image built on the host from the Containerfile.
 
+For 0.4.1 the engine was split into modules. Release candidate 0.4.1-rc.1
+was then run against both NVRs and the router: `--check` passed, `--dump`
+for 72 hours printed the same lines as 0.4.0, and a five-minute dry run on a
+copy of the state file had no warnings.
+
 The country reader was tried with the DB-IP Country Lite file of November
 2026 and the MaxMind GeoLite2 Country file of 17 November 2026 (both an IPv6
 tree with 24-bit records): for 3000 addresses in each, `--country` gave

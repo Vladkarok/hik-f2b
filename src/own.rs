@@ -6,7 +6,10 @@
 //! name) and, for each of them, the local address the operating system
 //! would send from to reach it. They are found at run time, never written
 //! in the config: at startup and again in every poll (`OwnAddresses::refresh`),
-//! because an address can change (DHCP, a VPN that reconnects). When a
+//! because an address can change (DHCP, a VPN that reconnects). The local
+//! address is asked for in every poll (the kernel answers at once); a host
+//! name is resolved at startup and then at most every `names::RESOLVE_EVERY`
+//! (`names::Names`), and an IPv4 address in a URL needs no look-up. When a
 //! look-up fails, what was last found for that device stays.
 //!
 //! The answers come through `Source`: the operating system (`System`), or
@@ -19,6 +22,7 @@
 
 use crate::config::Config;
 use crate::ledger::never_ban;
+use crate::names::Names;
 use crate::util;
 use std::collections::{BTreeMap, BTreeSet};
 use std::net::{Ipv4Addr, SocketAddr, ToSocketAddrs, UdpSocket};
@@ -82,6 +86,8 @@ struct Answers {
     local: Result<Ipv4Addr, String>,
     /// The answers for host names; an IPv4 address resolves to itself.
     names: BTreeMap<String, Result<Vec<Ipv4Addr>, String>>,
+    /// How many times `resolve` was called.
+    resolved: usize,
 }
 
 impl Fixed {
@@ -90,6 +96,7 @@ impl Fixed {
         Fixed(Arc::new(Mutex::new(Answers {
             local: Ok(local),
             names: BTreeMap::new(),
+            resolved: 0,
         })))
     }
 
@@ -108,14 +115,21 @@ impl Fixed {
     pub fn set_name(&self, name: &str, answer: Result<Vec<Ipv4Addr>, String>) {
         self.answers().names.insert(name.to_string(), answer);
     }
+
+    /// How many times a host was resolved through these answers.
+    pub fn resolved(&self) -> usize {
+        self.answers().resolved
+    }
 }
 
 impl Source for Fixed {
     fn resolve(&mut self, host: &str, _port: u16) -> Result<Vec<Ipv4Addr>, String> {
+        let mut answers = self.answers();
+        answers.resolved += 1;
         if let Ok(ip) = host.parse::<Ipv4Addr>() {
             return Ok(vec![ip]);
         }
-        match self.answers().names.get(host) {
+        match answers.names.get(host) {
             Some(answer) => answer.clone(),
             None => Err(format!("cannot resolve {}: no such name", host)),
         }
@@ -177,6 +191,8 @@ struct Found {
 pub struct OwnAddresses {
     devices: Vec<Device>,
     source: Box<dyn Source>,
+    /// The host names of the devices, resolved now and then.
+    names: Names,
     found: Vec<Found>,
     /// Why the last look-up for each device failed (`None`: it worked).
     failures: Vec<Option<String>>,
@@ -205,19 +221,21 @@ impl OwnAddresses {
             failures: vec![None; devices.len()],
             devices,
             source,
+            names: Names::new(),
             set: BTreeSet::new(),
         };
-        own.look_up();
+        own.look_up(None);
         own
     }
 
-    /// Looks every device up again. Logs, as INFO, a change of the set, and
-    /// a failed look-up whenever its reason changes (WARNING) and when it
-    /// works again (INFO).
-    pub fn refresh(&mut self) {
+    /// Looks every device up again at host time `now`: the local addresses
+    /// at once, a host name only when its answer is `names::RESOLVE_EVERY`
+    /// old. Logs, as INFO, a change of the set, and a failed look-up
+    /// whenever its reason changes (WARNING) and when it works again (INFO).
+    pub fn refresh(&mut self, now: u64) {
         let before = self.set.clone();
         let failures = self.failures.clone();
-        self.look_up();
+        self.look_up(Some(now));
         for (i, (was, now)) in failures.iter().zip(&self.failures).enumerate() {
             let name = &self.devices[i].name;
             match (was, now) {
@@ -252,15 +270,19 @@ impl OwnAddresses {
         }
     }
 
-    fn look_up(&mut self) {
+    /// One look-up of every device at host time `now` (`None` at startup).
+    fn look_up(&mut self, now: Option<u64>) {
         for (i, device) in self.devices.iter().enumerate() {
             let found = &mut self.found[i];
             let mut errors = Vec::new();
-            match self.source.resolve(&device.host, device.port) {
-                Ok(addresses) if !addresses.is_empty() => found.addresses = addresses,
-                Ok(_) => errors.push(format!("{} has no IPv4 address", device.host)),
-                Err(e) => errors.push(e),
+            let source = &mut self.source;
+            let (addresses, error) = self
+                .names
+                .lookup(&device.host, now, |host| source.resolve(host, device.port));
+            if !addresses.is_empty() {
+                found.addresses = addresses;
             }
+            errors.extend(error);
             let addresses = found.addresses.clone();
             found.local.retain(|peer, _| addresses.contains(peer));
             for peer in addresses {
@@ -343,9 +365,11 @@ impl OwnAddresses {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::names::RESOLVE_EVERY;
     use crate::util::{capture_log, captured_log};
 
     const LOCAL: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 200);
+    const T0: u64 = 1_768_000_000;
 
     fn ip(text: &str) -> Ipv4Addr {
         text.parse().unwrap()
@@ -422,11 +446,11 @@ mod tests {
         let cfg = config(Some("https://192.0.2.1"), &[("nvr1", "http://192.0.2.5")]);
         capture_log();
         let mut own = OwnAddresses::new(&cfg, Box::new(fixed.clone()));
-        own.refresh();
+        own.refresh(T0);
         // the first look-up and an unchanged set say nothing
         assert!(captured_log().is_empty());
         fixed.set_local(Ok(ip("192.0.2.201")));
-        own.refresh();
+        own.refresh(T0 + 30);
         assert_eq!(
             captured_log(),
             vec![
@@ -446,6 +470,8 @@ mod tests {
             &[("nvr1", "https://nvr.example.net")],
         );
         let mut own = OwnAddresses::new(&cfg, Box::new(fixed.clone()));
+        // the first poll; the name was resolved at startup
+        own.refresh(T0);
         let before = set(&own);
         capture_log();
         fixed.set_name(
@@ -453,7 +479,7 @@ mod tests {
             Err("cannot resolve: timed out".to_string()),
         );
         fixed.set_local(Err("no route".to_string()));
-        own.refresh();
+        own.refresh(T0 + RESOLVE_EVERY);
         assert_eq!(set(&own), before);
         assert_eq!(
             captured_log(),
@@ -472,13 +498,13 @@ mod tests {
             ]
         );
         // the same reason again is not logged again
-        own.refresh();
+        own.refresh(T0 + 2 * RESOLVE_EVERY);
         assert!(captured_log().is_empty());
         // a name that now resolves elsewhere: the new address, and the old
         // one's local address is no longer kept
         fixed.set_name("nvr.example.net", Ok(vec![ip("198.51.100.6")]));
         fixed.set_local(Ok(LOCAL));
-        own.refresh();
+        own.refresh(T0 + 3 * RESOLVE_EVERY);
         assert_eq!(
             captured_log(),
             vec![
@@ -489,6 +515,40 @@ mod tests {
             ]
         );
         assert!(own.failures().is_empty());
+    }
+
+    /// The local address is asked for in every poll, a host name at most
+    /// every `RESOLVE_EVERY` (and at once at startup), an IPv4 address in a
+    /// URL never.
+    #[test]
+    fn names_are_resolved_now_and_then_and_addresses_never() {
+        let fixed = Fixed::new(LOCAL);
+        fixed.set_name("nvr.example.net", Ok(vec![ip("198.51.100.5")]));
+        let cfg = config(
+            Some("https://192.0.2.1"),
+            &[("nvr1", "https://nvr.example.net")],
+        );
+        let mut own = OwnAddresses::new(&cfg, Box::new(fixed.clone()));
+        assert_eq!(fixed.resolved(), 1, "the name, at once");
+        // polls every 30 s: the local address follows at once, the name
+        // keeps its answer
+        fixed.set_name("nvr.example.net", Ok(vec![ip("198.51.100.6")]));
+        for poll in 0..10 {
+            own.refresh(T0 + poll * 30);
+        }
+        assert_eq!(fixed.resolved(), 1);
+        fixed.set_local(Ok(ip("192.0.2.201")));
+        own.refresh(T0 + 300 - 1);
+        assert_eq!(fixed.resolved(), 1);
+        assert_eq!(
+            set(&own),
+            ["192.0.2.1", "192.0.2.201", "198.51.100.5"],
+            "a new local address at once"
+        );
+        // the interval has passed since the first poll
+        own.refresh(T0 + RESOLVE_EVERY);
+        assert_eq!(fixed.resolved(), 2);
+        assert_eq!(set(&own), ["192.0.2.1", "192.0.2.201", "198.51.100.6"]);
     }
 
     #[test]

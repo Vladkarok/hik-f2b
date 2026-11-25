@@ -3292,8 +3292,8 @@ fn the_own_addresses_are_logged_at_the_start_and_when_a_look_up_fails() {
         util::captured_log(),
         vec![
             "INFO own addresses, never banned: router 127.0.0.1, nvr1 127.0.0.1",
-            "WARNING own addresses: a look-up failed, it is tried again in every poll: router: \
-             no route; nvr1: no route",
+            "WARNING own addresses: a look-up failed, it is tried again in every poll (a host \
+             name every 5 min): router: no route; nvr1: no route",
         ]
     );
 }

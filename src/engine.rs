@@ -18,7 +18,8 @@
 //! sends what it can.
 //!
 //! The own addresses (`own.rs`) are looked up again at the start of every
-//! poll and given to the ledger with the rules. With every firewall check
+//! poll (a host name at most every `names::RESOLVE_EVERY`) and given to the
+//! ledger with the rules. With every firewall check
 //! the engine asks the router whether an own address is in the
 //! address-list, and removes it if it is (`sweep_own`): the only ban
 //! hik-f2b ever removes (ADR 0005).
@@ -28,6 +29,7 @@ use crate::config::{Config, DEFAULT_MESSAGE};
 use crate::country::{self, Code};
 use crate::health::{self, BanAttempt, BansEnded, Health, Kind, Notice, NvrRead, OwnStuck};
 use crate::ledger::{Outcome, Rules, Turn, MAX_USER};
+use crate::names::RESOLVE_EVERY;
 use crate::nvr::{Nvr, NvrError};
 use crate::outbox::Outbox;
 use crate::own::OwnAddresses;
@@ -241,7 +243,9 @@ impl Engine {
         let failures = self.own.failures();
         if !failures.is_empty() {
             crate::warn!(
-                "own addresses: a look-up failed, it is tried again in every poll: {}",
+                "own addresses: a look-up failed, it is tried again in every poll (a host \
+                 name every {} min): {}",
+                RESOLVE_EVERY / 60,
                 failures.join("; ")
             );
         }
@@ -454,7 +458,7 @@ impl Engine {
         let now = host_i64(host_now);
         self.startup.polled(host_now, self.grace());
         if !self.stopping() {
-            self.own.refresh();
+            self.own.refresh(host_now);
         }
         let report_once = self.firewall.is_none() || self.cfg.dry_run;
         for i in 0..self.readers.len() {

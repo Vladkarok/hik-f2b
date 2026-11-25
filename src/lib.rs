@@ -43,6 +43,7 @@ pub mod health;
 pub mod http;
 pub mod ledger;
 pub mod mikrotik;
+pub mod names;
 pub mod nvr;
 pub mod outbox;
 pub mod own;

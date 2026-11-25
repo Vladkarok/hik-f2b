@@ -15,6 +15,7 @@ documentation uses the same word.
 | router | роутер | The MikroTik router that bans addresses. | Роутер MikroTik, на якому діють бани. | маршрутизатор |
 | host | хост | The Linux machine that runs hik-f2b. | Linux-машина, на якій працює hik-f2b. | server, machine; сервер |
 | address | адреса | The source IPv4 address of a failed login. | IPv4-адреса джерела невдалого входу. | IP (in prose); IP, айпі (у тексті) |
+| own address | власна адреса | An IPv4 address of the router or an NVR of the config, or the host's address toward one of them. hik-f2b finds them at run time and never bans them. | IPv4-адреса роутера чи реєстратора з конфігу або адреса хоста в бік одного з них. hik-f2b знаходить їх під час роботи й ніколи не банить. | self address, host address (for the whole set); своя адреса, адреса хоста (про весь набір) |
 | failed login | невдалий вхід | One login to an NVR with a wrong password or user name. | Один вхід на реєстратор із неправильним паролем чи іменем. | failure, failed attempt; невдала спроба, помилка входу |
 | log entry | запис журналу | One record in the NVR log. | Один запис у журналі реєстратора. | event, line; подія |
 | NVR log | журнал реєстратора | The log that the NVR keeps and hik-f2b reads. | Журнал, який веде реєстратор і читає hik-f2b. | лог |
@@ -29,6 +30,7 @@ documentation uses the same word.
 | remove a ban | зняти бан | Delete the address-list entry on the router. | Видалити запис з address-list на роутері. | lift a ban, unban; розбанити |
 | address-list | address-list | The RouterOS list that holds banned addresses (`cctv_ban`). | Список RouterOS, у якому лежать забанені адреси (`cctv_ban`). | ban list, block list; бан-лист, чорний список |
 | address-list entry | запис в address-list | One address in the address-list, with or without a timeout. | Одна адреса в address-list, з таймаутом чи без. | ban entry |
+| safe list | безпечний список | The optional second address-list (`safe_list`) in which hik-f2b keeps its own address toward the router; a rule above the drop rule accepts it. | Необов'язковий другий address-list (`safe_list`), у якому hik-f2b тримає власну адресу в бік роутера; правило над правилом відкидання її пропускає. | allow list, whitelist; білий список |
 | drop rule | правило відкидання | The firewall rule that blocks addresses from the address-list. | Правило фаєрвола, яке блокує адреси з address-list. | block rule, ban rule; правило блокування |
 | config | конфіг | The file `hik-f2b.ini`. | Файл `hik-f2b.ini`. | configuration file, settings file; файл налаштувань, конфігурація (про файл) |
 | setting | параметр | One `key = value` line in the config. | Один рядок `ключ = значення` у конфігу. | option (for this); опція (про це) |

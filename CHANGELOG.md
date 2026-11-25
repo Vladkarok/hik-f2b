@@ -8,6 +8,63 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 
 ## [Unreleased]
 
+### Added
+
+- hik-f2b never bans its own addresses: the addresses of the router and of
+  each NVR (from the URLs in the config, a host name resolved) and the
+  address this host uses to reach each of them. It finds them at startup
+  and again in every poll; a host name in a URL is resolved again at most
+  every 5 minutes, so that a slow resolver does not hold up every poll. A
+  failed login from one is not counted, and the
+  log line says that it came from an own address of hik-f2b, which is what
+  the NVR logs when hik-f2b's own NVR password is wrong. Before, those
+  failed logins could get the host banned once the password was right
+  again, or a forged log entry with the host's address could. A waiting ban
+  of an address that becomes an own address is dropped, as for `ignoreip`.
+  The start of the service logs the own addresses, `--check` prints them as
+  a line of its own, and a change is one INFO line. With NAT between the
+  host and a device, put the address the device sees into `ignoreip`.
+- With every firewall check (at startup and every 5 minutes) hik-f2b asks
+  the router whether an own address is in `address_list`, one request per
+  own address outside loopback and the other ranges that are never banned.
+  If one is, it removes the entry, logs a WARNING and sends a notification
+  at once. This is the only case in which hik-f2b removes a ban. In a dry
+  run it reports the entry once and removes nothing. A removal that fails is
+  the new health alert `own-address-listed`, until no own address is listed.
+- Both are always on, with no setting: a config that worked with 0.4.1
+  works as before, except that own addresses are never banned and are
+  removed from the address-list. Neither has been tried on real devices
+  yet; see "Not yet tried" in the README.
+- An optional safe list: with `safe_list = <name>` in `[mikrotik]`,
+  hik-f2b keeps this host's address toward the router in that address-list,
+  with a timeout of 30 minutes, renewed at every firewall check. With one
+  accept rule above the drop rule (the README gives the command), the
+  router then never blocks that address, whatever the address-list holds.
+  The firewall check also checks that this rule is enabled and comes before
+  the drop rule (new health alert `safe-list-rule`); a write the router
+  refuses is the new health alert `safe-list-refused`. `--check` prints a
+  line `safe list`. A dry run writes nothing and says once what it would
+  write. Without the setting nothing of this happens and no request is
+  sent. Not tried on a real router yet; see "Not yet tried" in the README.
+- `--test-ban` refuses an own address of hik-f2b: it says why, exits with
+  status 1 and sends nothing to the router.
+- `ignoreip` also takes host names, for example the dynamic DNS name of an
+  administrator whose address changes. hik-f2b resolves each name at
+  startup and then at most every 5 minutes, IPv4 only. An address that a
+  name resolves to is never banned, like an address written in `ignoreip`,
+  and its waiting ban is dropped; when the name moves on, the old address is
+  counted again. A failed look-up keeps the addresses found before; a name
+  that has never resolved exempts nothing. A name of a wrong form is a config
+  error, a name that does not resolve is not. The start of the service logs
+  what each name resolves to, a change is one INFO line, and `--check`
+  prints a line per name (a name that does not resolve fails the check).
+  Whoever controls the answer for the name can exempt an address: use a
+  name under your control, or the address itself where it is stable (see
+  "Host names in ignoreip" in the README). These addresses are not own
+  addresses: hik-f2b removes no ban and writes nothing to the safe list for
+  them. Without a name in `ignoreip` nothing changes. Not tried on a real
+  host yet.
+
 ## [0.4.1] - 2026-11-25
 
 ### Added

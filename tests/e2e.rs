@@ -3078,6 +3078,1315 @@ fn todays_wording_needs_no_lookup() {
     assert!(h.fake.lock().unwrap().lookups.is_empty());
 }
 
+// ---------------------------------------------------------- own addresses
+
+/// The address the host reaches the fakes from in these tests (the fakes
+/// themselves are on loopback, which is never banned anyway).
+const OWN: &str = "192.0.2.200";
+
+fn with_own(opts: Opts) -> Harness {
+    Harness::with(Opts {
+        own: ip(OWN),
+        ..opts
+    })
+}
+
+/// The NVR rejects hik-f2b's login for ten minutes (its password was
+/// changed on the NVR), and logs each refused login as a failed login from
+/// the host's address with hik-f2b's user name. Then the password is right
+/// again and hik-f2b reads those entries. Returns the harness and the log
+/// from the start.
+fn own_wrong_password(own: &str) -> (Harness, Vec<String>) {
+    let mut h = Harness::with(Opts {
+        general: "auth_backoff = 60",
+        own: ip(own),
+        ..Default::default()
+    });
+    util::capture_log();
+    h.fake.lock().unwrap().nvr_auth_ok = false;
+    for _ in 0..20 {
+        let before = h.fake.lock().unwrap().refused_logins;
+        h.advance(30);
+        let refused = h.fake.lock().unwrap().refused_logins - before;
+        for k in 0..refused {
+            let at = device(h.host + SKEW + k as i64);
+            Harness::entry_to(&h.fake, &at, "192.0.2.200", b"f2b", "illlegealAccess");
+        }
+    }
+    let logged_entries = h.fake.lock().unwrap().entries.len();
+    assert!(logged_entries >= 10, "{}", logged_entries);
+    h.fake.lock().unwrap().nvr_auth_ok = true;
+    run(&mut h, 4, 30);
+    (h, util::captured_log())
+}
+
+/// Layer 1, the scenario it is for: hik-f2b's own failed logins are never
+/// counted, and each one says why and what to check.
+#[test]
+fn own_failed_logins_after_a_wrong_password_are_not_counted() {
+    let (h, log) = own_wrong_password(OWN);
+    let entries = h.fake.lock().unwrap().entries.len();
+    assert!(h.banned().is_empty());
+    assert_eq!(h.engine.state().ledger.waiting(), 0);
+    assert_eq!(h.fails(OWN), 0);
+    assert_eq!(
+        exactly(
+            &log,
+            "INFO nvr1: failed login from 192.0.2.200 (user=\"f2b\"): an own address of \
+             hik-f2b, never banned, not counted; if that is hik-f2b's user, the NVR rejected \
+             hik-f2b's own login: check its password"
+        ),
+        entries,
+        "{:?}",
+        log
+    );
+    assert_eq!(
+        logged(&log, "failed login from 192.0.2.200 (user=\"f2b\") at "),
+        0
+    );
+    assert!(logged(&log, "ERROR nvr1: login to the NVR was rejected") >= 10);
+    // the same log from an address that is not an own address is banned:
+    // the scenario reaches maxretry
+    let (h, _) = own_wrong_password("127.0.0.1");
+    assert_eq!(h.banned(), vec![OWN]);
+}
+
+/// A forged log entry cannot get an own address banned, whatever user name
+/// it names.
+#[test]
+fn a_forged_entry_with_an_own_address_is_not_counted() {
+    let mut h = with_own(Opts::default());
+    util::capture_log();
+    for s in 0..8 {
+        h.add_full(
+            &format!("10:01:{:02}", 10 + s),
+            OWN,
+            "admin",
+            "illlegealAccess",
+        );
+    }
+    h.burst("10:01", ATTACKER, 5);
+    h.cycle("10:02:00");
+    let log = util::captured_log();
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    assert_eq!(h.fails(OWN), 0);
+    assert_eq!(
+        logged(
+            &log,
+            "INFO nvr1: failed login from 192.0.2.200 (user=\"admin\"): an own address of hik-f2b"
+        ),
+        8,
+        "{:?}",
+        log
+    );
+    // the router is asked about the own address once per firewall check,
+    // never asked to ban it
+    let f = h.fake.lock().unwrap();
+    assert!(f.put_log.iter().all(|(a, _)| a != OWN), "{:?}", f.put_log);
+}
+
+/// An address that becomes an own address (DHCP gave it to the host) while
+/// its ban waits: the waiting ban and its counted failed logins are
+/// dropped before bans are attempted, with one INFO line for the change.
+#[test]
+fn an_address_that_becomes_an_own_address_has_its_waiting_ban_dropped() {
+    const NEXT: &str = "198.51.100.9";
+    let mut h = with_own(Opts::default());
+    h.fake.lock().unwrap().router_unreachable = true;
+    h.burst("10:01", ATTACKER, 5);
+    h.add("10:01:30", NEXT);
+    h.cycle("10:02:00");
+    assert!(h.engine.state().ledger.is_waiting(attacker()));
+    assert_eq!(h.fails(NEXT), 1);
+    util::capture_log();
+    h.own.set_local(Ok(attacker()));
+    h.advance(30);
+    let log = util::captured_log();
+    assert_eq!(
+        exactly(
+            &log,
+            "INFO own addresses changed: added 198.51.100.7, removed 192.0.2.200; now router \
+             127.0.0.1 from 198.51.100.7, nvr1 127.0.0.1 from 198.51.100.7"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    assert_eq!(
+        exactly(
+            &log,
+            "INFO 198.51.100.7: waiting ban dropped, 5 counted failed login(s) forgotten: the \
+             address is now an own address of hik-f2b and is never banned"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    assert!(!h.engine.state().ledger.is_waiting(attacker()));
+    // an address that is not an own address keeps its count
+    assert_eq!(h.fails(NEXT), 1);
+    h.fake.lock().unwrap().router_unreachable = false;
+    h.own.set_local(Ok(ip(NEXT)));
+    util::capture_log();
+    h.advance(30);
+    let log = util::captured_log();
+    assert_eq!(
+        exactly(
+            &log,
+            "INFO 198.51.100.9: 1 counted failed login(s) forgotten: the address is now an own \
+             address of hik-f2b and is never banned"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    // the address that is no longer an own address is not banned for what
+    // was dropped
+    assert!(h.banned().is_empty());
+    assert_eq!(h.engine.state().ledger.waiting(), 0);
+}
+
+/// The start of the service logs the own addresses; a look-up that fails
+/// keeps the last known addresses and is said once.
+#[test]
+fn the_own_addresses_are_logged_at_the_start_and_when_a_look_up_fails() {
+    let mut h = with_own(Opts::default());
+    util::capture_log();
+    h.engine.startup_own();
+    assert_eq!(
+        util::captured_log(),
+        vec![
+            "INFO own addresses, never banned: router 127.0.0.1 from 192.0.2.200, nvr1 \
+             127.0.0.1 from 192.0.2.200"
+        ]
+    );
+    h.own.set_local(Err("no route to 127.0.0.1".to_string()));
+    h.advance(30);
+    h.advance(30);
+    let log = util::captured_log();
+    assert_eq!(
+        log.iter()
+            .filter(|l| l.contains("own addresses"))
+            .collect::<Vec<_>>(),
+        vec![
+            "WARNING own addresses: the look-up for router failed, its last known addresses \
+             stay: no route to 127.0.0.1",
+            "WARNING own addresses: the look-up for nvr1 failed, its last known addresses stay: \
+             no route to 127.0.0.1",
+        ]
+    );
+    // still an own address
+    h.add_full("10:01:10", OWN, "admin", "illlegealAccess");
+    h.advance(30);
+    assert_eq!(h.fails(OWN), 0);
+    // a start with the look-up failing names what is missing
+    let mut h = Harness::build(Opts {
+        own: ip(OWN),
+        ..Default::default()
+    });
+    h.own.set_local(Err("no route".to_string()));
+    h.restart();
+    util::capture_log();
+    h.engine.startup_own();
+    assert_eq!(
+        util::captured_log(),
+        vec![
+            "INFO own addresses, never banned: router 127.0.0.1, nvr1 127.0.0.1",
+            "WARNING own addresses: a look-up failed, it is tried again in every poll (a host \
+             name every 5 min): router: no route; nvr1: no route",
+        ]
+    );
+}
+
+/// `--check` prints the own addresses; a failed look-up is a failed check.
+#[test]
+fn check_prints_the_own_addresses() {
+    use hik_f2b::health::Status;
+    let h = with_own(Opts::default());
+    let line = h
+        .check()
+        .into_iter()
+        .find(|l| l.item == "own addresses")
+        .unwrap();
+    assert_eq!(
+        line.to_string(),
+        "ok       own addresses: router 127.0.0.1 from 192.0.2.200, nvr1 127.0.0.1 from \
+         192.0.2.200 (never banned)"
+    );
+    h.own.set_local(Err("no route".to_string()));
+    let line = h
+        .check()
+        .into_iter()
+        .find(|l| l.item == "own addresses")
+        .unwrap();
+    assert_eq!(line.status, Status::Failed);
+    assert_eq!(
+        line.to_string(),
+        "FAILED   own addresses: router 127.0.0.1, nvr1 127.0.0.1; look-up failed: router: no \
+         route; nvr1: no route"
+    );
+}
+
+/// Layer 3: an own address in the address-list (put there by hand, by
+/// another tool or by an earlier version) is removed at the next firewall
+/// check, with a WARNING and a notification at once. One look-up per own
+/// address outside the reserved ranges and firewall check, no more.
+#[test]
+fn an_own_address_in_the_address_list_is_removed_and_reported_at_once() {
+    let mut h = with_own(Opts {
+        telegram: true,
+        ..Default::default()
+    });
+    // the first poll ran the first periodic check: one look-up, for the one
+    // own address that is not loopback
+    let lookup = format!("list=cctv_ban&address={}&.proplist=.id", OWN);
+    assert_eq!(h.fake.lock().unwrap().lookups, vec![lookup.clone()]);
+    h.fake.lock().unwrap().bans.push(OWN.to_string());
+    run(&mut h, 9, 30); // the next check is due 300 s after the first
+    assert_eq!(h.banned(), vec![OWN]);
+    assert_eq!(h.fake.lock().unwrap().lookups.len(), 1);
+    util::capture_log();
+    h.advance(30);
+    let log = util::captured_log();
+    assert_eq!(
+        exactly(
+            &log,
+            "WARNING 192.0.2.200 is an own address of hik-f2b and was in MikroTik address-list \
+             cctv_ban: the entry is removed"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    assert!(h.banned().is_empty());
+    {
+        let f = h.fake.lock().unwrap();
+        assert_eq!(f.delete_log, vec![(OWN.to_string(), "removed")]);
+        assert_eq!(f.lookups, vec![lookup.clone(), lookup.clone()]);
+    }
+    assert_eq!(
+        telegram_texts(&h),
+        vec![format!(
+            "{}192.0.2.200 is an own address of hik-f2b and was in MikroTik address-list \
+             cctv_ban; the entry is removed. hik-f2b never bans its own addresses: it was added \
+             by hand, by another tool or by an earlier version.",
+            WARN
+        )]
+    );
+    assert!(h.engine.alerted_problems().is_empty());
+    // the check at the start of the service does it too
+    h.fake.lock().unwrap().bans.push(OWN.to_string());
+    h.restart();
+    assert!(h.engine.startup_check(h.host as u64));
+    assert!(h.banned().is_empty());
+    h.advance(30);
+    assert_eq!(telegram_texts(&h).len(), 2);
+    // nothing listed: nothing removed, nothing sent
+    run(&mut h, 20, 30);
+    assert_eq!(telegram_texts(&h).len(), 2);
+    assert_eq!(h.fake.lock().unwrap().delete_log.len(), 2);
+}
+
+/// A removal that the router refuses opens `own-address-listed`, reported
+/// once at once and alerted after `alert_after`; a later removal ends it.
+#[test]
+fn a_removal_that_fails_is_a_health_problem_until_the_address_is_gone() {
+    let mut h = with_own(Opts {
+        telegram: true,
+        general: "alert_after = 60",
+        ..Default::default()
+    });
+    {
+        let mut f = h.fake.lock().unwrap();
+        f.bans.push(OWN.to_string());
+        f.refuse_writes = true;
+    }
+    util::capture_log();
+    run(&mut h, 10, 30); // the check at 10:05:00 finds it
+    let log = util::captured_log();
+    assert_eq!(
+        exactly(
+            &log,
+            "ERROR cannot remove own address 192.0.2.200 from MikroTik address-list cctv_ban, \
+             will retry at the next firewall check: refused: HTTP 400: {\"detail\":\"not enough \
+             permissions (9)\",\"error\":400,\"message\":\"Bad Request\"}"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    // reported at once
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 1, "{:?}", texts);
+    assert!(h.engine.alerted_problems().is_empty());
+    // and alerted after alert_after
+    run(&mut h, 2, 30);
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 2, "{:?}", texts);
+    assert_eq!(
+        texts[0],
+        format!(
+            "{}192.0.2.200 is an own address of hik-f2b and is in MikroTik address-list \
+             cctv_ban, and cannot be removed: refused: HTTP 400: {{\"detail\":\"not enough \
+             permissions (9)\",\"error\":400,\"message\":\"Bad Request\"}}. Remove it by hand.",
+            WARN
+        )
+    );
+    assert!(
+        texts[1].starts_with(&format!(
+            "{}an own address of hik-f2b is in the address-list and cannot be removed for 1 \
+             min: 192.0.2.200 is in MikroTik address-list cctv_ban; remove it by hand and check \
+             that the router user may write: refused: HTTP 400",
+            WARN
+        )),
+        "{}",
+        texts[1]
+    );
+    assert_eq!(h.engine.alerted_problems(), vec!["own-address-listed"]);
+    // the next checks try again, without a second message
+    run(&mut h, 10, 30);
+    assert_eq!(telegram_texts(&h).len(), 2);
+    assert_eq!(h.banned(), vec![OWN]);
+    assert_eq!(h.engine.alerted_problems(), vec!["own-address-listed"]);
+    // the router user may write again
+    h.fake.lock().unwrap().refuse_writes = false;
+    run(&mut h, 10, 30);
+    assert!(h.banned().is_empty());
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 4, "{:?}", texts);
+    assert!(texts[2].contains("the entry is removed"), "{}", texts[2]);
+    assert!(
+        texts[3].starts_with(&format!(
+            "{}no own address of hik-f2b is in the address-list any more (after ",
+            OK
+        )),
+        "{}",
+        texts[3]
+    );
+    assert!(h.engine.alerted_problems().is_empty());
+    // the entry gone by itself (it timed out) also ends the problem
+    {
+        let mut f = h.fake.lock().unwrap();
+        f.bans.push(OWN.to_string());
+        f.refuse_writes = true;
+    }
+    run(&mut h, 14, 30);
+    assert_eq!(h.engine.alerted_problems(), vec!["own-address-listed"]);
+    h.fake.lock().unwrap().bans.clear();
+    run(&mut h, 10, 30);
+    assert!(h.engine.alerted_problems().is_empty());
+    assert!(telegram_texts(&h)
+        .last()
+        .unwrap()
+        .contains("no own address of hik-f2b is in the address-list any more"));
+}
+
+/// A dry run reports an own address in the address-list once and removes
+/// nothing; notify-only mode asks no router.
+#[test]
+fn own_address_in_the_address_list_in_a_dry_run_and_in_notify_only_mode() {
+    let mut h = with_own(Opts {
+        telegram: true,
+        general: "dry_run = true",
+        ..Default::default()
+    });
+    h.fake.lock().unwrap().bans.push(OWN.to_string());
+    util::capture_log();
+    run(&mut h, 25, 30); // two checks
+    let log = util::captured_log();
+    assert_eq!(
+        exactly(
+            &log,
+            "WARNING DRY RUN: 192.0.2.200 is an own address of hik-f2b and is in MikroTik \
+             address-list cctv_ban: it would be removed"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    assert_eq!(h.banned(), vec![OWN]);
+    assert!(h.fake.lock().unwrap().delete_log.is_empty());
+    assert_eq!(h.fake.lock().unwrap().lookups.len(), 3);
+    assert_eq!(
+        telegram_texts(&h),
+        vec![format!(
+            "{}192.0.2.200 is an own address of hik-f2b and is in MikroTik address-list \
+             cctv_ban. Dry run: it is not removed; remove it by hand.",
+            WARN
+        )]
+    );
+    assert!(h.engine.alerted_problems().is_empty());
+    // once it is gone and listed again, it is reported again
+    h.fake.lock().unwrap().bans.clear();
+    run(&mut h, 10, 30);
+    h.fake.lock().unwrap().bans.push(OWN.to_string());
+    run(&mut h, 10, 30);
+    assert_eq!(telegram_texts(&h).len(), 2);
+
+    // notify-only mode: no router to ask; own failed logins still do not count
+    let mut h = with_own(Opts {
+        telegram: true,
+        mikrotik: false,
+        ..Default::default()
+    });
+    h.burst("10:01", OWN, 6);
+    run(&mut h, 25, 30);
+    assert_eq!(h.fake.lock().unwrap().router_requests, 0);
+    assert_eq!(h.fails(OWN), 0);
+    assert!(telegram_texts(&h).is_empty());
+}
+
+// ------------------------------------------------------- names in ignoreip
+
+/// The administrator's dynamic DNS name, and the addresses it resolves to
+/// in these tests.
+const HOME: &str = "home.example.net";
+const HOME_IP: &str = "203.0.113.7";
+const NEXT_IP: &str = "203.0.113.8";
+const WITH_HOME: &str = "ignoreip = 192.168.0.0/16, home.example.net";
+
+fn with_home(opts: Opts) -> Harness {
+    Harness::with(Opts {
+        general: WITH_HOME,
+        own: ip(OWN),
+        names: &[(HOME, &[HOME_IP])],
+        ..opts
+    })
+}
+
+/// The administrator's scenario, from start to end: wrong passwords from
+/// the address the name resolves to are never counted; the name then
+/// follows the administrator to a new address, whose waiting ban is
+/// dropped, and the old address is banned on its next failed logins.
+#[test]
+fn an_administrator_behind_an_ignoreip_name_is_never_banned() {
+    let mut h = with_home(Opts::default());
+    util::capture_log();
+    h.engine.startup_names();
+    assert_eq!(
+        util::captured_log(),
+        vec!["INFO ignoreip names, never banned: home.example.net 203.0.113.7"]
+    );
+    // eight wrong passwords from home, and an attacker
+    h.burst("10:01", HOME_IP, 8);
+    h.burst("10:01", ATTACKER, 5);
+    h.cycle("10:02:00");
+    let log = util::captured_log();
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    assert_eq!(h.fails(HOME_IP), 0);
+    assert_eq!(
+        exactly(
+            &log,
+            "INFO nvr1: failed login from 203.0.113.7 (user=\"admin\"): never banned (ignoreip \
+             name home.example.net), not counted"
+        ),
+        8,
+        "{:?}",
+        log
+    );
+    // the administrator's next address has failed logins before the name
+    // follows it, while the router cannot be reached: its ban waits
+    h.fake.lock().unwrap().router_unreachable = true;
+    h.burst("10:03", NEXT_IP, 5);
+    h.cycle("10:04:00");
+    assert!(h.engine.state().ledger.is_waiting(ip(NEXT_IP)));
+    // the name follows; its answer is looked up again 5 min after the first
+    // poll, not before
+    h.own.set_name(HOME, Ok(vec![ip(NEXT_IP)]));
+    h.cycle("10:04:59");
+    assert!(h.engine.state().ledger.is_waiting(ip(NEXT_IP)));
+    util::capture_log();
+    h.cycle("10:05:00");
+    let log = util::captured_log();
+    assert_eq!(
+        exactly(
+            &log,
+            "INFO ignoreip: home.example.net now resolves to 203.0.113.8 (was 203.0.113.7)"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    assert_eq!(
+        exactly(
+            &log,
+            "INFO 203.0.113.8: waiting ban dropped, 5 counted failed login(s) forgotten: the \
+             address is now what the ignoreip name home.example.net resolves to and is never \
+             banned"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    assert!(!h.engine.state().ledger.is_waiting(ip(NEXT_IP)));
+    // the router is back: nothing is banned for what was dropped
+    h.fake.lock().unwrap().router_unreachable = false;
+    h.cycle("10:05:30");
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    // the old address is exempt no more: its next failed logins are counted
+    // from nothing and banned; the new one is exempt
+    util::capture_log();
+    h.burst("10:06", HOME_IP, 5);
+    h.burst("10:06", NEXT_IP, 5);
+    h.cycle("10:07:00");
+    let log = util::captured_log();
+    assert_eq!(h.banned(), vec![ATTACKER, HOME_IP]);
+    assert_eq!(h.fails(NEXT_IP), 0);
+    assert_eq!(
+        exactly(
+            &log,
+            "INFO nvr1: failed login from 203.0.113.7 (user=\"admin\") at 2026-01-10T08:06:10Z \
+             [1/5]"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    assert_eq!(
+        exactly(
+            &log,
+            "INFO nvr1: failed login from 203.0.113.8 (user=\"admin\"): never banned (ignoreip \
+             name home.example.net), not counted"
+        ),
+        5,
+        "{:?}",
+        log
+    );
+}
+
+/// A resolver that fails at the start: the name exempts nothing, which the
+/// start says once, and no poll says it again. Once the name resolves (at
+/// its next look-up, 5 min after the first poll), its address is exempt
+/// and what was counted of it is forgotten.
+#[test]
+fn an_ignoreip_name_that_does_not_resolve_at_the_start_exempts_nothing_until_it_does() {
+    let mut h = Harness::build(Opts {
+        general: WITH_HOME,
+        own: ip(OWN),
+        ..Default::default()
+    });
+    util::capture_log();
+    h.engine.startup_names();
+    assert_eq!(
+        util::captured_log(),
+        vec![
+            "INFO ignoreip names, never banned: home.example.net not resolved",
+            "WARNING ignoreip: home.example.net does not resolve, so it exempts no address until \
+             it does; it is tried again every 5 min: cannot resolve home.example.net: no such \
+             name",
+        ]
+    );
+    h.tick(); // the first poll, at 10:00:00
+    h.burst("10:01", HOME_IP, 3);
+    h.cycle("10:02:00");
+    assert_eq!(h.fails(HOME_IP), 3);
+    h.own.set_name(HOME, Ok(vec![ip(HOME_IP)]));
+    h.cycle("10:04:59");
+    assert_eq!(h.fails(HOME_IP), 3);
+    h.cycle("10:05:00");
+    assert_eq!(h.fails(HOME_IP), 0);
+    let log = util::captured_log();
+    assert_eq!(
+        log.iter()
+            .filter(|l| l.contains("ignoreip"))
+            .collect::<Vec<_>>(),
+        vec![
+            "INFO ignoreip: home.example.net now resolves to 203.0.113.7 (was none)",
+            "INFO 203.0.113.7: 3 counted failed login(s) forgotten: the address is now what the \
+             ignoreip name home.example.net resolves to and is never banned",
+        ]
+    );
+    h.burst("10:06", HOME_IP, 5);
+    h.cycle("10:07:00");
+    assert_eq!(h.fails(HOME_IP), 0);
+    assert!(h.banned().is_empty());
+}
+
+/// `--check` prints what each name resolves to now, one line per name; a
+/// name that does not resolve is a failed check.
+#[test]
+fn check_prints_what_each_ignoreip_name_resolves_to() {
+    use hik_f2b::health::Status;
+    let h = Harness::build(Opts {
+        general: "ignoreip = 192.168.0.0/16, home.example.net, vpn.example.org",
+        own: ip(OWN),
+        names: &[(HOME, &[NEXT_IP, HOME_IP])],
+        ..Default::default()
+    });
+    let lines = h.check();
+    let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    assert_eq!(
+        text[1..],
+        [
+            "ok       nvr nvr1 log: order not known, page size not known (0 entries read from \
+             the last 24 h)",
+            "ok       firewall: 1 enabled rule(s) in /ip/firewall/raw with \
+             src-address-list=cctv_ban",
+            "ok       own addresses: router 127.0.0.1 from 192.0.2.200, nvr1 127.0.0.1 from \
+             192.0.2.200 (never banned)",
+            "ok       ignoreip home.example.net: resolves to 203.0.113.7 and 203.0.113.8 (never \
+             banned)",
+            "FAILED   ignoreip vpn.example.org: does not resolve, so it exempts no address: \
+             cannot resolve vpn.example.org: no such name",
+            "off      telegram: not configured",
+            "off      country database: not configured",
+        ],
+        "{:#?}",
+        text
+    );
+    assert!(
+        text[0].starts_with("ok       nvr nvr1: login accepted"),
+        "{}",
+        text[0]
+    );
+    assert_eq!(
+        lines.iter().filter(|l| l.status == Status::Failed).count(),
+        1
+    );
+    // without a name, no such line
+    let h = with_own(Opts::default());
+    assert!(!h.check().iter().any(|l| l.item.starts_with("ignoreip")));
+}
+
+/// An address that a name of `ignoreip` resolves to is not an own address:
+/// found in the address-list, it is not removed (hik-f2b removes a ban only
+/// for an own address, ADR 0005), the router is not even asked about it,
+/// and it never goes into the safe list.
+#[test]
+fn an_address_of_an_ignoreip_name_in_the_address_list_is_not_removed() {
+    let mut h = with_home(Opts {
+        mikrotik_extra: "safe_list = cctv_safe",
+        ..Default::default()
+    });
+    h.fake.lock().unwrap().bans.push(HOME_IP.to_string());
+    h.burst("10:01", HOME_IP, 6);
+    run(&mut h, 25, 30); // two firewall checks after the first
+    assert_eq!(h.banned(), vec![HOME_IP]);
+    assert_eq!(h.fails(HOME_IP), 0);
+    let f = h.fake.lock().unwrap();
+    assert!(f.delete_log.is_empty(), "{:?}", f.delete_log);
+    // every look-up in a list is for the own address: one in the
+    // address-list and one in the safe list per check
+    assert_eq!(f.lookups.len(), 6, "{:?}", f.lookups);
+    assert!(
+        f.lookups
+            .iter()
+            .all(|l| l.contains(&format!("&address={}&", OWN))),
+        "{:?}",
+        f.lookups
+    );
+    assert!(!f.safe_log.is_empty());
+    assert!(
+        f.safe_log.iter().all(|(_, address, _)| address == OWN),
+        "{:?}",
+        f.safe_log
+    );
+    assert!(f.listed.iter().all(|e| e.address == OWN), "{:?}", f.listed);
+}
+
+// --------------------------------------------------------------- safe list
+
+/// The requests of one firewall check that the router answers, without a
+/// safe list, as they were before the safe list existed: the drop rule in
+/// `raw`, and the look-up of the own address in the address-list.
+const CHECK_REQUESTS: [&str; 2] = [
+    "GET /rest/ip/firewall/raw?src-address-list=cctv_ban&.proplist=.id%2Cdisabled%2Cinvalid",
+    "GET /rest/ip/firewall/address-list?list=cctv_ban&address=192.0.2.200&.proplist=.id",
+];
+
+/// A harness with the safe list `cctv_safe`, its rule above the drop rule
+/// in `raw`, the own address `OWN`, and `general` in `[general]`; the
+/// engine has not checked or polled yet.
+fn with_safe_list(general: &'static str) -> Harness {
+    let h = Harness::build(Opts {
+        own: ip(OWN),
+        telegram: true,
+        general,
+        mikrotik_extra: "safe_list = cctv_safe",
+        ..Default::default()
+    });
+    h.fake.lock().unwrap().rules = vec![
+        Rule::accept("raw", "cctv_safe"),
+        Rule::new("raw", "cctv_ban", false),
+    ];
+    h
+}
+
+/// The requests that reached the router since the last call.
+fn requests(h: &Harness) -> Vec<String> {
+    std::mem::take(&mut h.fake.lock().unwrap().rest_log)
+}
+
+/// What was written to the safe list since the last call.
+fn safe_writes(h: &Harness) -> Vec<(String, String, &'static str)> {
+    std::mem::take(&mut h.fake.lock().unwrap().safe_log)
+}
+
+fn safe(outcome: &'static str) -> (String, String, &'static str) {
+    ("cctv_safe".to_string(), OWN.to_string(), outcome)
+}
+
+/// Without `safe_list`, a firewall check sends what it sent before the
+/// safe list existed, at startup and in a cycle, and nothing about another
+/// list.
+#[test]
+fn without_a_safe_list_no_request_is_added() {
+    let mut h = Harness::build(Opts {
+        own: ip(OWN),
+        ..Default::default()
+    });
+    assert!(h.engine.startup_check(h.host as u64));
+    assert_eq!(requests(&h), CHECK_REQUESTS);
+    // the first poll: the next check is due 300 s after the first
+    run(&mut h, 10, 30);
+    assert_eq!(requests(&h), CHECK_REQUESTS);
+    run(&mut h, 30, 30);
+    assert_eq!(
+        requests(&h),
+        [CHECK_REQUESTS, CHECK_REQUESTS, CHECK_REQUESTS].concat()
+    );
+    let f = h.fake.lock().unwrap();
+    assert!(f.safe_log.is_empty() && f.listed.is_empty());
+}
+
+/// The own address toward the router is written at startup, with a
+/// timeout of six firewall checks, and renewed at each check: four
+/// requests more per check.
+#[test]
+fn the_safe_list_is_written_at_startup_and_renewed_at_each_check() {
+    let mut h = with_safe_list("");
+    util::capture_log();
+    assert!(h.engine.startup_check(h.host as u64));
+    assert_eq!(
+        util::captured_log(),
+        vec![
+            "INFO firewall check ok: 1 enabled rule(s) in /ip/firewall/raw with \
+             src-address-list=cctv_ban",
+            "INFO safe list check ok: 1 enabled accept rule(s) in /ip/firewall/raw with \
+             src-address-list=cctv_safe before the drop rule for cctv_ban",
+            "INFO 192.0.2.200 added to the safe list cctv_safe for 00:30:00",
+        ]
+    );
+    let check = [
+        CHECK_REQUESTS[0],
+        "GET /rest/ip/firewall/raw?.proplist=.id",
+        "GET /rest/ip/firewall/raw?src-address-list=cctv_safe&.proplist=.id%2Cdisabled%2Cinvalid%2Caction",
+        "GET /rest/ip/firewall/address-list?list=cctv_safe&address=192.0.2.200&.proplist=.id%2Cdynamic%2Ctimeout",
+    ];
+    let added = [
+        &check[..],
+        &["PUT /rest/ip/firewall/address-list?", CHECK_REQUESTS[1]],
+    ]
+    .concat();
+    assert_eq!(requests(&h), added);
+    assert_eq!(safe_writes(&h), vec![safe("added")]);
+    {
+        let f = h.fake.lock().unwrap();
+        assert_eq!(
+            f.listed,
+            vec![Listed {
+                list: "cctv_safe".to_string(),
+                address: OWN.to_string(),
+                timeout: Some("00:30:00".to_string()),
+            }]
+        );
+        // nothing of it went to the address-list
+        assert!(f.ban_bodies.is_empty() && f.put_log.is_empty());
+    }
+    // the polls between two checks send nothing to the router
+    run(&mut h, 9, 30);
+    assert!(requests(&h).is_empty());
+    // the periodic check renews it
+    h.fake.lock().unwrap().listed[0].timeout = Some("00:25:00".to_string());
+    h.advance(30);
+    // the id of the entry, as the fake router makes it
+    let patch = format!(
+        "PATCH /rest/ip/firewall/address-list/*1{:08X}?",
+        u32::from(ip(OWN))
+    );
+    let renewed = [&check[..], &[patch.as_str(), CHECK_REQUESTS[1]]].concat();
+    assert_eq!(requests(&h), renewed);
+    assert_eq!(safe_writes(&h), vec![safe("renewed")]);
+    let f = h.fake.lock().unwrap();
+    assert_eq!(f.listed.len(), 1);
+    assert_eq!(f.listed[0].timeout.as_deref(), Some("00:30:00"));
+    drop(f);
+    assert!(h.engine.alerted_problems().is_empty());
+    assert!(telegram_texts(&h).is_empty());
+}
+
+/// An entry that is there already is renewed, never added a second time;
+/// one without a timeout (added by hand) is left as it is.
+#[test]
+fn an_existing_entry_is_renewed_not_duplicated() {
+    let mut h = with_safe_list("");
+    h.fake.lock().unwrap().listed.push(Listed {
+        list: "cctv_safe".to_string(),
+        address: OWN.to_string(),
+        timeout: Some("00:01:00".to_string()),
+    });
+    assert!(h.engine.startup_check(h.host as u64));
+    run(&mut h, 20, 30);
+    assert_eq!(safe_writes(&h), vec![safe("renewed"); 3]);
+    assert_eq!(h.fake.lock().unwrap().listed.len(), 1);
+    // static: no write at all
+    requests(&h);
+    h.fake.lock().unwrap().listed[0].timeout = None;
+    run(&mut h, 20, 30);
+    assert!(safe_writes(&h).is_empty());
+    let f = h.fake.lock().unwrap();
+    assert_eq!(f.listed.len(), 1);
+    assert_eq!(f.listed[0].timeout, None);
+    assert!(!f
+        .rest_log
+        .iter()
+        .any(|r| r.starts_with("PUT") || r.starts_with("PATCH")));
+}
+
+/// A new own address toward the router is written at the next check; the
+/// old entry is left to expire, not removed.
+#[test]
+fn a_new_own_address_is_written_and_the_old_one_left_to_expire() {
+    let mut h = with_safe_list("");
+    assert!(h.engine.startup_check(h.host as u64));
+    h.tick();
+    h.own.set_local(Ok(ip("192.0.2.201")));
+    run(&mut h, 9, 30);
+    util::capture_log();
+    h.advance(30);
+    let log = util::captured_log();
+    for line in [
+        "INFO 192.0.2.200 is no longer the own address toward the router: its entry in the safe \
+         list cctv_safe is left to expire",
+        "INFO 192.0.2.201 added to the safe list cctv_safe for 00:30:00",
+    ] {
+        assert_eq!(exactly(&log, line), 1, "{:?}", log);
+    }
+    let f = h.fake.lock().unwrap();
+    let listed: Vec<&str> = f.listed.iter().map(|e| e.address.as_str()).collect();
+    assert_eq!(listed, ["192.0.2.200", "192.0.2.201"]);
+    assert!(f.delete_log.is_empty());
+    drop(f);
+    // said once
+    util::capture_log();
+    run(&mut h, 10, 30);
+    assert_eq!(
+        starting(&util::captured_log(), "INFO 192.0.2.200 is no longer"),
+        0
+    );
+    let writes = safe_writes(&h);
+    assert_eq!(
+        writes.last(),
+        Some(&(
+            "cctv_safe".to_string(),
+            "192.0.2.201".to_string(),
+            "renewed"
+        ))
+    );
+}
+
+/// A write the router refuses is an ERROR at each check and the health
+/// problem `safe-list-refused`, which a write that works ends. A write that
+/// meets a router error is the firewall problem, as for a ban.
+#[test]
+fn a_refused_write_is_its_own_health_problem() {
+    let mut h = with_safe_list("alert_after = 60");
+    h.fake.lock().unwrap().refuse_writes = true;
+    util::capture_log();
+    assert!(h.engine.startup_check(h.host as u64));
+    let refused = "ERROR cannot write own address 192.0.2.200 to the safe list cctv_safe, will \
+                   retry at the next firewall check: refused: HTTP 400: {\"detail\":\"not enough \
+                   permissions (9)\",\"error\":400,\"message\":\"Bad Request\"}";
+    assert_eq!(exactly(&util::captured_log(), refused), 1);
+    run(&mut h, 10, 30);
+    let log = util::captured_log();
+    assert_eq!(exactly(&log, refused), 1, "{:?}", log);
+    assert_eq!(
+        exactly(
+            &log,
+            "ERROR health alert [safe-list-refused]: hik-f2b: the firewall refuses to write the \
+             own address to the safe list for 1 min: 192.0.2.200 cannot be written to cctv_safe: \
+             refused: HTTP 400: {\"detail\":\"not enough \
+             permissions (9)\",\"error\":400,\"message\":\"Bad Request\"}"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    assert_eq!(h.engine.alerted_problems(), vec!["safe-list-refused"]);
+    assert_eq!(safe_writes(&h), vec![safe("refused"); 2]);
+    // the write works
+    h.fake.lock().unwrap().refuse_writes = false;
+    run(&mut h, 10, 30);
+    assert_eq!(
+        exactly(
+            &util::captured_log(),
+            "INFO health recovered [safe-list-refused]: hik-f2b: the firewall writes the own \
+             address to the safe list again (after 10 min)"
+        ),
+        1
+    );
+    assert!(h.engine.alerted_problems().is_empty());
+    assert_eq!(h.fake.lock().unwrap().listed.len(), 1);
+    // a router error on the write: the firewall problem
+    h.fake.lock().unwrap().listed.clear();
+    h.fake.lock().unwrap().put_status = Some(500);
+    run(&mut h, 12, 30);
+    assert_eq!(h.engine.alerted_problems(), vec!["firewall"]);
+    h.fake.lock().unwrap().put_status = None;
+    run(&mut h, 10, 30);
+    assert!(h.engine.alerted_problems().is_empty());
+}
+
+/// The rule is missing: an ERROR at startup, a WARNING at each check, the
+/// health problem `safe-list-rule` after `alert_after`; the rule is added
+/// and the problem ends. The safe list is written either way.
+#[test]
+fn a_missing_safe_list_rule_is_a_problem_until_it_is_added() {
+    let mut h = with_safe_list("alert_after = 60");
+    h.fake.lock().unwrap().rules = vec![Rule::new("raw", "cctv_ban", false)];
+    let reason = "no rule in /ip/firewall/raw has src-address-list=cctv_safe: add one with \
+                  action=accept above the drop rule for cctv_ban, in the same table";
+    util::capture_log();
+    assert!(h.engine.startup_check(h.host as u64));
+    let log = util::captured_log();
+    assert_eq!(
+        exactly(&log, &format!("ERROR safe list check failed: {}", reason)),
+        1,
+        "{:?}",
+        log
+    );
+    assert_eq!(safe_writes(&h), vec![safe("added")]);
+    run(&mut h, 10, 30);
+    let log = util::captured_log();
+    assert_eq!(
+        exactly(&log, &format!("WARNING safe list check failed: {}", reason)),
+        1,
+        "{:?}",
+        log
+    );
+    assert_eq!(h.engine.alerted_problems(), vec!["safe-list-rule"]);
+    let texts = telegram_texts(&h);
+    assert_eq!(
+        texts,
+        vec![format!(
+            "{}the safe list does not keep the own address from being blocked for 1 min: {}",
+            WARN, reason
+        )]
+    );
+    // the operator adds the rule above the drop rule
+    h.fake
+        .lock()
+        .unwrap()
+        .rules
+        .insert(0, Rule::accept("raw", "cctv_safe"));
+    run(&mut h, 10, 30);
+    assert!(h.engine.alerted_problems().is_empty());
+    assert_eq!(
+        telegram_texts(&h)[1],
+        format!(
+            "{}the safe list keeps the own address from being blocked again (after 10 min)",
+            OK
+        )
+    );
+}
+
+/// The rule check on the router's answers, in every case: the rule must
+/// be in the table of the first usable drop rule, enabled, valid, with the
+/// action `accept`, and come before that drop rule in the table's order,
+/// whatever its id.
+#[test]
+fn the_safe_list_rule_check_in_every_case() {
+    let h = with_safe_list("");
+    let check = |rules: Vec<Rule>| {
+        h.fake.lock().unwrap().rules = rules;
+        let checked = h.router().check_with_safe_list().unwrap();
+        assert_eq!(
+            checked.found.split(" with ").next(),
+            Some(
+                if h.fake
+                    .lock()
+                    .unwrap()
+                    .rules
+                    .iter()
+                    .any(|r| r.table == "raw" && r.list == "cctv_ban" && !r.disabled)
+                {
+                    "1 enabled rule(s) in /ip/firewall/raw"
+                } else {
+                    "1 enabled rule(s) in /ip/firewall/filter"
+                }
+            )
+        );
+        checked.safe_rule.unwrap()
+    };
+    let drop_raw = || Rule::new("raw", "cctv_ban", false);
+    let drop_filter = || Rule::new("filter", "cctv_ban", false);
+    let accept = |t| Rule::accept(t, "cctv_safe");
+    let ok_raw = Ok(
+        "1 enabled accept rule(s) in /ip/firewall/raw with src-address-list=cctv_safe \
+                     before the drop rule for cctv_ban"
+            .to_string(),
+    );
+    let counts = |table: &str, what: &str, fix: &str| {
+        Err(format!(
+            "no rule in /ip/firewall/{} with src-address-list=cctv_safe counts ({}): {}",
+            table, what, fix
+        ))
+    };
+    let missing = |table: &str| {
+        Err(format!(
+            "no rule in /ip/firewall/{} has src-address-list=cctv_safe: add one with \
+             action=accept above the drop rule for cctv_ban, in the same table",
+            table
+        ))
+    };
+    // before the drop rule
+    assert_eq!(check(vec![accept("raw"), drop_raw()]), ok_raw);
+    // missing
+    assert_eq!(check(vec![drop_raw()]), missing("raw"));
+    // disabled
+    let disabled = Rule {
+        disabled: true,
+        ..accept("raw")
+    };
+    assert_eq!(
+        check(vec![disabled, drop_raw()]),
+        counts("raw", "1 disabled", "enable it")
+    );
+    // invalid
+    let invalid = Rule {
+        invalid: true,
+        ..accept("raw")
+    };
+    assert_eq!(
+        check(vec![invalid, drop_raw()]),
+        counts("raw", "1 invalid", "make it valid")
+    );
+    // another action
+    assert_eq!(
+        check(vec![Rule::new("raw", "cctv_safe", false), drop_raw()]),
+        counts("raw", "1 with another action", "set action=accept")
+    );
+    // after the drop rule
+    assert_eq!(
+        check(vec![drop_raw(), accept("raw")]),
+        counts(
+            "raw",
+            "1 after the drop rule",
+            "move it above the drop rule"
+        )
+    );
+    // in the other table
+    assert_eq!(check(vec![accept("filter"), drop_raw()]), missing("raw"));
+    assert_eq!(check(vec![accept("raw"), drop_filter()]), missing("filter"));
+    // in filter, where the drop rule is
+    assert_eq!(
+        check(vec![accept("filter"), drop_filter()]),
+        Ok("1 enabled accept rule(s) in /ip/firewall/filter with \
+            src-address-list=cctv_safe before the drop rule for cctv_ban"
+            .to_string())
+    );
+    // the order counts, not the ids: RouterOS keeps the id of a moved rule
+    assert_eq!(
+        check(vec![accept("raw").with_id(0x20), drop_raw().with_id(0x3)]),
+        ok_raw
+    );
+    assert_eq!(
+        check(vec![drop_raw().with_id(0x20), accept("raw").with_id(0x3)]),
+        counts(
+            "raw",
+            "1 after the drop rule",
+            "move it above the drop rule"
+        )
+    );
+    // before the first usable drop rule, a disabled one before it does not
+    // count
+    let off = Rule::new("raw", "cctv_ban", true);
+    assert_eq!(check(vec![off, accept("raw"), drop_raw()]), ok_raw);
+    // one good rule is enough, the others are not named
+    let disabled = Rule {
+        disabled: true,
+        ..accept("raw")
+    };
+    assert_eq!(check(vec![disabled, accept("raw"), drop_raw()]), ok_raw);
+    // several reasons
+    let disabled = Rule {
+        disabled: true,
+        ..accept("raw")
+    };
+    assert_eq!(
+        check(vec![disabled, drop_raw(), accept("raw")]),
+        counts(
+            "raw",
+            "1 disabled, 1 after the drop rule",
+            "enable it, move it above the drop rule"
+        )
+    );
+    // with the rule check off, the rule is not looked at
+    let h = Harness::build(Opts {
+        mikrotik_extra: "safe_list = cctv_safe\ncheck_rule = false",
+        ..Default::default()
+    });
+    assert_eq!(h.router().check_with_safe_list().unwrap().safe_rule, None);
+    assert_eq!(h.fake.lock().unwrap().rule_queries.len(), 0);
+    // and without a safe list, neither
+    let h = Harness::build(Opts::default());
+    assert_eq!(h.router().check_with_safe_list().unwrap().safe_rule, None);
+    assert_eq!(h.fake.lock().unwrap().rule_queries.len(), 1);
+}
+
+/// A dry run writes nothing to the safe list and says once what it would
+/// do; the rule is still checked.
+#[test]
+fn a_dry_run_writes_nothing_to_the_safe_list() {
+    let mut h = with_safe_list("dry_run = true");
+    util::capture_log();
+    assert!(h.engine.startup_check(h.host as u64));
+    run(&mut h, 40, 30);
+    h.restart();
+    assert!(h.engine.startup_check(h.host as u64));
+    let log = util::captured_log();
+    assert_eq!(
+        exactly(
+            &log,
+            "INFO DRY RUN: would keep 192.0.2.200 in the safe list cctv_safe for 00:30:00, \
+             renewed at every firewall check"
+        ),
+        2,
+        "once per start: {:?}",
+        log
+    );
+    assert_eq!(
+        starting(&log, "INFO safe list check ok: "),
+        2,
+        "at the starts; the periodic ones are DEBUG"
+    );
+    let f = h.fake.lock().unwrap();
+    assert!(f.safe_log.is_empty() && f.listed.is_empty());
+    assert!(!f.rest_log.iter().any(|r| r.contains("cctv_safe&address")
+        || r.starts_with("PUT")
+        || r.starts_with("PATCH")));
+}
+
+/// `--check` prints one line for the safe list, after the firewall's, and
+/// changes nothing on the router.
+#[test]
+fn check_prints_the_safe_list() {
+    use hik_f2b::health::Status;
+    let mut h = with_safe_list("");
+    let line = |h: &Harness| {
+        h.check()
+            .into_iter()
+            .find(|l| l.item == "safe list")
+            .unwrap()
+    };
+    let items: Vec<String> = h.check().into_iter().map(|l| l.item).collect();
+    assert_eq!(
+        items,
+        [
+            "nvr nvr1",
+            "nvr nvr1 log",
+            "firewall",
+            "safe list",
+            "own addresses",
+            "telegram",
+            "country database"
+        ]
+    );
+    let rule = "1 enabled accept rule(s) in /ip/firewall/raw with src-address-list=cctv_safe \
+                before the drop rule for cctv_ban";
+    assert_eq!(
+        line(&h).to_string(),
+        format!(
+            "ok       safe list: {}; 192.0.2.200 is not in cctv_safe (the service writes it at \
+             every firewall check)",
+            rule
+        )
+    );
+    assert!(safe_writes(&h).is_empty());
+    assert!(h.engine.startup_check(h.host as u64));
+    // what the service wrote; --check writes nothing from here on
+    assert_eq!(safe_writes(&h), vec![safe("added")]);
+    requests(&h);
+    assert_eq!(
+        line(&h).to_string(),
+        format!("ok       safe list: {}; 192.0.2.200 is in cctv_safe", rule)
+    );
+    h.fake.lock().unwrap().listed[0].timeout = None;
+    assert_eq!(
+        line(&h).to_string(),
+        format!(
+            "ok       safe list: {}; 192.0.2.200 is in cctv_safe without a timeout",
+            rule
+        )
+    );
+    // the rule is missing
+    h.fake.lock().unwrap().rules = vec![Rule::new("raw", "cctv_ban", false)];
+    let l = line(&h);
+    assert_eq!(l.status, Status::Failed);
+    assert_eq!(
+        l.to_string(),
+        "FAILED   safe list: no rule in /ip/firewall/raw has src-address-list=cctv_safe: add one \
+         with action=accept above the drop rule for cctv_ban, in the same table; 192.0.2.200 is \
+         in cctv_safe without a timeout"
+    );
+    // no drop rule: the rule cannot be placed
+    h.fake.lock().unwrap().rules = vec![];
+    assert_eq!(
+        line(&h).to_string(),
+        "FAILED   safe list: not checked: the firewall check failed; 192.0.2.200 is in cctv_safe \
+         without a timeout"
+    );
+    // the router cannot be used
+    h.fake.lock().unwrap().router_unreachable = true;
+    assert_eq!(
+        line(&h).to_string(),
+        "FAILED   safe list: not checked: the firewall check failed"
+    );
+    h.fake.lock().unwrap().router_unreachable = false;
+    // the address toward the router is not known (loopback)
+    h.own.set_local(Ok(std::net::Ipv4Addr::LOCALHOST));
+    h.fake.lock().unwrap().rules = vec![
+        Rule::accept("raw", "cctv_safe"),
+        Rule::new("raw", "cctv_ban", false),
+    ];
+    assert_eq!(
+        line(&h).to_string(),
+        format!(
+            "ok       safe list: {}; the own address toward the router is not known",
+            rule
+        )
+    );
+    // with the rule check off
+    h.ini = h.ini.replace(
+        "safe_list = cctv_safe",
+        "safe_list = cctv_safe\ncheck_rule = false",
+    );
+    h.own.set_local(Ok(ip(OWN)));
+    assert_eq!(
+        line(&h).to_string(),
+        "ok       safe list: rule check is off; 192.0.2.200 is in cctv_safe without a timeout"
+    );
+    // nothing was written by any of these
+    assert!(safe_writes(&h).is_empty());
+    assert!(!requests(&h)
+        .iter()
+        .any(|r| r.starts_with("PUT") || r.starts_with("PATCH") || r.starts_with("DELETE")));
+    // the command itself prints the line in its place
+    let (_, stdout, _) = hik_f2b(&h, &h.ini, &["--check"]);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(
+        lines[2].starts_with("ok       firewall: ") && lines[4].starts_with("ok       own "),
+        "{}",
+        stdout
+    );
+    // the operating system reaches the fakes from loopback
+    assert_eq!(
+        lines[3],
+        "ok       safe list: rule check is off; the own address toward the router is not known"
+    );
+}
+
 // ------------------------------------------------------------------ --check
 
 #[test]
@@ -3106,6 +4415,7 @@ fn check_command_reports_each_item_and_changes_nothing() {
             ("nvr nvr1 log".to_string(), Status::Ok),
             ("nvr nvr2".to_string(), Status::Failed),
             ("firewall".to_string(), Status::Ok),
+            ("own addresses".to_string(), Status::Ok),
             ("telegram".to_string(), Status::Ok),
             ("country database".to_string(), Status::Off),
         ]
@@ -3152,7 +4462,10 @@ fn check_command_reports_each_item_and_changes_nothing() {
     let lines = h.check();
     assert_eq!(lines[2].item, "firewall");
     assert_eq!(lines[2].status, Status::Off);
-    assert_eq!(lines[3].status, Status::Off);
+    // the own addresses are found in notify-only mode too
+    assert_eq!(lines[3].item, "own addresses");
+    assert_eq!(lines[3].status, Status::Ok);
+    assert_eq!(lines[4].status, Status::Off);
     assert_eq!(h.fake.lock().unwrap().router_requests, 0);
 }
 
@@ -3730,6 +5043,8 @@ fn check_prints_one_line_per_item() {
              FAILED   nvr nvr2: login rejected (HTTP 401)\n\
              ok       firewall: 1 enabled rule(s) in /ip/firewall/raw with \
              src-address-list=cctv_ban\n\
+             ok       own addresses: router 127.0.0.1 from 127.0.0.1, nvr1 127.0.0.1 from \
+             127.0.0.1, nvr2 127.0.0.1 from 127.0.0.1 (never banned)\n\
              ok       telegram: configured, health alerts on; nothing sent (see --test-notify)\n\
              off      country database: not configured\n",
             util::fmt_ts(start + SKEW),
@@ -3756,7 +5071,7 @@ fn check_prints_one_line_per_item() {
     let (code, stdout, stderr) = hik_f2b(&h, &h.ini, &["--check"]);
     assert_eq!((code, stderr.as_str()), (Some(0), ""));
     let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines.len(), 5, "{}", stdout);
+    assert_eq!(lines.len(), 6, "{}", stdout);
     assert!(
         lines[0]
             .starts_with("ok       nvr nvr1: login accepted, device time 2026-01-10T10:00:00Z ("),
@@ -3774,6 +5089,7 @@ fn check_prints_one_line_per_item() {
             "ok       nvr nvr1 log: order not known, page size not known (0 entries read from \
              the last 24 h)",
             "off      firewall: not configured (notify-only mode)",
+            "ok       own addresses: nvr1 127.0.0.1 from 127.0.0.1 (never banned)",
             "off      telegram: not configured",
             "off      country database: not configured",
         ]
@@ -3833,6 +5149,28 @@ fn test_ban_prints_what_the_router_did() {
                 .to_string()
         )
     );
+}
+
+/// `--test-ban` refuses an own address, as the service never bans one: it
+/// says why, exits non-zero and sends nothing to the router. The command
+/// asks the operating system, which reaches the fakes from loopback.
+#[test]
+fn test_ban_refuses_an_own_address() {
+    let h = Harness::build(Opts::default());
+    assert_eq!(
+        hik_f2b(&h, &h.ini, &["--test-ban", "127.0.0.1"]),
+        (
+            Some(1),
+            String::new(),
+            "hik-f2b: --test-ban 127.0.0.1: that is an own address of hik-f2b (router 127.0.0.1 \
+             from 127.0.0.1, nvr1 127.0.0.1 from 127.0.0.1), and hik-f2b never bans its own \
+             addresses; nothing was sent to the router\n"
+                .to_string()
+        )
+    );
+    let f = h.fake.lock().unwrap();
+    assert_eq!(f.rest_requests, 0);
+    assert!(f.bans.is_empty() && f.put_log.is_empty());
 }
 
 /// What `--test-notify` prints and sends, exactly.

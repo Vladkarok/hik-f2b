@@ -1,11 +1,13 @@
 //! `--check`: every health check once, on clients of its own. It only
 //! reads: nothing is banned, sent or remembered, and no engine is involved.
 
-use crate::action::Firewall;
+use crate::action::{Checked, Firewall, HealthError, SafeEntry};
 use crate::config::Config;
 use crate::country;
 use crate::health::{CheckLine, Status};
+use crate::ignored::IgnoredNames;
 use crate::nvr::{Nvr, NvrError, Search};
+use crate::own::OwnAddresses;
 use crate::util::{self, host_i64};
 use std::net::Ipv4Addr;
 
@@ -54,13 +56,105 @@ fn describe_log(search: &Search) -> String {
     out
 }
 
+/// The line of the safe list `list`: its rule, as the firewall check
+/// `checked` found it, and whether each own address toward the router is
+/// in it. Only reads, like the rest of `--check`: the entry is written by
+/// the service.
+fn safe_list_line(
+    fw: &dyn Firewall,
+    list: &str,
+    checked: &Result<Checked, HealthError>,
+    own: &OwnAddresses,
+) -> CheckLine {
+    let (mut failed, rule) = match checked {
+        Err(_) => (true, "not checked: the firewall check failed".to_string()),
+        Ok(Checked {
+            safe_rule: Some(Ok(found)),
+            ..
+        }) => (false, found.clone()),
+        Ok(Checked {
+            safe_rule: Some(Err(e)),
+            ..
+        }) => (true, e.clone()),
+        Ok(Checked {
+            safe_rule: None, ..
+        }) => (false, "rule check is off".to_string()),
+    };
+    let mut parts = vec![rule];
+    let toward = own.toward_router();
+    if matches!(checked, Err(HealthError::Unusable(_))) {
+        // The router cannot be used: asking it again would only fail again.
+    } else if toward.is_empty() {
+        parts.push("the own address toward the router is not known".to_string());
+    } else {
+        for ip in toward {
+            parts.push(match fw.safe_entry(ip) {
+                Ok(Some(SafeEntry { timed: true, .. })) => format!("{} is in {}", ip, list),
+                Ok(Some(SafeEntry { timed: false, .. })) => {
+                    format!("{} is in {} without a timeout", ip, list)
+                }
+                Ok(None) => format!(
+                    "{} is not in {} (the service writes it at every firewall check)",
+                    ip, list
+                ),
+                Err(e) => {
+                    failed = true;
+                    format!("cannot ask whether {} is in {}: {}", ip, list, e)
+                }
+            });
+        }
+    }
+    CheckLine {
+        item: "safe list".to_string(),
+        status: if failed { Status::Failed } else { Status::Ok },
+        detail: parts.join("; "),
+    }
+}
+
+/// One line per host name of `ignoreip`: what it resolves to now. A name
+/// that does not resolve is a failed check: the operator wrote it to keep
+/// an address from being banned, and it keeps none.
+fn ignored_lines(ignored: &IgnoredNames) -> Vec<CheckLine> {
+    ignored
+        .each()
+        .map(|(name, known, error)| {
+            let (status, detail) = match error {
+                None => (
+                    Status::Ok,
+                    format!(
+                        "resolves to {} (never banned)",
+                        known
+                            .iter()
+                            .map(|ip| ip.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" and ")
+                    ),
+                ),
+                Some(e) => (
+                    Status::Failed,
+                    format!("does not resolve, so it exempts no address: {}", e),
+                ),
+            };
+            CheckLine {
+                item: format!("ignoreip {}", name),
+                status,
+                detail,
+            }
+        })
+        .collect()
+}
+
 /// `--check`: every health check once, with the NVR clients `nvrs` (one per
-/// `cfg.nvrs`, in that order) and the firewall, if there is one. Nothing
-/// is sent. `host_now` is the host's Unix time.
+/// `cfg.nvrs`, in that order) and the firewall, if there is one, the own
+/// addresses as `own` found them and the host names of `ignoreip` as
+/// `ignored` resolved them. Nothing is sent. `host_now` is the host's Unix
+/// time.
 pub fn check_all(
     cfg: &Config,
     nvrs: &mut [Nvr],
     firewall: Option<&dyn Firewall>,
+    own: &OwnAddresses,
+    ignored: &IgnoredNames,
     host_now: u64,
 ) -> Vec<CheckLine> {
     let mut out = Vec::new();
@@ -104,18 +198,42 @@ pub fn check_all(
             });
         }
     }
-    let (status, detail) = match firewall {
+    let checked = firewall.map(|fw| fw.check_with_safe_list());
+    let (status, detail) = match &checked {
         None => (Status::Off, "not configured (notify-only mode)".to_string()),
-        Some(fw) => match fw.check() {
-            Ok(found) => (Status::Ok, found),
-            Err(e) => (Status::Failed, e.to_string()),
-        },
+        Some(Ok(checked)) => (Status::Ok, checked.found.clone()),
+        Some(Err(e)) => (Status::Failed, e.to_string()),
     };
     out.push(CheckLine {
         item: "firewall".to_string(),
         status,
         detail,
     });
+    if let (Some(fw), Some(checked)) = (firewall, &checked) {
+        if let Some(list) = fw.safe_list() {
+            out.push(safe_list_line(fw, &list, checked, own));
+        }
+    }
+    // A look-up that failed leaves an address unprotected.
+    let failures = own.failures();
+    let (status, detail) = if failures.is_empty() {
+        (Status::Ok, format!("{} (never banned)", own.describe()))
+    } else {
+        (
+            Status::Failed,
+            format!(
+                "{}; look-up failed: {}",
+                own.describe(),
+                failures.join("; ")
+            ),
+        )
+    };
+    out.push(CheckLine {
+        item: "own addresses".to_string(),
+        status,
+        detail,
+    });
+    out.extend(ignored_lines(ignored));
     let (status, detail) = match &cfg.telegram {
         None => (Status::Off, "not configured".to_string()),
         Some(t) => (

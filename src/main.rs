@@ -6,8 +6,10 @@ use hik_f2b::config::{self, Config};
 use hik_f2b::country;
 use hik_f2b::engine::Engine;
 use hik_f2b::health::Status;
+use hik_f2b::ignored::IgnoredNames;
 use hik_f2b::mikrotik::Mikrotik;
 use hik_f2b::nvr::Nvr;
+use hik_f2b::own::{OwnAddresses, System};
 use hik_f2b::state::State;
 use hik_f2b::telegram::Telegram;
 use hik_f2b::{info, util, warn};
@@ -35,9 +37,9 @@ usage: hik-f2b [options]
       --test-notify   send a test Telegram message and exit
       --country IP    print the country of IP from country_db and exit
                       (contacts nothing; non-zero if the file cannot be read)
-      --check         check every NVR, the firewall and its drop rule and
-                      the country database once, print the results and
-                      exit (non-zero if any failed)
+      --check         check every NVR, the firewall and its drop rule, the
+                      own addresses and the country database once, print
+                      the results and exit (non-zero if any failed)
   -v, --verbose       more logging
       --version       print the version and exit
   -h, --help          this text
@@ -246,10 +248,14 @@ fn one_shot(
     telegram: Option<&Telegram>,
 ) -> Result<(), String> {
     if args.check {
+        let own = OwnAddresses::new(cfg, Box::new(System));
+        let ignored = IgnoredNames::new(cfg, Box::new(System));
         let lines = check::check_all(
             cfg,
             nvrs,
             mikrotik.map(|m| m as &dyn Firewall),
+            &own,
+            &ignored,
             util::unix_now(),
         );
         for line in &lines {
@@ -280,6 +286,16 @@ fn one_shot(
             "--test-ban needs a firewall, but there is no [mikrotik] section in the config"
                 .to_string()
         })?;
+        // As in the service: an own address is never banned (ADR 0004).
+        let own = OwnAddresses::new(cfg, Box::new(System));
+        if own.set().contains(&ip) {
+            return Err(format!(
+                "--test-ban {}: that is an own address of hik-f2b ({}), and hik-f2b never bans \
+                 its own addresses; nothing was sent to the router",
+                ip,
+                own.describe()
+            ));
+        }
         let added = firewall
             .ban(ip, BanTime::Seconds(60), "hik-f2b test")
             .map_err(|e| e.to_string())?;
@@ -411,7 +427,9 @@ fn run() -> Result<(), String> {
     };
     let firewall = mikrotik.map(|m| Box::new(m) as Box<dyn Firewall>);
     let notifier = telegram.map(|t| Box::new(t) as Box<dyn Notifier>);
-    let mut engine = Engine::new(cfg, state, firewall, notifier)?;
+    let own = OwnAddresses::new(&cfg, Box::new(System));
+    let ignored = IgnoredNames::new(&cfg, Box::new(System));
+    let mut engine = Engine::new(cfg, state, firewall, notifier, own, ignored)?;
 
     // A stop takes effect between the steps of a cycle (see
     // `Engine::cycle_at`); the state is saved before hik-f2b exits.
@@ -421,6 +439,8 @@ fn run() -> Result<(), String> {
             .map_err(|e| format!("cannot install signal handler: {}", e))?;
     }
 
+    engine.startup_own();
+    engine.startup_names();
     engine.startup_country();
     // Also in a dry run: that is when the setup is being checked. The size
     // of the address-list is asked only of a router that answered it, so an

@@ -30,6 +30,29 @@
 //!   DST on an NVR that cannot be reached for an hour while failed logins
 //!   are logged (they are read only after the step).
 //!
+//! Every class also has failed logins from the host's own address (`OWN`,
+//! the address the harness reaches every device from): with hik-f2b's user
+//! name, as after its NVR password was changed, or with another one, as a
+//! forged entry would have. In the classes with a router, `OWN` is also put
+//! into the address-list by an outside hand now and then.
+//!
+//! In the classes with a router, half of the scenarios have the safe list
+//! `SAFE` (`safe_list`), four in five of them with its accept rule above the
+//! drop rule. Whether a scenario has them is drawn from a generator of its
+//! own, so a seed gives the same events with and without them. The fake
+//! router expires an entry of the safe list when its timeout has passed.
+//!
+//! Half of the scenarios, in every class, have the host name `NAME` in
+//! `ignoreip`, whose fixed answer (`own::Fixed`) gives one or both of the
+//! addresses `NAMED`, no IPv4 address, or a failed look-up, and changes now
+//! and then during the scenario. Those scenarios also have failed logins from
+//! the `NAMED` addresses and, with a router, those addresses put into the
+//! address-list by hand. Whether a scenario has the name, and all of these
+//! events, are drawn from a generator of their own, so a seed gives the same
+//! other events with and without it. The model learns what the name
+//! resolves to for the engine from the look-ups that reach the fixed
+//! answers, as the fake router shows what the engine asked of it.
+//!
 //! Every scenario starts with failed logins already in the logs (some within
 //! `lookback` before the first start), may start with an NVR unreachable, and
 //! ends with a settle phase: router and NVRs back, then polls until no ban is
@@ -39,8 +62,10 @@
 //!
 //! - `safety/exempt` (all): no ban request, report, ban notification or
 //!   counted failed login for an address that is exempt (`ignoreip` in force
-//!   at that moment, or a range that is never banned). Exemption is computed
-//!   here, not by the engine.
+//!   at that moment, a range that is never banned, or the own address `OWN`).
+//!   Exemption is computed here, not by the engine.
+//! - `own/other` (all): only `OWN` is ever said to be an own address of
+//!   hik-f2b: no address read from a log becomes one.
 //! - `safety/maxretry` (all): every ban request or report for an address is
 //!   backed by `maxretry` failed logins of it, logged after its NVR's first
 //!   start, within a `findtime` span (true host time, from the generated
@@ -91,12 +116,65 @@
 //!   one for a permanent ban.
 //! - `notify` (all): one ban notification for each ban and report, none for
 //!   an address that is already listed.
+//! - `own/removed` (`Firewall`, `Backlog`, `Clock`): after each firewall
+//!   check that the router answers (at an engine start, and the periodic one
+//!   in a cycle), `OWN` is not in the address-list if the router accepts
+//!   writes, and each removal is one WARNING. While the router refuses
+//!   writes it stays listed, with an ERROR at each such check. `own/kept`
+//!   (`DryRun`): `OWN` is never removed, and a check that finds it listed
+//!   reports it (a WARNING), once while it stays listed. `own/notify` (all
+//!   with a router): one notification at once for each removal, and one for
+//!   each stretch in which `OWN` stays listed after a check that answered
+//!   (dry run, or refused), sent at the end of the cycle (or of the first
+//!   cycle after an engine start); none else. No other request about `OWN`
+//!   fails while the router answers its checks. `own/only` (all): every
+//!   request to remove an address-list entry is for `OWN`, and the router
+//!   removes one only where a removal is logged.
+//! - `safe/only` (all with a router): every write to the safe list is for
+//!   `OWN`, to `SAFE`, and the safe list never holds anything else.
+//!   `safe/off` (all): without `safe_list`, no write to any list but the
+//!   address-list, no request that names another list or reads a whole
+//!   table of rules, no `PATCH`, and no line about a safe list.
+//!   `safe/dry` (`DryRun`): nothing is written to the safe list, and the
+//!   first check that the router answers after each engine start says what
+//!   it would write (one line), no later one. `safe/kept` (`Firewall`,
+//!   `Backlog`, `Clock`): at each firewall check that the router answers,
+//!   one write for `OWN`: an entry that is there is renewed, one that is
+//!   not is added (never a duplicate); while the router refuses writes, it
+//!   is refused with an ERROR. After a check that the router answers and
+//!   that is not refused, `OWN` has one entry, with a timeout that outlives
+//!   three checks. No write in a check that the router does not answer,
+//!   and none between checks. The rule check fails (one line) at each such
+//!   check exactly when the scenario has no accept rule.
+//! - `name/exempt` (all): no ban request, report, ban notification or
+//!   counted failed login for an address while the name resolves to it for
+//!   the engine running now: what the last look-up of that engine that found
+//!   an IPv4 address answered. `name/line` (all): a failed login said to be
+//!   exempt for an `ignoreip` name, and a waiting ban or counted failed
+//!   logins dropped for one, are of such an address and name `NAME`; without
+//!   the name, no line names an `ignoreip` name. `name/kept` (all with a
+//!   router): an address the name resolves to, or once did, that is in the
+//!   address-list before a cycle or an engine start is still there after it:
+//!   hik-f2b removes nothing for it. `name/interval` (all with the name):
+//!   the name is looked up once at each engine start, not at the first poll
+//!   after it, and then exactly at the first poll `RESOLVE_EVERY` or more
+//!   after the last look-up (the first poll for the one at the start).
+//!   `name/log` (all with the name): the start of an engine says what the
+//!   name resolves to (one line) and, if it does not resolve, a WARNING;
+//!   a look-up that changes what it resolves to is one INFO line with the new
+//!   and old addresses, the first that fails after one that worked is one
+//!   WARNING, the first that works after failures and changes nothing is one
+//!   INFO line, and no other line is about the name.
 //! - `health/model` (all): the health notices of each cycle are exactly the
 //!   ones the documented policy gives for what the engine observed (failed
 //!   and successful polls, ban attempts, firewall checks, the rate limit,
 //!   listed addresses that still reach an NVR well after their ban, which
 //!   is over once none has for `alert_after` while every NVR is read; none
-//!   is such an address within `STARTUP_GRACE` after an engine start):
+//!   is such an address within `STARTUP_GRACE` after an engine start; an own
+//!   address that a check that answered finds listed and cannot remove,
+//!   which is over at the first such check that leaves none listed; with
+//!   the safe list, the missing rule at each check that answered, and a
+//!   write the router refuses, which only a write that works ends):
 //!   alert once after `alert_after`, reminder after 24 h, one recovery or
 //!   "unknown" when an alerted problem ends, nothing for a short one, state
 //!   lost on restart. `health/condition` (all): an unreachable firewall is
@@ -133,6 +211,7 @@ mod fake;
 
 use fake::{Entry, Fake, Harness, Opts, SKEW};
 use hik_f2b::ledger::Ledger;
+use hik_f2b::names::RESOLVE_EVERY;
 use hik_f2b::reader::{CLOCK_JUMP, MAX_SEEN};
 use hik_f2b::state::State;
 use hik_f2b::util;
@@ -182,6 +261,20 @@ const OCCASIONAL: [&str; 3] = ["198.51.100.20", "192.0.2.30", "203.0.113.60"];
 const OWNERS: [&str; 3] = ["203.0.113.17", "203.0.113.18", "203.0.113.21"];
 const PRIVATE: [&str; 4] = ["192.168.1.50", "10.0.0.7", "172.16.0.9", "127.0.0.1"];
 const USERS: [&str; 4] = ["admin", "illegal usernam", "", "user1"];
+/// The address the host reaches its devices from (`own::Fixed`): an own
+/// address, which no other part of a scenario uses.
+const OWN: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 200);
+const OWN_TEXT: &str = "192.0.2.200";
+/// The user name hik-f2b logs in with (`support/fake.rs`).
+const OWN_USER: &str = "f2b";
+/// The safe list of the scenarios that have one.
+const SAFE: &str = "cctv_safe";
+/// The host name in `ignoreip` of the scenarios that have one, and the
+/// addresses its answers give, which no other part of a scenario uses.
+const NAME: &str = "home.example.net";
+const NAMED: [&str; 2] = ["203.0.113.80", "203.0.113.81"];
+/// The interval of the periodic firewall check (`health::HEALTH_CHECK_INTERVAL`).
+const CHECK_EVERY: i64 = 300;
 const FAIL: &str = "illlegealAccess";
 const OTHER: &str = "videoLost/30";
 const NOTICES: [(&str, &str); 4] = [
@@ -294,7 +387,7 @@ impl Params {
         matches!(self.class, Class::DryRun | Class::NotifyOnly)
     }
 
-    fn general(&self, nets: &[String]) -> String {
+    fn general(&self, nets: &[String], name: bool) -> String {
         let bantime = match self.bantime {
             Some(s) => s.to_string(),
             None => "permanent".to_string(),
@@ -314,7 +407,7 @@ impl Params {
             self.alert_after,
             self.max_per_hour,
             dry,
-            ignore_line(nets)
+            ignore_line(nets, name)
         )
     }
 
@@ -337,8 +430,47 @@ impl Params {
     }
 }
 
-fn ignore_line(nets: &[String]) -> String {
-    format!("ignoreip = {}", nets.join(", "))
+/// The `ignoreip` line: the networks `nets` and, with `name`, `NAME`.
+fn ignore_line(nets: &[String], name: bool) -> String {
+    let mut items = nets.to_vec();
+    if name {
+        items.push(NAME.to_string());
+    }
+    format!("ignoreip = {}", items.join(", "))
+}
+
+/// An answer for `NAME`: one or both of `NAMED`, no IPv4 address, or a
+/// failed look-up.
+fn draw_answer(rng: &mut Rng) -> Result<Vec<Ipv4Addr>, String> {
+    let a: Ipv4Addr = NAMED[0].parse().unwrap();
+    let b: Ipv4Addr = NAMED[1].parse().unwrap();
+    match rng.below(10) {
+        0..=2 => Ok(vec![a]),
+        3..=5 => Ok(vec![b]),
+        6 => Ok(vec![b, a]),
+        7 => Ok(vec![]),
+        _ => Err(format!("cannot resolve {}: timed out", NAME)),
+    }
+}
+
+/// The addresses of an answer that exempt something, sorted: none for one
+/// that failed or found no IPv4 address.
+fn found(answer: &Result<Vec<Ipv4Addr>, String>) -> Option<Vec<Ipv4Addr>> {
+    let mut addresses = answer.as_ref().ok().filter(|a| !a.is_empty())?.clone();
+    addresses.sort_unstable();
+    Some(addresses)
+}
+
+/// `203.0.113.80 and 203.0.113.81`, or `none`, as hik-f2b lists them.
+fn and_list(addresses: &[Ipv4Addr]) -> String {
+    if addresses.is_empty() {
+        return "none".to_string();
+    }
+    addresses
+        .iter()
+        .map(|ip| ip.to_string())
+        .collect::<Vec<_>>()
+        .join(" and ")
 }
 
 fn in_net(ip: Ipv4Addr, net: &str) -> bool {
@@ -349,10 +481,11 @@ fn in_net(ip: Ipv4Addr, net: &str) -> bool {
     u32::from(ip) & mask == u32::from(addr) & mask
 }
 
-/// Never banned under `nets`, by the README's list.
+/// Never banned under `nets`, by the README's list, and the own address.
 fn exempt(nets: &[String], ip: Ipv4Addr) -> bool {
     let first = ip.octets()[0];
-    ip.is_loopback()
+    ip == OWN
+        || ip.is_loopback()
         || ip.is_unspecified()
         || ip.is_broadcast()
         || ip.is_multicast()
@@ -394,6 +527,8 @@ enum Kind {
     List,
     Flood,
     Clock,
+    Own,
+    OwnListed,
 }
 
 struct NvrSim {
@@ -510,6 +645,30 @@ enum Line {
     Skipped(usize, i64, i64),
     SkippedAll(usize),
     Notice(String),
+    /// A failed login said to come from an own address.
+    OwnLogin(Ipv4Addr),
+    /// An own address found in the address-list: removed, reported in a
+    /// dry run, or not removed (refused).
+    OwnRemoved(Ipv4Addr),
+    OwnDryRun(Ipv4Addr),
+    OwnStuck(Ipv4Addr),
+    /// The look-up of an own address failed.
+    OwnAskFailed,
+    /// A line about a safe list: what a dry run would write, an address
+    /// added, a write that failed, a rule check that passed or failed, or
+    /// anything else that names it.
+    SafeDry(Ipv4Addr),
+    SafeAdded(Ipv4Addr),
+    SafeWriteFailed(Ipv4Addr),
+    SafeRuleOk,
+    SafeRuleFailed,
+    SafeOther,
+    /// A failed login said to be exempt for this `ignoreip` name, and a
+    /// waiting ban or counted failed logins dropped for one.
+    NameExempt(Ipv4Addr, String),
+    NameDropped(Ipv4Addr, String),
+    /// Any other line about an `ignoreip` name.
+    NameLog(String),
     Other,
 }
 
@@ -555,6 +714,25 @@ fn classify(line: &str) -> Line {
         }
     }
     let text = line.split_once(' ').map_or("", |(_, text)| text);
+    if let Some((_, rest)) = text.split_once(": failed login from ") {
+        if let Some((ip, rest)) = rest.split_once(' ') {
+            if let Some((_, name)) = rest.split_once("): never banned (ignoreip name ") {
+                if let (Ok(ip), Some((name, _))) = (ip.parse(), name.split_once(')')) {
+                    return Line::NameExempt(ip, name.to_string());
+                }
+            }
+        }
+    }
+    if let Some((_, name)) = text.split_once(": the address is now what the ignoreip name ") {
+        if let (Some((ip, _)), Some((name, _))) = (text.split_once(':'), name.split_once(' ')) {
+            if let Ok(ip) = ip.parse() {
+                return Line::NameDropped(ip, name.to_string());
+            }
+        }
+    }
+    if text.starts_with("ignoreip") {
+        return Line::NameLog(line.to_string());
+    }
     if let Some((n, ip, ts)) = counted(text) {
         return Line::Counted(n, ip, ts);
     }
@@ -566,6 +744,59 @@ fn classify(line: &str) -> Line {
     }
     if let Some(ip) = address_after(text, "DRY RUN: would ban ") {
         return Line::Ban(ip, Ban::Reported);
+    }
+    if let Some(ip) = address_after(text, "cannot remove own address ") {
+        return Line::OwnStuck(ip);
+    }
+    if text.starts_with("cannot ask ") && text.contains(" whether own address ") {
+        return Line::OwnAskFailed;
+    }
+    if let Some(ip) = address_after(text, "cannot write own address ") {
+        return Line::SafeWriteFailed(ip);
+    }
+    if let Some(ip) = address_after(text, "DRY RUN: would keep ") {
+        return Line::SafeDry(ip);
+    }
+    if text.starts_with("safe list check failed: ") {
+        return Line::SafeRuleFailed;
+    }
+    if text.starts_with("safe list check ok: ") {
+        return Line::SafeRuleOk;
+    }
+    if let Some((ip, rest)) = text.split_once(' ') {
+        if rest.starts_with("added to the safe list ") {
+            if let Ok(ip) = ip.parse() {
+                return Line::SafeAdded(ip);
+            }
+        }
+    }
+    if text.contains("safe list") {
+        return Line::SafeOther;
+    }
+    if let Some(rest) = text.strip_prefix("DRY RUN: ") {
+        if let Some((ip, rest)) = rest.split_once(' ') {
+            if rest.starts_with("is an own address of hik-f2b and is in ") {
+                if let Ok(ip) = ip.parse() {
+                    return Line::OwnDryRun(ip);
+                }
+            }
+        }
+    }
+    if let Some((ip, rest)) = text.split_once(' ') {
+        if rest.starts_with("is an own address of hik-f2b and was in ") {
+            if let Ok(ip) = ip.parse() {
+                return Line::OwnRemoved(ip);
+            }
+        }
+    }
+    if let Some((_, rest)) = text.split_once(": failed login from ") {
+        if let Some((ip, rest)) = rest.split_once(' ') {
+            if rest.contains("): an own address of hik-f2b, ") {
+                if let Ok(ip) = ip.parse() {
+                    return Line::OwnLogin(ip);
+                }
+            }
+        }
     }
     if let Some(ip) = address_after(text, "cannot ban ") {
         if text.contains(", will retry next cycle: ") {
@@ -607,11 +838,244 @@ fn classify(line: &str) -> Line {
     Line::Other
 }
 
+/// Whether a notification is the one sent at once about the own address
+/// in the address-list.
+fn own_notice(body: &str) -> bool {
+    fake::text_of(body).starts_with(&format!(
+        "\u{26a0}\u{fe0f} hik-f2b: {} is an own address of hik-f2b and ",
+        OWN_TEXT
+    ))
+}
+
 /// The address a ban notification is about.
 fn ban_notice(body: &str) -> Option<Ipv4Addr> {
     let text = fake::text_of(body);
     let rest = text.strip_prefix("\u{26d4} hik-f2b: ")?;
     rest.split(' ').next()?.parse().ok()
+}
+
+/// What a firewall check did about the safe list, from the lines of one
+/// cycle (or engine start).
+#[derive(Default)]
+struct SafeSeen {
+    dry: usize,
+    added: usize,
+    failed: usize,
+    rule_failed: usize,
+    other: usize,
+}
+
+impl SafeSeen {
+    /// Takes one classified line; `safe/only` for one about another address
+    /// than `OWN`.
+    fn see(&mut self, line: &Line) -> Result<(), String> {
+        let ip = match line {
+            Line::SafeDry(ip) => {
+                self.dry += 1;
+                ip
+            }
+            Line::SafeAdded(ip) => {
+                self.added += 1;
+                ip
+            }
+            Line::SafeWriteFailed(ip) => {
+                self.failed += 1;
+                ip
+            }
+            Line::SafeRuleOk => return Ok(()),
+            Line::SafeRuleFailed => {
+                self.rule_failed += 1;
+                return Ok(());
+            }
+            Line::SafeOther => {
+                self.other += 1;
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        if *ip != OWN {
+            return Err(format!("[safe/only] a line about {} in the safe list", ip));
+        }
+        Ok(())
+    }
+
+    fn any(&self) -> bool {
+        self.dry + self.added + self.failed + self.rule_failed + self.other > 0
+    }
+}
+
+/// The safe list of a scenario that has one.
+struct SafeSim {
+    /// The accept rule is there, above the drop rule.
+    rule: bool,
+    /// When the fake router expires the entry of `OWN`.
+    until: Option<i64>,
+    /// The engine running now has said what a dry run would write.
+    dry_said: bool,
+    /// Writes the router accepted.
+    writes: usize,
+}
+
+/// The host name in `ignoreip` of a scenario that has one.
+struct NameSim {
+    /// What the fixed answer for `NAME` gives now.
+    answer: Result<Vec<Ipv4Addr>, String>,
+    /// What the name resolves to for the engine running now: the answer of
+    /// its last look-up that found an address (empty if none did).
+    known: Vec<Ipv4Addr>,
+    /// The last look-up of the engine running now failed.
+    failing: bool,
+    /// Look-ups that reached the fixed answers so far.
+    resolved: usize,
+    /// The host time from which the next look-up is counted; `None` before
+    /// the first poll of the engine running now.
+    since: Option<i64>,
+    /// The addresses the name resolved to at some time.
+    ever: Vec<Ipv4Addr>,
+    /// For the summary: look-ups, and the ones that changed `known`.
+    lookups: usize,
+    changes: usize,
+}
+
+impl NameSim {
+    /// The look-up of a new engine. Returns the lines its start must log
+    /// (`name/log`), each a prefix.
+    fn started(&mut self) -> Vec<String> {
+        self.lookups += 1;
+        self.since = None;
+        let found = found(&self.answer);
+        self.failing = found.is_none();
+        self.known = found.unwrap_or_default();
+        self.remember();
+        let mut lines = vec![format!(
+            "INFO ignoreip names, never banned: {} {}",
+            NAME,
+            if self.known.is_empty() {
+                "not resolved".to_string()
+            } else {
+                and_list(&self.known)
+            }
+        )];
+        if self.failing {
+            lines.push(format!(
+                "WARNING ignoreip: {} does not resolve, so it exempts no address until it does; \
+                 it is tried again every 5 min: ",
+                NAME
+            ));
+        }
+        lines
+    }
+
+    /// A look-up in a poll. Returns the lines it must log, each a prefix.
+    fn looked_up(&mut self) -> Vec<String> {
+        self.lookups += 1;
+        let before = self.known.clone();
+        let was_failing = self.failing;
+        let found = found(&self.answer);
+        self.failing = found.is_none();
+        if let Some(found) = found {
+            self.known = found;
+        }
+        self.remember();
+        if self.known != before {
+            self.changes += 1;
+            return vec![format!(
+                "INFO ignoreip: {} now resolves to {} (was {})",
+                NAME,
+                and_list(&self.known),
+                and_list(&before)
+            )];
+        }
+        match (was_failing, self.failing) {
+            (false, true) => vec![format!(
+                "WARNING ignoreip: the look-up of {} failed, the addresses it last resolved to \
+                 stay exempt ({}): ",
+                NAME,
+                and_list(&self.known)
+            )],
+            (true, false) => vec![format!(
+                "INFO ignoreip: the look-up of {} works again, it still resolves to {}",
+                NAME,
+                and_list(&self.known)
+            )],
+            _ => vec![],
+        }
+    }
+
+    fn remember(&mut self) {
+        for ip in &self.known {
+            if !self.ever.contains(ip) {
+                self.ever.push(*ip);
+            }
+        }
+    }
+}
+
+/// The lines of one cycle (or engine start) about own addresses.
+#[derive(Default)]
+struct OwnSeen {
+    logins: usize,
+    removed: usize,
+    dry_run: usize,
+    stuck: usize,
+    ask_failed: bool,
+    /// Entries the router removed.
+    deleted: usize,
+}
+
+impl OwnSeen {
+    /// Takes the requests to remove an entry that reached the router;
+    /// `own/only` for one that is not about `OWN`.
+    fn deletes(&mut self, router: &Mutex<Fake>) -> Result<(), String> {
+        let deletes = std::mem::take(&mut router.lock().unwrap().delete_log);
+        for (address, outcome) in deletes {
+            if address != OWN_TEXT {
+                return Err(format!(
+                    "[own/only] a request to remove the entry of {:?} ({})",
+                    address, outcome
+                ));
+            }
+            if outcome == "removed" {
+                self.deleted += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Takes one classified line; `own/other` for an own address that is
+    /// not `OWN`.
+    fn see(&mut self, line: &Line) -> Result<(), String> {
+        let ip = match line {
+            Line::OwnLogin(ip) => {
+                self.logins += 1;
+                ip
+            }
+            Line::OwnRemoved(ip) => {
+                self.removed += 1;
+                ip
+            }
+            Line::OwnDryRun(ip) => {
+                self.dry_run += 1;
+                ip
+            }
+            Line::OwnStuck(ip) => {
+                self.stuck += 1;
+                ip
+            }
+            Line::OwnAskFailed => {
+                self.ask_failed = true;
+                return Ok(());
+            }
+            _ => return Ok(()),
+        };
+        if *ip != OWN {
+            return Err(format!(
+                "[own/other] {} is said to be an own address of hik-f2b",
+                ip
+            ));
+        }
+        Ok(())
+    }
 }
 
 struct Sim {
@@ -651,6 +1115,21 @@ struct Sim {
     started_at: Option<i64>,
     /// Addresses the liveness check had a due ban or report for.
     musts: usize,
+    /// `OWN` stays listed after a check that answered, and that was
+    /// reported (`own/notify`); the engine running now knows it.
+    own_reported: bool,
+    /// Notifications about `OWN` in the address-list that the engine
+    /// running now still has to send.
+    own_notices: usize,
+    /// Removals of `OWN` and reports of it in a dry run.
+    own_removed: usize,
+    own_kept: usize,
+    /// The safe list, if the scenario has one.
+    safe: Option<SafeSim>,
+    /// The host name in `ignoreip`, if the scenario has one, and the
+    /// generator of its events.
+    name: Option<NameSim>,
+    name_rng: Rng,
     trace: Vec<String>,
 }
 
@@ -663,14 +1142,66 @@ impl Sim {
         if rng.chance(50) {
             nets.push(OWNER_NET.to_string());
         }
-        let general: &'static str = Box::leak(p.general(&nets).into_boxed_str());
+        // Drawn apart from the scenario: the same seed gives the same other
+        // events with and without the name.
+        let mut name_rng = Rng::new(seed ^ 0x4e41_4d45_4e41_4d45);
+        let name = name_rng.chance(50).then(|| NameSim {
+            answer: draw_answer(&mut name_rng),
+            known: Vec::new(),
+            failing: false,
+            resolved: 0,
+            since: None,
+            ever: Vec::new(),
+            lookups: 0,
+            changes: 0,
+        });
+        let general: &'static str = Box::leak(p.general(&nets, name.is_some()).into_boxed_str());
+        // The answer the first engine gets; a failed look-up is the fixed
+        // answers' own for a name they do not know.
+        let names: &'static [(&'static str, &'static [&'static str])] =
+            match name.as_ref().map(|n| &n.answer) {
+                Some(Ok(addresses)) => {
+                    let texts: Vec<&'static str> = addresses
+                        .iter()
+                        .map(|ip| -> &'static str { Box::leak(ip.to_string().into_boxed_str()) })
+                        .collect();
+                    let texts: &'static [&'static str] = Box::leak(texts.into_boxed_slice());
+                    Box::leak(vec![(NAME, texts)].into_boxed_slice())
+                }
+                _ => &[],
+            };
+        // Drawn apart from the scenario: the same seed gives the same events
+        // with and without a safe list.
+        let mut own_rng = Rng::new(seed ^ 0x5afe_5afe_5afe_5afe);
+        let safe = (class != Class::NotifyOnly && own_rng.chance(50)).then(|| SafeSim {
+            rule: own_rng.chance(80),
+            until: None,
+            dry_said: false,
+            writes: 0,
+        });
         let h = Harness::build(Opts {
             telegram: true,
             mikrotik: class != Class::NotifyOnly,
             second_nvr: p.nvrs == 2,
             general,
+            mikrotik_extra: if safe.is_some() {
+                "safe_list = cctv_safe"
+            } else {
+                ""
+            },
+            own: OWN,
+            names,
             ..Default::default()
         });
+        if let Some(Err(e)) = name.as_ref().map(|n| &n.answer) {
+            h.own.set_name(NAME, Err(e.clone()));
+        }
+        if safe.as_ref().is_some_and(|s| s.rule) {
+            h.fake.lock().unwrap().rules = vec![
+                fake::Rule::accept("raw", SAFE),
+                fake::Rule::new("raw", "cctv_ban", false),
+            ];
+        }
         let nvr = (0..p.nvrs)
             .map(|n| NvrSim {
                 name: format!("nvr{}", n + 1),
@@ -708,6 +1239,13 @@ impl Sim {
             last_bypass: None,
             started_at: None,
             musts: 0,
+            own_reported: false,
+            own_notices: 0,
+            own_removed: 0,
+            own_kept: 0,
+            safe,
+            name,
+            name_rng,
             trace: Vec::new(),
         }
     }
@@ -739,6 +1277,19 @@ impl Sim {
     /// the IPv4 address of a failed login, if it has one.
     fn write(&mut self, n: usize, host: i64, address: &str, minor: &str, counts: Option<Ipv4Addr>) {
         let user = self.rng.pick(&USERS);
+        self.write_as(n, host, address, minor, counts, user);
+    }
+
+    /// `write` with the user name `user`.
+    fn write_as(
+        &mut self,
+        n: usize,
+        host: i64,
+        address: &str,
+        minor: &str,
+        counts: Option<Ipv4Addr>,
+        user: &str,
+    ) {
         let device = host + self.nvr[n].skew;
         let entry = Entry {
             ts: fake::device(device),
@@ -803,8 +1354,24 @@ impl Sim {
     fn start(&mut self) -> Result<(), String> {
         let text = format!("class {:?}: {}", self.p.class, self.p.describe());
         self.note(text);
-        let text = ignore_line(&self.nets);
+        let text = ignore_line(&self.nets, self.name.is_some());
         self.note(text);
+        if let Some(n) = &self.name {
+            let text = format!("{} answers {:?}", NAME, n.answer);
+            self.note(text);
+        }
+        if let Some(s) = &self.safe {
+            let text = format!(
+                "safe list {}, {}",
+                SAFE,
+                if s.rule {
+                    "accept rule above the drop rule"
+                } else {
+                    "no accept rule"
+                }
+            );
+            self.note(text);
+        }
         for n in 0..self.p.nvrs {
             let percent = if self.p.class == Class::Backlog {
                 60
@@ -847,30 +1414,298 @@ impl Sim {
         for (t, n, address) in backlog {
             self.write(n, t, address, FAIL, address.parse().ok());
         }
+        // as `main.rs` starts the service
+        let expected = self.name_lookups(true)?;
+        self.h.engine.startup_own();
+        self.h.engine.startup_names();
+        let listed = self.listed(OWN_TEXT);
+        let named = self.named_listed();
+        self.expire_safe();
+        let safe_before = self.safe_listed();
         self.h.engine.startup_check(self.host as u64);
-        self.startup_lines()?;
+        self.named_kept(&named, "at the engine start")?;
+        self.startup_lines(listed, safe_before, &expected)?;
         self.note("first poll".to_string());
         self.cycle()
     }
 
-    /// The log of an engine start: only the firewall check matters.
-    fn startup_lines(&mut self) -> Result<(), String> {
-        for line in util::captured_log() {
-            if matches!(classify(&line), Line::CheckFailed) {
-                if self.router != Router::Unreachable {
+    /// The log of an engine start: what the name resolves to (`expected`,
+    /// see `name_lookups`), the firewall check, and the look-up of the own
+    /// address that follows it when the router answers.
+    fn startup_lines(
+        &mut self,
+        listed_before: bool,
+        safe_before: bool,
+        expected: &[String],
+    ) -> Result<(), String> {
+        let lines = util::captured_log();
+        let mut own = OwnSeen::default();
+        let mut safe = SafeSeen::default();
+        let mut about_name = Vec::new();
+        own.deletes(&self.h.fake)?;
+        for line in &lines {
+            let line = classify(line);
+            safe.see(&line)?;
+            match line {
+                Line::NameExempt(ip, name) => {
+                    self.named_line(ip, &name, "a failed login said to be exempt")?
+                }
+                Line::NameDropped(ip, name) => self.named_line(ip, &name, "a drop")?,
+                Line::NameLog(text) => about_name.push(text),
+                Line::CheckFailed => {
+                    if self.router != Router::Unreachable {
+                        return Err(format!(
+                            "[health/condition] the firewall check failed at startup while the \
+                             router was {:?}",
+                            self.router
+                        ));
+                    }
+                    self.health.fail("firewall", self.host);
+                }
+                other => own.see(&other)?,
+            }
+        }
+        self.name_logged(&about_name, expected)?;
+        let answered = self.p.class != Class::NotifyOnly && self.router != Router::Unreachable;
+        self.safe_checked(answered, safe_before, &safe)?;
+        self.own_swept(answered, listed_before, &own)
+    }
+
+    /// Whether the safe list has an entry for `OWN`.
+    fn safe_listed(&self) -> bool {
+        let f = self.h.fake.lock().unwrap();
+        f.listed.iter().any(|e| e.address == OWN_TEXT)
+    }
+
+    /// Removes the entry of `OWN` from the safe list once its timeout has
+    /// passed, as the router does.
+    fn expire_safe(&mut self) {
+        let now = self.host;
+        if let Some(s) = &mut self.safe {
+            if s.until.is_some_and(|until| until <= now) {
+                s.until = None;
+                self.h
+                    .fake
+                    .lock()
+                    .unwrap()
+                    .listed
+                    .retain(|e| e.list != SAFE);
+            }
+        }
+    }
+
+    /// See `safe/only`, `safe/off`, `safe/dry` and `safe/kept` in the module
+    /// comment: what a firewall check (`answered`: the router answered it),
+    /// or a cycle without one, must have done about the safe list, which
+    /// held an entry for `OWN` before it or not (`had`), given the lines
+    /// `seen` of the engine.
+    fn safe_checked(&mut self, answered: bool, had: bool, seen: &SafeSeen) -> Result<(), String> {
+        let (writes, listed, requests) = {
+            let mut f = self.h.fake.lock().unwrap();
+            (
+                std::mem::take(&mut f.safe_log),
+                f.listed.clone(),
+                std::mem::take(&mut f.rest_log),
+            )
+        };
+        for (list, address, outcome) in &writes {
+            if list != SAFE || address != OWN_TEXT {
+                return Err(format!(
+                    "[safe/only] a write of {} to {} ({})",
+                    address, list, outcome
+                ));
+            }
+        }
+        for entry in &listed {
+            if entry.list != SAFE || entry.address != OWN_TEXT {
+                return Err(format!(
+                    "[safe/only] {} holds {}",
+                    entry.list, entry.address
+                ));
+            }
+        }
+        let dry = self.p.class == Class::DryRun;
+        let router = self.router;
+        let host = self.host;
+        let Some(s) = &mut self.safe else {
+            if !writes.is_empty() || !listed.is_empty() || seen.any() {
+                return Err(format!(
+                    "[safe/off] without a safe list: writes {:?}, entries {:?}, {} line(s)",
+                    writes,
+                    listed,
+                    seen.dry + seen.added + seen.failed + seen.rule_failed + seen.other
+                ));
+            }
+            for request in &requests {
+                let rules = request.contains("/rest/ip/firewall/raw")
+                    || request.contains("/rest/ip/firewall/filter");
+                if request.starts_with("PATCH")
+                    || request.contains(SAFE)
+                    || (rules && !request.contains("src-address-list=cctv_ban"))
+                {
                     return Err(format!(
-                        "[health/condition] the firewall check failed at startup while the \
-                         router was {:?}",
-                        self.router
+                        "[safe/off] a request without a safe list: {}",
+                        request
                     ));
                 }
-                self.health.fail("firewall", self.host);
+            }
+            return Ok(());
+        };
+        if seen.other > 0 {
+            return Err(format!(
+                "[safe/kept] {} line(s) about the safe list that say nothing known",
+                seen.other
+            ));
+        }
+        let rule_failed = usize::from(answered && !s.rule);
+        if seen.rule_failed != rule_failed {
+            return Err(format!(
+                "[safe/kept] {} failed rule check(s) logged, expected {} (answered {}, rule {})",
+                seen.rule_failed, rule_failed, answered, s.rule
+            ));
+        }
+        if answered {
+            if s.rule {
+                self.health.pass("safe-list-rule");
+            } else {
+                self.health.fail("safe-list-rule", host);
+            }
+        }
+        if dry {
+            let said = usize::from(answered && !s.dry_said);
+            if !writes.is_empty() || seen.dry != said || seen.failed > 0 {
+                return Err(format!(
+                    "[safe/dry] writes {:?}, {} line(s) of what it would write, expected {} \
+                     (answered {})",
+                    writes, seen.dry, said, answered
+                ));
+            }
+            s.dry_said |= answered;
+            return Ok(());
+        }
+        let expected: Vec<&str> = match (answered, router) {
+            (false, _) => vec![],
+            (true, Router::Refusing) => vec!["refused"],
+            (true, _) if had => vec!["renewed"],
+            (true, _) => vec!["added"],
+        };
+        let outcomes: Vec<&str> = writes.iter().map(|(_, _, o)| *o).collect();
+        let lines = (seen.added, seen.failed);
+        let expected_lines = (
+            usize::from(expected == ["added"]),
+            usize::from(expected == ["refused"]),
+        );
+        if outcomes != expected || lines != expected_lines {
+            return Err(format!(
+                "[safe/kept] writes {:?}, expected {:?}; (added, failed) lines {:?}, expected \
+                 {:?} (answered {}, router {:?}, listed before {})",
+                outcomes, expected, lines, expected_lines, answered, router, had
+            ));
+        }
+        if !answered || router == Router::Refusing {
+            if answered {
+                self.health.fail("safe-list-refused", host);
+            }
+            return Ok(());
+        }
+        self.health.pass("safe-list-refused");
+        s.writes += 1;
+        let entries: Vec<_> = listed.iter().filter(|e| e.address == OWN_TEXT).collect();
+        let timeout = match entries.as_slice() {
+            [entry] => entry.timeout.as_deref().and_then(seconds),
+            _ => None,
+        };
+        match timeout {
+            Some(t) if t >= 3 * CHECK_EVERY => {
+                s.until = Some(host + t);
+                Ok(())
+            }
+            _ => Err(format!(
+                "[safe/kept] after the check, {} holds {:?} for {}",
+                SAFE, entries, OWN_TEXT
+            )),
+        }
+    }
+
+    /// See `own/removed`, `own/kept` and `own/notify` in the module comment:
+    /// what a firewall check (`answered`: the router answered it) must have
+    /// done about `OWN`, listed before it or not, given the lines `own` of
+    /// the engine.
+    fn own_swept(
+        &mut self,
+        answered: bool,
+        listed_before: bool,
+        own: &OwnSeen,
+    ) -> Result<(), String> {
+        let listed = self.listed(OWN_TEXT);
+        let dry = self.p.class == Class::DryRun;
+        let found = answered && listed_before;
+        let (removed, stuck) = match (found, dry, self.router) {
+            (false, _, _) => (0, 0),
+            (true, true, _) => (0, 0),
+            (true, false, Router::Refusing) => (0, 1),
+            (true, false, _) => (1, 0),
+        };
+        let reported = usize::from(found && dry && !self.own_reported);
+        let expected = (removed, reported, stuck);
+        let seen = (own.removed, own.dry_run, own.stuck);
+        if seen != expected {
+            return Err(format!(
+                "[own/removed] (removed, reported in a dry run, not removed) lines {:?}, \
+                 expected {:?} (check answered {}, listed before {}, router {:?})",
+                seen, expected, answered, listed_before, self.router
+            ));
+        }
+        if listed != (listed_before && removed == 0) {
+            return Err(format!(
+                "[own/removed] {} is {}listed after a check (answered {}, listed before {}, \
+                 router {:?})",
+                OWN_TEXT,
+                if listed { "" } else { "not " },
+                answered,
+                listed_before,
+                self.router
+            ));
+        }
+        if own.ask_failed {
+            return Err("[own/removed] the look-up of the own address failed".to_string());
+        }
+        if own.deleted != own.removed {
+            return Err(format!(
+                "[own/only] the router removed {} entr(ies), {} removal(s) logged",
+                own.deleted, own.removed
+            ));
+        }
+        if removed > 0 {
+            self.own_notices += 1;
+            self.own_removed += 1;
+            self.own_reported = false;
+            self.note(format!("  -> {} removed from the address-list", OWN_TEXT));
+        } else if found {
+            if !self.own_reported {
+                self.own_notices += 1;
+                self.own_reported = true;
+            }
+            if dry {
+                self.own_kept += reported;
+            }
+        } else if answered {
+            self.own_reported = false;
+        }
+        if answered {
+            if stuck > 0 {
+                self.health.fail("own-address-listed", self.host);
+            } else {
+                self.health.pass("own-address-listed");
             }
         }
         Ok(())
     }
 
     fn step(&mut self) -> Result<(), String> {
+        if self.name.is_some() && self.name_rng.chance(10) {
+            self.name_event();
+        }
         let class = self.p.class;
         let mut table = vec![
             (45, Kind::Poll),
@@ -890,6 +1725,10 @@ impl Sim {
         }
         if class == Class::Clock {
             table.push((10, Kind::Clock));
+        }
+        table.push((3, Kind::Own));
+        if class != Class::NotifyOnly {
+            table.push((2, Kind::OwnListed));
         }
         let total: u64 = table.iter().map(|(weight, _)| weight).sum();
         let mut roll = self.rng.below(total);
@@ -968,7 +1807,41 @@ impl Sim {
             }
             Kind::Flood => self.flood(),
             Kind::Clock => self.clock(),
+            Kind::Own => {
+                self.own_fail();
+                Ok(())
+            }
+            Kind::OwnListed => {
+                if !self.listed(OWN_TEXT) {
+                    self.h.fake.lock().unwrap().bans.push(OWN_TEXT.to_string());
+                }
+                self.note(format!("router: {} listed by an outside hand", OWN_TEXT));
+                Ok(())
+            }
         }
+    }
+
+    /// Failed logins from the own address: with hik-f2b's user name, as
+    /// while the NVR rejects hik-f2b's login, or with another, as a forged
+    /// entry has. Enough to reach `maxretry` if they were counted.
+    fn own_fail(&mut self) {
+        let n = self.rng.below(self.p.nvrs as u64) as usize;
+        let count = self.rng.range(1, self.p.maxretry as i64 + 3);
+        let gap = self.rng.range(1, 30);
+        let user = if self.rng.chance(50) {
+            OWN_USER
+        } else {
+            self.rng.pick(&USERS)
+        };
+        for i in 0..count {
+            self.write_as(n, self.host + i * gap, OWN_TEXT, FAIL, Some(OWN), user);
+        }
+        self.host += (count - 1) * gap;
+        let text = format!(
+            "fail {} {:?} (own) user {:?} x{} every {}s",
+            self.nvr[n].name, OWN_TEXT, user, count, gap
+        );
+        self.note(text);
     }
 
     fn set_router(&mut self, mode: Router) {
@@ -1044,7 +1917,7 @@ impl Sim {
     }
 
     fn restart(&mut self) -> Result<(), String> {
-        let old = ignore_line(&self.nets);
+        let old = ignore_line(&self.nets, self.name.is_some());
         let mut what = "same config".to_string();
         if self.rng.chance(60) {
             let net = if self.rng.chance(50) {
@@ -1059,7 +1932,7 @@ impl Sim {
                 what = format!("ignoreip with {}", net);
                 self.nets.push(net);
             }
-            let new = ignore_line(&self.nets);
+            let new = ignore_line(&self.nets, self.name.is_some());
             self.h.ini = self
                 .h
                 .ini
@@ -1072,8 +1945,22 @@ impl Sim {
         self.health = Health::default();
         self.last_bypass = None;
         self.started_at = None;
+        // what the engine before knew and had still to send is gone
+        self.own_reported = false;
+        self.own_notices = 0;
+        if let Some(s) = &mut self.safe {
+            s.dry_said = false;
+        }
+        let expected = self.name_lookups(true)?;
+        self.h.engine.startup_own();
+        self.h.engine.startup_names();
+        let listed = self.listed(OWN_TEXT);
+        let named = self.named_listed();
+        self.expire_safe();
+        let safe_before = self.safe_listed();
         self.h.engine.startup_check(self.host as u64);
-        self.startup_lines()
+        self.named_kept(&named, "at the engine start")?;
+        self.startup_lines(listed, safe_before, &expected)
     }
 
     /// Thousands of entries logged while hik-f2b does not poll.
@@ -1253,11 +2140,18 @@ impl Sim {
             self.unsorted = false;
         }
         self.expire_router();
+        self.expire_safe();
+        let safe_before = self.safe_listed();
         let router = Arc::clone(&self.h.fake);
         let queries = router.lock().unwrap().rule_queries.len();
         let offsets = self.offsets();
+        let own_listed = self.listed(OWN_TEXT);
+        let named = self.named_listed();
         self.h.set_host(self.host);
         self.h.engine.cycle_at(self.host as u64);
+        self.named_kept(&named, "in a cycle")?;
+        let expected = self.name_lookups(false)?;
+        let mut about_name = Vec::new();
         let started_at = *self.started_at.get_or_insert(self.host);
         for (n, (before, after)) in offsets.iter().zip(self.offsets()).enumerate() {
             if *before != after {
@@ -1300,8 +2194,23 @@ impl Sim {
         let mut check_failed = false;
         let mut notified = Vec::new();
         let mut events = Vec::new();
+        let mut own = OwnSeen::default();
+        let mut safe = SafeSeen::default();
+        own.deletes(&router)?;
         for line in &lines {
-            match classify(line) {
+            let line = classify(line);
+            own.see(&line)?;
+            safe.see(&line)?;
+            match line {
+                Line::NameExempt(ip, name) => {
+                    self.named_line(ip, &name, "a failed login said to be exempt")?;
+                    events.push(format!("{} exempt", ip));
+                }
+                Line::NameDropped(ip, name) => {
+                    self.named_line(ip, &name, "a drop")?;
+                    events.push(format!("{} dropped as named", ip));
+                }
+                Line::NameLog(text) => about_name.push(text),
                 Line::Counted(n, ip, ts) => {
                     self.on_count(n, ip, ts)?;
                     events.push(format!("{}+1", ip));
@@ -1385,7 +2294,18 @@ impl Sim {
                     events.push(notice.clone());
                     cycle.notices.push(notice);
                 }
-                Line::Other => {}
+                Line::OwnLogin(_)
+                | Line::OwnRemoved(_)
+                | Line::OwnDryRun(_)
+                | Line::OwnStuck(_)
+                | Line::OwnAskFailed
+                | Line::SafeDry(_)
+                | Line::SafeAdded(_)
+                | Line::SafeWriteFailed(_)
+                | Line::SafeRuleOk
+                | Line::SafeRuleFailed
+                | Line::SafeOther
+                | Line::Other => {}
             }
         }
         for (address, outcome) in puts {
@@ -1396,6 +2316,12 @@ impl Sim {
             self.on_request(ip, "ban request")?;
             if !["refused", "down", "status"].contains(&outcome) {
                 cycle.router_pass = true;
+            }
+        }
+        self.name_logged(&about_name, &expected)?;
+        if !expected.is_empty() {
+            if let Some(n) = &self.name {
+                events.push(format!("{} -> {}", NAME, and_list(&n.known)));
             }
         }
         if !limited && !cycle.transport {
@@ -1416,6 +2342,13 @@ impl Sim {
         } else if checked {
             self.health.pass("firewall");
             self.health.pass("firewall-rule");
+        }
+        // the write of the safe list and the look-up of the own address
+        // follow a check that the router answered
+        self.safe_checked(checked, safe_before, &safe)?;
+        self.own_swept(checked, own_listed, &own)?;
+        if own.logins > 0 {
+            events.push(format!("{} own failed login(s) not counted", own.logins));
         }
         if (cycle.transport || check_failed) && self.router != Router::Unreachable {
             return Err(format!(
@@ -1440,11 +2373,22 @@ impl Sim {
             ));
         }
         let mut announced = Vec::new();
+        let mut own_sent = 0;
         for body in &sent {
             if let Some(ip) = ban_notice(body) {
                 announced.push(ip);
             }
+            if own_notice(body) {
+                own_sent += 1;
+            }
         }
+        if own_sent != self.own_notices {
+            return Err(format!(
+                "[own/notify] {} notification(s) about {} in the address-list, expected {}",
+                own_sent, OWN_TEXT, self.own_notices
+            ));
+        }
+        self.own_notices = 0;
         announced.sort();
         notified.sort();
         if announced != notified {
@@ -1485,11 +2429,12 @@ impl Sim {
     }
 
     fn on_count(&mut self, n: usize, ip: Ipv4Addr, ts: i64) -> Result<(), String> {
+        self.named_exempt(ip, "a counted failed login")?;
         if exempt(&self.nets, ip) {
             return Err(format!(
                 "[safety/exempt] a failed login of {} was counted, which is exempt under {}",
                 ip,
-                ignore_line(&self.nets)
+                ignore_line(&self.nets, self.name.is_some())
             ));
         }
         // The engine converts with the NVR's offset at this poll, which is
@@ -1562,14 +2507,189 @@ impl Sim {
         Ok(())
     }
 
+    /// `name/exempt`: `what` happened for `ip` while the name resolves to it
+    /// for the engine running now.
+    fn named_exempt(&self, ip: Ipv4Addr, what: &str) -> Result<(), String> {
+        match &self.name {
+            Some(n) if n.known.contains(&ip) => Err(format!(
+                "[name/exempt] {} for {} while {} resolves to {} for the engine",
+                what,
+                ip,
+                NAME,
+                and_list(&n.known)
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// `name/line`: a line that says `ip` is exempt for the `ignoreip` name
+    /// `name`.
+    fn named_line(&self, ip: Ipv4Addr, name: &str, what: &str) -> Result<(), String> {
+        match &self.name {
+            Some(n) if name == NAME && n.known.contains(&ip) => Ok(()),
+            Some(n) => Err(format!(
+                "[name/line] {} for {} as {}, but {} resolves to {} for the engine",
+                what,
+                ip,
+                name,
+                NAME,
+                and_list(&n.known)
+            )),
+            None => Err(format!(
+                "[name/line] {} for {} as {}, without a name in ignoreip",
+                what, ip, name
+            )),
+        }
+    }
+
+    /// The addresses the name resolves to, or once did, that are in the
+    /// address-list now (`name/kept`).
+    fn named_listed(&self) -> Vec<String> {
+        match &self.name {
+            Some(n) => n
+                .ever
+                .iter()
+                .map(|ip| ip.to_string())
+                .filter(|a| self.listed(a))
+                .collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// `name/kept`: each of `before` is still in the address-list.
+    fn named_kept(&self, before: &[String], when: &str) -> Result<(), String> {
+        for address in before {
+            if !self.listed(address) {
+                return Err(format!(
+                    "[name/kept] {}, which {} resolves to or did, left the address-list {}",
+                    address, NAME, when
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The look-ups of the name since the last call: `name/interval`, and
+    /// the lines they must log (`name/log`), each a prefix. `start`: an
+    /// engine was started.
+    fn name_lookups(&mut self, start: bool) -> Result<Vec<String>, String> {
+        let resolved = self.h.own.resolved();
+        let host = self.host;
+        let Some(n) = &mut self.name else {
+            if resolved != 0 {
+                return Err(format!(
+                    "[name/interval] {} look-up(s) without a name in ignoreip",
+                    resolved
+                ));
+            }
+            return Ok(Vec::new());
+        };
+        let new = resolved - n.resolved;
+        n.resolved = resolved;
+        if start {
+            if new != 1 {
+                return Err(format!(
+                    "[name/interval] {} look-up(s) at an engine start, expected 1",
+                    new
+                ));
+            }
+            return Ok(n.started());
+        }
+        let due = match n.since {
+            None => {
+                n.since = Some(host);
+                false
+            }
+            Some(since) => host < since || host - since >= RESOLVE_EVERY as i64,
+        };
+        if new != usize::from(due) {
+            return Err(format!(
+                "[name/interval] {} look-up(s) in a poll {} s after the last one, expected {}",
+                new,
+                n.since.map_or(0, |since| host - since),
+                usize::from(due)
+            ));
+        }
+        if !due {
+            return Ok(Vec::new());
+        }
+        n.since = Some(host);
+        Ok(n.looked_up())
+    }
+
+    /// `name/log`: the lines about the name are `expected` (prefixes).
+    fn name_logged(&self, seen: &[String], expected: &[String]) -> Result<(), String> {
+        let matches = seen.len() == expected.len()
+            && seen
+                .iter()
+                .zip(expected)
+                .all(|(line, want)| line.starts_with(want));
+        if !matches {
+            return Err(format!(
+                "[name/log] lines about the name {:?}, expected {:?}",
+                seen, expected
+            ));
+        }
+        Ok(())
+    }
+
+    /// A name event: the answer for `NAME` changes, failed logins come from
+    /// one of `NAMED`, or one of them is put into the address-list by hand.
+    /// Drawn from the name's own generator.
+    fn name_event(&mut self) {
+        let r = self.name_rng.below(100);
+        if r < 45 {
+            let answer = draw_answer(&mut self.name_rng);
+            self.h.own.set_name(NAME, answer.clone());
+            self.note(format!("{} answers {:?}", NAME, answer));
+            if let Some(n) = &mut self.name {
+                n.answer = answer;
+            }
+            return;
+        }
+        let address = NAMED[self.name_rng.below(2) as usize];
+        let ip: Ipv4Addr = address.parse().unwrap();
+        if r < 88 || self.p.report_once() {
+            let n = self.name_rng.below(self.p.nvrs as u64) as usize;
+            let count = self.name_rng.range(1, self.p.maxretry as i64 + 2);
+            let gap = self.name_rng.range(1, 10);
+            let user = self.name_rng.pick(&USERS);
+            // the drop rule keeps a listed address away from the NVR, mostly
+            if !self.p.report_once() && self.listed(address) && self.name_rng.chance(85) {
+                self.note(format!("{} blocked by the router", address));
+                return;
+            }
+            for i in 0..count {
+                self.write_as(n, self.host + i * gap, address, FAIL, Some(ip), user);
+            }
+            self.host += (count - 1) * gap;
+            let text = format!(
+                "fail {} {:?} (named) user {:?} x{} every {}s",
+                self.nvr[n].name, address, user, count, gap
+            );
+            self.note(text);
+            return;
+        }
+        if !self.listed(address) {
+            self.h.fake.lock().unwrap().bans.push(address.to_string());
+        }
+        if let Some(n) = &mut self.name {
+            if !n.ever.contains(&ip) {
+                n.ever.push(ip);
+            }
+        }
+        self.note(format!("router: {} listed by hand", address));
+    }
+
     /// A ban request or report for `ip`: exempt, or not backed by the log?
     fn on_request(&self, ip: Ipv4Addr, what: &str) -> Result<(), String> {
+        self.named_exempt(ip, what)?;
         if exempt(&self.nets, ip) {
             return Err(format!(
                 "[safety/exempt] {} for {}, which is exempt under {}",
                 what,
                 ip,
-                ignore_line(&self.nets)
+                ignore_line(&self.nets, self.name.is_some())
             ));
         }
         // 0 unless a device clock changed between logging and counting
@@ -1840,6 +2960,22 @@ impl Sim {
     }
 }
 
+/// `hh:mm:ss` or `NdHH:MM:SS`, as hik-f2b writes a timeout, in seconds.
+fn seconds(text: &str) -> Option<i64> {
+    let (days, hms) = match text.split_once('d') {
+        Some((d, rest)) => (d.parse::<i64>().ok()?, rest),
+        None => (0, text),
+    };
+    let parts: Vec<i64> = hms
+        .split(':')
+        .map(|p| p.parse().ok())
+        .collect::<Option<_>>()?;
+    match parts.as_slice() {
+        [h, m, s] => Some(days * 86400 + h * 3600 + m * 60 + s),
+        _ => None,
+    }
+}
+
 fn env(name: &str) -> Option<u64> {
     std::env::var(name).ok().and_then(|v| v.trim().parse().ok())
 }
@@ -1890,8 +3026,11 @@ fn run_class(class: Class) {
     let seeds = seeds(class);
     let mut failures = Vec::new();
     // cycles, accepted, listed, reported, alerts, liveness, shifted, bypass
-    // alerts
-    let mut stats = [0usize; 8];
+    // alerts, own address removed, own address reported in a dry run,
+    // scenarios with a safe list, writes to it, scenarios with a name in
+    // ignoreip, its look-ups and changes, bans and reports of its addresses
+    // (after they left its answer)
+    let mut stats = [0usize; 16];
     for &seed in &seeds {
         let mut sim = Sim::new(seed);
         let result = match catch_unwind(AssertUnwindSafe(|| sim.run())) {
@@ -1919,6 +3058,17 @@ fn run_class(class: Class) {
                 .flat_map(|c| &c.notices)
                 .filter(|n| *n == "alert ban-bypassed")
                 .count(),
+            sim.own_removed,
+            sim.own_kept,
+            usize::from(sim.safe.is_some()),
+            sim.safe.as_ref().map_or(0, |s| s.writes),
+            usize::from(sim.name.is_some()),
+            sim.name.as_ref().map_or(0, |n| n.lookups),
+            sim.name.as_ref().map_or(0, |n| n.changes),
+            sim.bans
+                .iter()
+                .filter(|(_, ip, k)| *k != Ban::Listed && NAMED.contains(&ip.to_string().as_str()))
+                .count(),
         ];
         for (total, n) in stats.iter_mut().zip(seen) {
             *total += n;
@@ -1934,7 +3084,9 @@ fn run_class(class: Class) {
     let summary = format!(
         "sim {:?}: {} seed(s), {} cycles, {:.1} s, {} violation(s); bans {}, already listed {}, \
          reports {}, health alerts {} (ban-bypassed {}), addresses due for liveness {}, \
-         addresses with a shift {}; peak fake threads {} (at most {}){}",
+         addresses with a shift {}, own address removed {} (reported in a dry run {}), safe \
+         list in {} scenario(s) ({} write(s)), ignoreip name in {} scenario(s) ({} look-up(s), \
+         {} change(s), {} ban(s) or report(s) of its addresses); peak fake threads {} (at most {}){}",
         class,
         seeds.len(),
         stats[0],
@@ -1947,6 +3099,14 @@ fn run_class(class: Class) {
         stats[7],
         stats[5],
         stats[6],
+        stats[8],
+        stats[9],
+        stats[10],
+        stats[11],
+        stats[12],
+        stats[13],
+        stats[14],
+        stats[15],
         fake::peak_threads(),
         MAX_FAKE_THREADS,
         conntrack

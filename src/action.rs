@@ -89,14 +89,68 @@ impl std::fmt::Display for HealthError {
     }
 }
 
+/// What a firewall check found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Checked {
+    /// A short description of what was found.
+    pub found: String,
+    /// The check of the safe list's rule: `Ok` with what was found, or why
+    /// the rule does not keep the safe list from being blocked. `None` when
+    /// no safe list is configured or the rules are not checked.
+    pub safe_rule: Option<Result<String, String>>,
+}
+
+/// What `Firewall::keep_safe` did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kept {
+    /// The address was not in the safe list and is added.
+    Added,
+    /// Its entry had a timeout, which starts again.
+    Renewed,
+    /// It has an entry without a timeout (made by hand), or one appeared
+    /// meanwhile: the entry is left as it is.
+    Left,
+}
+
+/// An entry of the safe list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SafeEntry {
+    /// The firewall's id of the entry.
+    pub id: String,
+    /// Whether it has a timeout (otherwise it stays until removed by hand).
+    pub timed: bool,
+}
+
 pub trait Firewall {
     /// Blocks `ip` for `bantime`. Returns `Ok(false)` when the firewall
     /// already lists the address; an existing entry is left as it is.
     fn ban(&self, ip: Ipv4Addr, bantime: BanTime, comment: &str) -> Result<bool, BanError>;
     /// Checks that bans can be applied and that listed addresses are
-    /// actually blocked. `Ok` carries a short description of what was found.
-    /// Must change nothing on the firewall.
-    fn check(&self) -> Result<String, HealthError>;
+    /// actually blocked, and, with a safe list, that a rule keeps the
+    /// addresses of the safe list from being blocked. Must change nothing
+    /// on the firewall.
+    fn check_with_safe_list(&self) -> Result<Checked, HealthError>;
+    /// `check_with_safe_list` without the safe list's rule. `Ok` carries a
+    /// short description of what was found.
+    fn check(&self) -> Result<String, HealthError> {
+        self.check_with_safe_list().map(|checked| checked.found)
+    }
+    /// The name of the safe list, if one is configured. Without one, no
+    /// other method sends anything about it.
+    fn safe_list(&self) -> Option<String>;
+    /// The entry of `ip` in the safe list, if it has one. Changes nothing.
+    fn safe_entry(&self, ip: Ipv4Addr) -> Result<Option<SafeEntry>, BanError>;
+    /// Keeps `ip`, an own address, in the safe list for `timeout` seconds
+    /// from now: adds it, or starts the timeout of its entry again. Only
+    /// own addresses are ever given to it.
+    fn keep_safe(&self, ip: Ipv4Addr, timeout: u64) -> Result<Kept, BanError>;
+    /// The ids of the address-list entries for `ip`; empty when it is not
+    /// listed. For own addresses only (see `remove`).
+    fn entries(&self, ip: Ipv4Addr) -> Result<Vec<String>, BanError>;
+    /// Removes the address-list entry `id`, one of those `entries` gave for
+    /// `ip`. An entry that is gone counts as removed. hik-f2b removes an
+    /// entry only for an own address (ADR 0005).
+    fn remove(&self, ip: Ipv4Addr, id: &str) -> Result<(), BanError>;
     /// A short human-readable name for log lines, e.g. the address-list.
     fn describe(&self) -> String;
 }

@@ -578,6 +578,8 @@ mod tests {
             bantime: crate::action::BanTime::Seconds(3600),
             max_bans_per_hour: 30,
             ignore: &[],
+            own: &std::collections::BTreeSet::new(),
+            named: &std::collections::BTreeMap::new(),
         };
         assert!(st.ledger.due(&rules, 5 + 3600).is_empty());
         assert_eq!(st.digest(), empty);

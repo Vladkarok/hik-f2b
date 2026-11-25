@@ -1,5 +1,7 @@
-//! RouterOS v7 REST client: adds addresses to a firewall address-list and
-//! checks that a firewall rule blocks that list.
+//! RouterOS v7 REST client: adds addresses to a firewall address-list,
+//! checks that a firewall rule blocks that list, and finds and removes the
+//! entries of own addresses. With a safe list, it keeps own addresses in it
+//! and checks that a rule accepts them before the drop rule.
 //!
 //! There is no JSON parser here. Where an answer is needed, the router is
 //! asked to filter (`property=value` in the query string) and to return only
@@ -9,7 +11,7 @@
 //! An answer that does not have the shape asked for (an HTML page from a
 //! proxy, say) is an error, never an empty list.
 
-use crate::action::{BanError, BanTime, Firewall, HealthError};
+use crate::action::{BanError, BanTime, Checked, Firewall, HealthError, Kept, SafeEntry};
 use crate::config::MikrotikCfg;
 use crate::{http, util};
 use std::net::Ipv4Addr;
@@ -28,6 +30,14 @@ const RULE_LIST_PROPERTY: &str = "src-address-list";
 /// stops using it) when, for example, the interface list it names is
 /// removed. Dynamic rules report neither property.
 const RULE_PROPERTIES: &str = ".id,disabled,invalid";
+/// The properties asked for of a rule that uses the safe list: as for the
+/// drop rule, and its action, which must be `accept`.
+const SAFE_RULE_PROPERTIES: &str = ".id,disabled,invalid,action";
+/// The properties asked for of a safe-list entry. An entry with a timeout
+/// is dynamic: RouterOS reports `timeout`, `"dynamic":"true"` or both.
+const SAFE_ENTRY_PROPERTIES: &str = ".id,dynamic,timeout";
+/// The comment of a safe-list entry that hik-f2b adds.
+const SAFE_COMMENT: &str = "hik-f2b own address";
 /// Part of RouterOS's error text for a duplicate address-list entry. Only a
 /// shortcut: without it the router is asked whether the entry exists.
 const DUPLICATE_TEXT: &str = "already have";
@@ -35,6 +45,8 @@ const DUPLICATE_TEXT: &str = "already have";
 pub struct Mikrotik {
     base: String,
     pub list: String,
+    /// The safe list, if one is configured.
+    safe: Option<String>,
     check_rule: bool,
     agent: ureq::Agent,
     auth: String,
@@ -46,6 +58,66 @@ struct Rules {
     usable: usize,
     disabled: usize,
     invalid: usize,
+    /// The id of the first usable rule, in the order of the table.
+    first: Option<String>,
+}
+
+/// The rules of one table that use the safe list, by why they do not
+/// count, in this order: disabled, invalid, an action other than
+/// `accept`, after the drop rule.
+#[derive(Debug, Default, PartialEq)]
+struct SafeRules {
+    usable: usize,
+    disabled: usize,
+    invalid: usize,
+    other_action: usize,
+    after: usize,
+}
+
+impl SafeRules {
+    /// Whether a rule keeps the safe list `safe` from being blocked by the
+    /// drop rule for `list` in `table` (`Ok`), or why none does, with what
+    /// the operator has to do.
+    fn verdict(&self, table: &str, safe: &str, list: &str) -> Result<String, String> {
+        if self.usable > 0 {
+            return Ok(format!(
+                "{} enabled accept rule(s) in /{} with {}={} before the drop rule for {}",
+                self.usable, table, RULE_LIST_PROPERTY, safe, list
+            ));
+        }
+        let why = [
+            (self.disabled, "disabled", "enable it"),
+            (self.invalid, "invalid", "make it valid"),
+            (
+                self.other_action,
+                "with another action",
+                "set action=accept",
+            ),
+            (
+                self.after,
+                "after the drop rule",
+                "move it above the drop rule",
+            ),
+        ];
+        let why: Vec<_> = why.iter().filter(|(n, _, _)| *n > 0).collect();
+        if why.is_empty() {
+            return Err(format!(
+                "no rule in /{} has {}={}: add one with action=accept above the drop rule for \
+                 {}, in the same table",
+                table, RULE_LIST_PROPERTY, safe, list
+            ));
+        }
+        let found: Vec<String> = why.iter().map(|(n, w, _)| format!("{} {}", n, w)).collect();
+        let fixes: Vec<&str> = why.iter().map(|(_, _, fix)| *fix).collect();
+        Err(format!(
+            "no rule in /{} with {}={} counts ({}): {}",
+            table,
+            RULE_LIST_PROPERTY,
+            safe,
+            found.join(", "),
+            fixes.join(", ")
+        ))
+    }
 }
 
 /// Why rules were left out, for the text of the check: empty, or e.g.
@@ -63,6 +135,23 @@ fn left_out(disabled: usize, invalid: usize) -> String {
     }
 }
 
+/// Longest address-list entry id taken from the router; RouterOS ids are
+/// `*` and a hexadecimal number.
+const MAX_ID: usize = 24;
+
+/// The value of the `.id` member of one object of a reply limited by
+/// `.proplist`, if it looks like a RouterOS id: it goes into a URL path.
+fn id_of(object: &str) -> Option<&str> {
+    let at = object.find("\".id\"")?;
+    let rest = object[at + 5..].trim_start().strip_prefix(':')?;
+    let rest = rest.trim_start().strip_prefix('"')?;
+    let id = &rest[..rest.find('"')?];
+    let ok = !id.is_empty()
+        && id.len() <= MAX_ID
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '*');
+    ok.then_some(id)
+}
+
 /// The start of an answer, for an error message.
 fn shown(body: &str) -> String {
     format!("{:?}", util::sanitize(body.trim(), 40))
@@ -74,6 +163,7 @@ impl Mikrotik {
         Ok(Mikrotik {
             base: format!("{}/rest", cfg.url),
             list: cfg.address_list.clone(),
+            safe: cfg.safe_list.clone(),
             check_rule: cfg.check_rule,
             agent: http::agent(&cfg.url, cfg.ca_file.as_deref(), http::DEFAULT_TIMEOUT)
                 .map_err(|e| format!("mikrotik: {}", e))?,
@@ -163,16 +253,40 @@ impl Mikrotik {
         .map_err(|e| e.to_string())
     }
 
-    /// Whether the address-list has an entry for `ip`.
-    fn listed(&self, ip: Ipv4Addr) -> Result<bool, BanError> {
+    /// Whether the address-list `list` has an entry for `ip`.
+    fn listed(&self, list: &str, ip: Ipv4Addr) -> Result<bool, BanError> {
         let address = ip.to_string();
         self.get_list(
             "ip/firewall/address-list",
-            &[("list", self.list.as_str()), ("address", address.as_str())],
+            &[("list", list), ("address", address.as_str())],
             ".id",
             ".id",
         )
         .map(|entries| !entries.is_empty())
+    }
+
+    /// The ids of the entries for `ip` in the address-list.
+    fn ids(&self, ip: Ipv4Addr) -> Result<Vec<String>, BanError> {
+        let address = ip.to_string();
+        let path = "ip/firewall/address-list";
+        let entries = self.get_list(
+            path,
+            &[("list", self.list.as_str()), ("address", address.as_str())],
+            ".id",
+            ".id",
+        )?;
+        entries
+            .iter()
+            .map(|entry| {
+                id_of(entry).map(str::to_string).ok_or_else(|| {
+                    BanError::Router(format!(
+                        "the answer to /{} has an entry id that is not a RouterOS id: {}",
+                        path,
+                        shown(entry)
+                    ))
+                })
+            })
+            .collect()
     }
 
     /// The rules in `table` that use the address-list.
@@ -191,9 +305,162 @@ impl Mikrotik {
                 out.invalid += 1;
             } else {
                 out.usable += 1;
+                if out.first.is_none() {
+                    out.first = id_of(rule).map(str::to_string);
+                }
             }
         }
         Ok(out)
+    }
+
+    /// Whether a rule in `table` accepts the safe list `safe` before the
+    /// drop rule `drop` (the id of the first usable rule for the
+    /// address-list). Two requests: the ids of every rule of the table, in
+    /// the order RouterOS keeps them (only ids: nothing else of the
+    /// operator's rules is read), and the rules that use the safe list.
+    fn safe_rules(
+        &self,
+        table: &str,
+        safe: &str,
+        drop: Option<&str>,
+    ) -> Result<Result<String, String>, BanError> {
+        let order = self.get_list(table, &[], ".id", ".id")?;
+        let order: Vec<&str> = order.iter().filter_map(|rule| id_of(rule)).collect();
+        let rules = self.get_list(
+            table,
+            &[(RULE_LIST_PROPERTY, safe)],
+            SAFE_RULE_PROPERTIES,
+            ".id",
+        )?;
+        let place = |id: &str| order.iter().position(|o| *o == id);
+        let Some(drop_at) = drop.and_then(place) else {
+            return Ok(Err(format!(
+                "the place of the drop rule for {} in /{} is not known: the rules changed while \
+                 they were read",
+                self.list, table
+            )));
+        };
+        let mut out = SafeRules::default();
+        for rule in &rules {
+            if members(rule, "disabled", Some("true")) > 0 {
+                out.disabled += 1;
+            } else if members(rule, "invalid", Some("true")) > 0 {
+                out.invalid += 1;
+            } else if members(rule, "action", Some("accept")) == 0 {
+                out.other_action += 1;
+            } else if id_of(rule).and_then(place).is_none_or(|at| at > drop_at) {
+                out.after += 1;
+            } else {
+                out.usable += 1;
+            }
+        }
+        Ok(out.verdict(table, safe, &self.list))
+    }
+
+    /// `PUT /rest/ip/firewall/address-list`: adds `ip` to `list`. Returns
+    /// `false` when the router already lists the address there (with or
+    /// without a timeout). `what` names the entry in an error.
+    fn add(
+        &self,
+        list: &str,
+        ip: Ipv4Addr,
+        bantime: BanTime,
+        comment: &str,
+        what: &str,
+    ) -> Result<bool, BanError> {
+        // An entry without a timeout is static: RouterOS saves it in its
+        // configuration, while timed entries live in memory only.
+        let timeout = match bantime {
+            BanTime::Seconds(s) => format!(",\"timeout\":\"{}\"", util::fmt_timeout(s)),
+            BanTime::Permanent => String::new(),
+        };
+        let body = format!(
+            "{{\"list\":\"{}\",\"address\":\"{}\"{},\"comment\":\"{}\"}}",
+            util::json_escape(list),
+            ip,
+            timeout,
+            util::json_escape(comment)
+        );
+        let result = self
+            .agent
+            .put(&format!("{}/ip/firewall/address-list", self.base))
+            .set("Authorization", &self.auth)
+            .set("Content-Type", "application/json")
+            .send_string(&body);
+        match result {
+            Ok(resp) if (200..300).contains(&resp.status()) => {
+                let answer = http::read_body(resp, MAX_BODY).map_err(BanError::Transport)?;
+                if is_object(&answer) {
+                    Ok(true)
+                } else {
+                    // Something other than RouterOS answered: whether the
+                    // entry was made is not known. The next attempt finds
+                    // out (an existing entry is "already listed").
+                    Err(BanError::Router(format!(
+                        "the answer to {} is not the JSON object RouterOS sends: {}",
+                        what,
+                        shown(&answer)
+                    )))
+                }
+            }
+            Ok(resp) => Err(BanError::Router(format!(
+                "unexpected HTTP {}",
+                resp.status()
+            ))),
+            Err(ureq::Error::Status(code, resp))
+                if (400..500).contains(&code) && code != 401 && code != 403 =>
+            {
+                // An answer about this request.
+                let message = Self::failure(code, resp);
+                if message.contains(DUPLICATE_TEXT) {
+                    return Ok(false);
+                }
+                // The wording of the duplicate error is not an interface;
+                // whether the entry exists is. A lookup that fails says the
+                // router cannot be used at all.
+                match self.listed(list, ip) {
+                    Ok(true) => Ok(false),
+                    Ok(false) => Err(BanError::Refused(message)),
+                    Err(e) => Err(e),
+                }
+            }
+            Err(ureq::Error::Status(code, resp)) => Err(Self::status_error(code, resp)),
+            Err(e) => Err(BanError::Transport(util::sanitize(&e.to_string(), 200))),
+        }
+    }
+
+    /// `PATCH /rest/ip/firewall/address-list/<id>` with a new timeout: how
+    /// RouterOS's REST interface changes a property of an entry. An answer
+    /// about this request (HTTP 4xx other than 401 and 403) is `Refused`.
+    fn renew(&self, id: &str, timeout: u64) -> Result<(), BanError> {
+        let body = format!("{{\"timeout\":\"{}\"}}", util::fmt_timeout(timeout));
+        let result = self
+            .agent
+            .request(
+                "PATCH",
+                &format!("{}/ip/firewall/address-list/{}", self.base, id),
+            )
+            .set("Authorization", &self.auth)
+            .set("Content-Type", "application/json")
+            .send_string(&body);
+        match result {
+            Ok(resp) if (200..300).contains(&resp.status()) => {
+                // read, so that the connection can be used again
+                http::read_body(resp, MAX_BODY).map_err(BanError::Transport)?;
+                Ok(())
+            }
+            Ok(resp) => Err(BanError::Router(format!(
+                "unexpected HTTP {}",
+                resp.status()
+            ))),
+            Err(ureq::Error::Status(code, resp))
+                if (400..500).contains(&code) && code != 401 && code != 403 =>
+            {
+                Err(BanError::Refused(Self::failure(code, resp)))
+            }
+            Err(ureq::Error::Status(code, resp)) => Err(Self::status_error(code, resp)),
+            Err(e) => Err(BanError::Transport(util::sanitize(&e.to_string(), 200))),
+        }
     }
 }
 
@@ -253,71 +520,20 @@ impl Firewall for Mikrotik {
     /// Adds `ip` to the address-list. Returns `false` when the router
     /// already lists the address (with or without a timeout).
     fn ban(&self, ip: Ipv4Addr, bantime: BanTime, comment: &str) -> Result<bool, BanError> {
-        // An entry without a timeout is static: RouterOS saves it in its
-        // configuration, while timed entries live in memory only.
-        let timeout = match bantime {
-            BanTime::Seconds(s) => format!(",\"timeout\":\"{}\"", util::fmt_timeout(s)),
-            BanTime::Permanent => String::new(),
-        };
-        let body = format!(
-            "{{\"list\":\"{}\",\"address\":\"{}\"{},\"comment\":\"{}\"}}",
-            util::json_escape(&self.list),
-            ip,
-            timeout,
-            util::json_escape(comment)
-        );
-        let result = self
-            .agent
-            .put(&format!("{}/ip/firewall/address-list", self.base))
-            .set("Authorization", &self.auth)
-            .set("Content-Type", "application/json")
-            .send_string(&body);
-        match result {
-            Ok(resp) if (200..300).contains(&resp.status()) => {
-                let answer = http::read_body(resp, MAX_BODY).map_err(BanError::Transport)?;
-                if is_object(&answer) {
-                    Ok(true)
-                } else {
-                    // Something other than RouterOS answered: whether the
-                    // entry was made is not known. The next attempt finds
-                    // out (an existing entry is "already listed").
-                    Err(BanError::Router(format!(
-                        "the answer to the ban is not the JSON object RouterOS sends: {}",
-                        shown(&answer)
-                    )))
-                }
-            }
-            Ok(resp) => Err(BanError::Router(format!(
-                "unexpected HTTP {}",
-                resp.status()
-            ))),
-            Err(ureq::Error::Status(code, resp))
-                if (400..500).contains(&code) && code != 401 && code != 403 =>
-            {
-                // An answer about this request.
-                let message = Self::failure(code, resp);
-                if message.contains(DUPLICATE_TEXT) {
-                    return Ok(false);
-                }
-                // The wording of the duplicate error is not an interface;
-                // whether the entry exists is. A lookup that fails says the
-                // router cannot be used at all.
-                match self.listed(ip) {
-                    Ok(true) => Ok(false),
-                    Ok(false) => Err(BanError::Refused(message)),
-                    Err(e) => Err(e),
-                }
-            }
-            Err(ureq::Error::Status(code, resp)) => Err(Self::status_error(code, resp)),
-            Err(e) => Err(BanError::Transport(util::sanitize(&e.to_string(), 200))),
-        }
+        self.add(&self.list, ip, bantime, comment, "the ban")
     }
 
     /// Reachable with our credentials and, unless `check_rule` is off, at
     /// least one rule in `raw` or `filter` that is neither disabled nor
     /// invalid has the address-list as its `src-address-list`. The rule's
     /// action and chain are not looked at.
-    fn check(&self) -> Result<String, HealthError> {
+    ///
+    /// With a safe list (and `check_rule` on), the table of the first such
+    /// rule is also asked for the order of its rules and for the rules that
+    /// use the safe list (`safe_rules`): one of these must be enabled,
+    /// valid, have the action `accept` and come before that drop rule.
+    /// Without a safe list nothing more is asked.
+    fn check_with_safe_list(&self) -> Result<Checked, HealthError> {
         let unusable = |e: BanError| HealthError::Unusable(e.to_string());
         if !self.check_rule {
             let body = self.get("system/identity", &[], "name").map_err(unusable)?;
@@ -327,7 +543,10 @@ impl Firewall for Mikrotik {
                     shown(&body)
                 ))));
             }
-            return Ok("router answers (rule check is off)".to_string());
+            return Ok(Checked {
+                found: "router answers (rule check is off)".to_string(),
+                safe_rule: None,
+            });
         }
         let (mut disabled, mut invalid) = (0, 0);
         for table in RULE_TABLES {
@@ -335,14 +554,22 @@ impl Firewall for Mikrotik {
             disabled += rules.disabled;
             invalid += rules.invalid;
             if rules.usable > 0 {
-                return Ok(format!(
+                let found = format!(
                     "{} enabled rule(s) in /{} with {}={}{}",
                     rules.usable,
                     table,
                     RULE_LIST_PROPERTY,
                     self.list,
                     left_out(disabled, invalid)
-                ));
+                );
+                let safe_rule = match &self.safe {
+                    None => None,
+                    Some(safe) => Some(
+                        self.safe_rules(table, safe, rules.first.as_deref())
+                            .map_err(unusable)?,
+                    ),
+                };
+                return Ok(Checked { found, safe_rule });
             }
         }
         Err(HealthError::NotEnforced(format!(
@@ -353,6 +580,120 @@ impl Firewall for Mikrotik {
             self.list,
             left_out(disabled, invalid)
         )))
+    }
+
+    /// `GET /rest/ip/firewall/address-list?list=<list>&address=<ip>&.proplist=.id`,
+    /// the request a refused ban already uses.
+    fn entries(&self, ip: Ipv4Addr) -> Result<Vec<String>, BanError> {
+        self.ids(ip)
+    }
+
+    /// `DELETE /rest/ip/firewall/address-list/<id>`. As for a ban, the
+    /// wording of an error is not an interface: after an answer about this
+    /// request (HTTP 4xx other than 401 and 403) the router is asked whether
+    /// the entry is still there.
+    fn remove(&self, ip: Ipv4Addr, id: &str) -> Result<(), BanError> {
+        if id_of(&format!("{{\".id\":\"{}\"}}", id)) != Some(id) {
+            return Err(BanError::Router(format!(
+                "{:?} is not a RouterOS id",
+                util::sanitize(id, 40)
+            )));
+        }
+        let result = self
+            .agent
+            .delete(&format!("{}/ip/firewall/address-list/{}", self.base, id))
+            .set("Authorization", &self.auth)
+            .call();
+        match result {
+            Ok(resp) if (200..300).contains(&resp.status()) => {
+                // read, so that the connection can be used again
+                http::read_body(resp, MAX_BODY).map_err(BanError::Transport)?;
+                Ok(())
+            }
+            Ok(resp) => Err(BanError::Router(format!(
+                "unexpected HTTP {}",
+                resp.status()
+            ))),
+            Err(ureq::Error::Status(code, resp))
+                if (400..500).contains(&code) && code != 401 && code != 403 =>
+            {
+                let message = Self::failure(code, resp);
+                match self.ids(ip) {
+                    Ok(ids) if !ids.iter().any(|i| i == id) => Ok(()),
+                    Ok(_) => Err(BanError::Refused(message)),
+                    Err(e) => Err(e),
+                }
+            }
+            Err(ureq::Error::Status(code, resp)) => Err(Self::status_error(code, resp)),
+            Err(e) => Err(BanError::Transport(util::sanitize(&e.to_string(), 200))),
+        }
+    }
+
+    fn safe_list(&self) -> Option<String> {
+        self.safe.clone()
+    }
+
+    /// `GET /rest/ip/firewall/address-list?list=<safe>&address=<ip>&.proplist=.id,dynamic,timeout`.
+    fn safe_entry(&self, ip: Ipv4Addr) -> Result<Option<SafeEntry>, BanError> {
+        let Some(safe) = &self.safe else {
+            return Ok(None);
+        };
+        let address = ip.to_string();
+        let path = "ip/firewall/address-list";
+        let entries = self.get_list(
+            path,
+            &[("list", safe.as_str()), ("address", address.as_str())],
+            SAFE_ENTRY_PROPERTIES,
+            ".id",
+        )?;
+        let Some(entry) = entries.first() else {
+            return Ok(None);
+        };
+        let id = id_of(entry).ok_or_else(|| {
+            BanError::Router(format!(
+                "the answer to /{} has an entry id that is not a RouterOS id: {}",
+                path,
+                shown(entry)
+            ))
+        })?;
+        Ok(Some(SafeEntry {
+            id: id.to_string(),
+            timed: members(entry, "timeout", None) > 0
+                || members(entry, "dynamic", Some("true")) > 0,
+        }))
+    }
+
+    /// The look-up (`safe_entry`), then the `PATCH` of the entry's timeout
+    /// or the `PUT` of a new entry: two requests. An entry without a
+    /// timeout was made by hand and is left as it is. After a refused
+    /// `PATCH` the entry is looked up again: one that has gone meanwhile
+    /// (its timeout ran out) is added.
+    fn keep_safe(&self, ip: Ipv4Addr, timeout: u64) -> Result<Kept, BanError> {
+        let Some(safe) = &self.safe else {
+            return Err(BanError::Router("no safe list is configured".to_string()));
+        };
+        let add = || {
+            self.add(
+                safe,
+                ip,
+                BanTime::Seconds(timeout),
+                SAFE_COMMENT,
+                "the safe-list entry",
+            )
+            .map(|added| if added { Kept::Added } else { Kept::Left })
+        };
+        match self.safe_entry(ip)? {
+            None => add(),
+            Some(SafeEntry { timed: false, .. }) => Ok(Kept::Left),
+            Some(SafeEntry { id, timed: true }) => match self.renew(&id, timeout) {
+                Ok(()) => Ok(Kept::Renewed),
+                Err(BanError::Refused(message)) => match self.safe_entry(ip)? {
+                    None => add(),
+                    Some(_) => Err(BanError::Refused(message)),
+                },
+                Err(e) => Err(e),
+            },
+        }
     }
 
     fn describe(&self) -> String {
@@ -415,6 +756,24 @@ mod tests {
         assert!(is_object("{\".id\":\"*1\",\"list\":\"x\"}\n"));
         assert!(!is_object("<html></html>"));
         assert!(!is_object("[]"));
+    }
+
+    #[test]
+    fn takes_entry_ids_that_look_like_routeros_ids() {
+        assert_eq!(id_of(r#"{".id":"*1A"}"#), Some("*1A"));
+        assert_eq!(id_of(r#"{ ".id" : "*C0000264" }"#), Some("*C0000264"));
+        for bad in [
+            r#"{".id":""}"#,
+            r#"{".id":"*1/../x"}"#,
+            r#"{".id":"*1?x=1"}"#,
+            r#"{".id":"*1 2"}"#,
+            r#"{".id":1}"#,
+            r#"{"address":"192.0.2.1"}"#,
+        ] {
+            assert_eq!(id_of(bad), None, "{}", bad);
+        }
+        let long = format!("{{\".id\":\"*{}\"}}", "F".repeat(MAX_ID));
+        assert_eq!(id_of(&long), None);
     }
 
     #[test]

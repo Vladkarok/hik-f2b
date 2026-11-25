@@ -119,7 +119,19 @@ to connections that your own LAN opened. hik-f2b checks at startup and every 5
 minutes that such a rule exists and is enabled. If the rule is gone, hik-f2b
 sends a health alert (see [Health alerts](#health-alerts)).
 
-4. Export the CA certificate:
+4. Optional: add the rule for the safe list, see [Safe list](#safe-list).
+   If you do not set `safe_list`, skip this step.
+   If you set it, add this rule above the drop rule:
+
+```
+/ip firewall raw add chain=prerouting src-address-list=cctv_safe action=accept comment="hik-f2b: accept safe" place-before=[find comment="hik-f2b: drop banned"]
+```
+
+The rule must be in the same table and chain as the drop rule, and above it.
+`place-before` puts it right above the drop rule from step 3. Use the name
+of your `safe_list` in place of `cctv_safe`.
+
+5. Export the CA certificate:
 
 ```
 /certificate export-certificate f2b-ca
@@ -127,7 +139,7 @@ sends a health alert (see [Health alerts](#health-alerts)).
 
 The router now has the file `cert_export_f2b-ca.crt` in its files.
 
-5. Copy this file to the host. The [Host](#3-host) step saves it as
+6. Copy this file to the host. The [Host](#3-host) step saves it as
    `router-ca.crt`, the name that the example config expects. With Compose or
    without a container, name it `router-ca.crt` yourself.
 
@@ -243,9 +255,10 @@ Run these commands the same way as you run the service. For the plain binary:
 
 ```bash
 # Every NVR (login, clock, log search), the router and its drop rule,
-# whether Telegram is configured, and the country database if set. One line
-# per item; exits non-zero if anything failed. Bans nothing, sends nothing,
-# does not touch the state file.
+# the own addresses, what each host name in ignoreip resolves to, whether
+# Telegram is configured, and the country database if set. One line per
+# item; exits non-zero if anything failed.
+# Bans nothing, sends nothing, does not touch the state file.
 hik-f2b --config hik-f2b.ini --check
 
 # What the NVR returns. Failed logins must be flagged MATCH and carry ip=...
@@ -402,7 +415,7 @@ See [hik-f2b.example.ini](hik-f2b.example.ini). The settings in `[general]`:
 | `maxretry` | 5 | 1–1000 | Failed-login log entries that trigger a ban. |
 | `findtime` | 3600 | 10–2592000 | Window in which they must happen. |
 | `bantime` | 86400 | 60–21474836 or `permanent` | Ban length; the router expires the entry itself. `permanent`: see [Permanent bans](#permanent-bans). |
-| `ignoreip` | private ranges | | Addresses and networks that are never banned. Setting it replaces the default list. |
+| `ignoreip` | private ranges | | Addresses, networks and host names that are never banned. Setting it replaces the default list. A host name stands for the addresses it resolves to, see [Host names in ignoreip](#host-names-in-ignoreip). The own addresses are never banned either, see [Own addresses](#own-addresses). |
 | `max_bans_per_hour` | 20 | 1–10000 | Upper limit on new bans (or reports) per hour. |
 | `poll_interval` | 30 | 5–3600 | Time between log polls. |
 | `lookback` | 120 | 10–172800 | Overlap between consecutive log queries. |
@@ -432,7 +445,10 @@ the setting you probably meant.
 
 The default `ignoreip` is `127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12,
 192.168.0.0/16`. If you set `ignoreip`, repeat the private ranges you still
-need.
+need. The own addresses of hik-f2b stay exempt whatever `ignoreip` says, see
+[Own addresses](#own-addresses). An item of `ignoreip` that is not an
+address or a network is a host name, for example `home.example.net`, see
+[Host names in ignoreip](#host-names-in-ignoreip).
 
 Failed logins are counted across all configured NVRs together.
 
@@ -455,6 +471,11 @@ address-list is blocked some other way, set it to `false`. Examples: a rule
 that uses the address-list as `dst-address-list`, or blocking on another
 device.
 
+`safe_list` in the `[mikrotik]` section (not set by default) names a second
+address-list, in which hik-f2b keeps its own address toward the router, see
+[Safe list](#safe-list). It follows the rules of `address_list` for a name
+and must differ from it.
+
 hik-f2b does not use a state file that was written by an older version
 (format 1), whose first line is damaged, that cannot be read or that is
 larger than 16 MiB. It logs a WARNING that says why and renames the file to
@@ -464,6 +485,132 @@ NVR log from the current time on, and the hourly ban counter starts at zero.
 If the file cannot be renamed, hik-f2b does not start, so that it does not
 overwrite the file. Single lines that cannot be used are left out, with one
 WARNING that counts them.
+
+### Own addresses
+
+hik-f2b never bans its own addresses. They are the addresses of the router
+and of each NVR, taken from the URLs in the config (a host name is
+resolved), and the address this host uses to reach each of them. hik-f2b
+finds them at run time, when it starts and again in every poll, so an
+address that changes (DHCP, a VPN that reconnects) counts from the next
+poll on. A host name in a URL is resolved when hik-f2b starts and then at
+most every 5 minutes, so that a slow resolver does not hold up every poll.
+There is no setting for them, and this cannot be turned off.
+
+- The start of the service logs them in one INFO line
+  (`own addresses, never banned: ...`): for each device, its address and
+  the address of this host toward it. `--check` prints the same as its line
+  `own addresses`. A change is one INFO line (`own addresses changed: ...`).
+  If a look-up fails, for example because a host name does not resolve, the
+  addresses found before stay, and hik-f2b logs a WARNING.
+- A failed login from an own address is never counted. The log line says
+  `an own address of hik-f2b, never banned, not counted`. This is what you
+  see when the password of hik-f2b's NVR user was changed on the NVR: every
+  poll is then a failed login from this host, next to the ERROR
+  `login to the NVR was rejected`. Before 0.5.0 these failed logins could
+  get the host banned once the password was right again.
+- A waiting ban and the counted failed logins of an address that becomes an
+  own address are dropped, as for `ignoreip`
+  (`the address is now an own address of hik-f2b and is never banned`).
+- With every firewall check (at startup and every 5 minutes), hik-f2b asks
+  the router whether an own address is in `address_list`. If one is, it
+  removes the entry, logs a WARNING and sends a notification at once. This
+  is the only ban that hik-f2b ever removes: it never adds an own address
+  itself, so the entry came from elsewhere (by hand, another tool or an
+  earlier version). In a dry run it reports the entry once and does not
+  remove it. If the removal fails, the problem is a health alert, see
+  [Health alerts](#health-alerts). Each check asks once per own address.
+  Loopback and the other ranges that are never banned need no question.
+- The addresses come only from the config and from the answers of this
+  host's own sockets and resolver, never from an NVR log. So a forged log
+  entry cannot make an address exempt.
+
+The limit: with NAT between this host and a device, the device sees another
+address, which hik-f2b cannot know. Put that address into `ignoreip`. A
+host name in a URL is resolved by this host's resolver, so whoever controls
+the answer for that name also decides which address is exempt.
+
+### Host names in ignoreip
+
+If your own public address changes (a home connection), you cannot write it
+into `ignoreip`, and a few wrong passwords from it ban you for `bantime`.
+Write a host name instead that follows your address, for example a dynamic
+DNS name: `ignoreip = 192.168.0.0/16, home.example.net`.
+
+- An item of `ignoreip` that is not an address or a network is a host name.
+  It has at least one dot, and only letters, digits and hyphens. A name of
+  another form is a config error that names the item. A name that does not
+  resolve is no error: the resolver may be down when hik-f2b starts.
+- hik-f2b resolves each name when it starts and then at most every 5
+  minutes, IPv4 only, with the resolver of this host. An address the name
+  resolves to is exempt like an address written in `ignoreip`. Its failed
+  logins are not counted
+  (`never banned (ignoreip name home.example.net), not counted`). Its waiting ban and counted failed logins are dropped
+  (`the address is now what the ignoreip name home.example.net resolves to`),
+  also right before a ban is applied.
+- When the name moves to another address, the old address is no longer
+  exempt: its next failed logins are counted, from zero. The change is one
+  INFO line (`ignoreip: home.example.net now resolves to ...`).
+- If a look-up fails, the addresses found before stay exempt. One WARNING
+  says so, not again while the look-ups keep failing. A name that has never
+  resolved exempts nothing, and the start of the service says so in a
+  WARNING.
+- The start of the service logs each name and what it resolves to
+  (`ignoreip names, never banned: ...`). `--check` prints one line per name
+  (`ignoreip home.example.net: resolves to ...`). A name that does not
+  resolve is a failed check there, because it protects nobody.
+- These addresses are not own addresses. hik-f2b does not remove them from
+  the address-list and does not write them to the safe list. If such an
+  address is banned already, remove its entry on the router.
+
+The trade-off: whoever controls the answer for the name can exempt any
+address from bans. That is the DNS provider, whoever holds the account at
+the dynamic DNS service, and whoever can forge answers on the path between
+this host and its resolver. Use a name under your own control, and protect
+that account well. Where your address is stable, write the address instead:
+that is safer. Why hik-f2b offers names anyway:
+[ADR 0007](docs/adr/0007-host-names-in-ignoreip-only-exempt.md).
+
+### Safe list
+
+The safe list is an optional second address-list on the router, named by
+`safe_list` in `[mikrotik]`, for example `cctv_safe`. hik-f2b keeps one
+address in it: the address of this host toward the router, one of the own
+addresses. Nothing read from an NVR log can get into it. Together with an
+accept rule above the drop rule (step 4 of the [router setup](#1-router)),
+the router does not block that address, whatever the address-list holds.
+Without `safe_list` none of this happens, and hik-f2b sends no request for
+it.
+
+- hik-f2b adds the entry when it starts, with a timeout of 30 minutes. At
+  every firewall check that the router answers (every 5 minutes), it renews
+  the timeout. So the entry outlives five failed checks in a row, and it
+  expires by itself when the service stops or the host moves. Each check
+  sends four requests more: the order of the rules, the rules that use the
+  safe list, the look-up of the entry, and the renewal
+  (`PATCH /rest/ip/firewall/address-list/<id>`) or the new entry.
+- The start logs `... added to the safe list cctv_safe for 00:30:00`. If
+  the address of this host toward the router changes, hik-f2b adds the new
+  one. It leaves the old one to expire and logs that once. An entry without
+  a timeout, added by hand, is left as it is.
+- The firewall check also checks the rule: one rule in the table of the
+  drop rule must have `src-address-list` set to `safe_list` and the action
+  `accept`. It must be enabled, valid and come before the first enabled
+  drop rule. If not, hik-f2b logs `safe list check failed: ...` with what to
+  add or move, and the problem is a health alert (`safe-list-rule`).
+- If the router refuses to write the entry, hik-f2b logs an ERROR at each
+  check, and the problem is a health alert (`safe-list-refused`). A router
+  that cannot be reached is the firewall problem, as for a ban.
+- A dry run writes nothing to the router. It says once what it would write
+  (`DRY RUN: would keep ...`). The rule is checked as usual.
+- `--check` prints a line `safe list`: the rule, and whether the address is
+  in the list. It writes nothing. Without the service, the entry expires
+  after 30 minutes, and `--check` then says that it is not in the list.
+
+What the safe list does not do: whoever has the router account can remove
+the rule or the entry, as they can change any other rule. Most setups do not
+need the safe list: the drop rule matches only packets from the WAN, and the
+host usually reaches the router from the LAN.
 
 ### Permanent bans
 
@@ -750,6 +897,24 @@ and always in its log. It watches:
   whether it is over. Then hik-f2b sends one message that says so, sends no
   more reminders, and does not claim a recovery. The next refused ban starts
   a new problem.
+- **An own address in the address-list:** hik-f2b found an own address in
+  `address_list` and could not remove it, for example because the router
+  user's group has lost the `write` policy (`own-address-listed`). The
+  reason names the address. Remove the entry by hand on the router and
+  check the router user. The problem is over at the first firewall check
+  that finds no own address in the address-list. When hik-f2b finds the
+  entry, it also sends one message at once, not after `alert_after`, see
+  [Own addresses](#own-addresses).
+- **The rule of the safe list** (only with `safe_list`): no enabled, valid
+  rule with `src-address-list` set to `safe_list` and the action `accept`
+  comes before the first enabled drop rule, in the same table
+  (`safe-list-rule`). The reason says what to add, enable or move. hik-f2b
+  reads the ids of the table's rules in their order
+  (`GET /rest/ip/firewall/raw?.proplist=.id`) and the rules of the safe list
+  with their `disabled`, `invalid` and `action`. See [Safe list](#safe-list).
+- **A refused write to the safe list** (only with `safe_list`): the router
+  answers, but refuses to add or renew the entry of this host
+  (`safe-list-refused`). Only a write that works ends it.
 
 The router checks also run in a dry run, where they help with the setup. A dry
 run sends no bans, so the refused-ban check does not run in a dry run. In
@@ -840,7 +1005,9 @@ than 5 minutes in the future (host time).
   covered by the default `ignoreip`. Some VPNs use 100.64.0.0/10 (Tailscale,
   carrier-grade NAT), which the default does not cover. Add such ranges to
   `ignoreip`. Also add your own public addresses (office, monitoring host).
-  Keep the private ranges in `ignoreip`.
+  If your address changes, add a host name that follows it, see
+  [Host names in ignoreip](#host-names-in-ignoreip). Keep the private ranges
+  in `ignoreip`.
 - A client app with a stale saved password retries on its own and reaches the
   threshold quickly. After you change a password, update the saved password
   in the client apps at once.
@@ -922,7 +1089,29 @@ whatever they typed). It is built accordingly:
   for the router is checked against `ignoreip` again before it is applied,
   and at startup. So if you add an address to `ignoreip` and restart
   hik-f2b, its waiting ban and its counted failed logins are dropped, with an
-  INFO line for each address.
+  INFO line for each address. The same holds for the addresses that the
+  host names in `ignoreip` resolve to, see the item after the next. The own
+  addresses are never banned either, see the next item.
+- **Never banning itself.** hik-f2b finds its own addresses (the router's,
+  each NVR's and this host's toward each) from the config and from this
+  host's own sockets and resolver only, never from a log entry. A failed
+  login from one is not counted, and an own address found in the
+  address-list is removed at the next firewall check. So neither hik-f2b's
+  own failed logins after a password change nor a forged entry with the
+  host's address can get the host banned, so that the router would block
+  hik-f2b itself. See [Own addresses](#own-addresses).
+- **Host names in ignoreip.** Whoever controls the answer for such a name
+  (the DNS provider, the account at the dynamic DNS service, or someone who
+  can forge answers on the path to the resolver) can exempt an address from
+  bans. A name only exempts: hik-f2b never removes a ban for it and never
+  writes its addresses to the safe list. Use a name
+  under your control, or the address itself where it is stable. See
+  [Host names in ignoreip](#host-names-in-ignoreip).
+- **Safe list (optional).** With `safe_list` and its accept rule, the
+  router does not block the address of this host toward it, whatever the
+  address-list holds. hik-f2b writes only that own address to the safe
+  list, and it never adds or changes a firewall rule. See
+  [Safe list](#safe-list).
 - **TLS.** Certificate verification cannot be turned off. An https router URL
   needs `ca_file`: with a path, only that CA is trusted; `ca_file = public`
   trusts the public CA roots built into hik-f2b, which has to be written out.
@@ -986,6 +1175,8 @@ What it does not protect against:
   rules above cannot tell from a real one. Both NVRs tested here escape `<`
   and cut the logged name to 15 characters, so they are not affected.
 - A ban is per address, so it also affects anyone sharing that address.
+- An attacker with the router account or root on the host. They can remove
+  the rule of the safe list or its entry, or ban any address.
 
 Never attach your real config, router export or `--dump --raw` output to an
 issue unchanged. They hold passwords, public addresses and serial numbers, and
@@ -995,6 +1186,9 @@ vulnerability, see [SECURITY.md](SECURITY.md).
 ## Limitations
 
 - IPv4 only.
+- With NAT between this host and a device, hik-f2b cannot know the address
+  the device sees: put it into `ignoreip`, see
+  [Own addresses](#own-addresses).
 - Detection lags by up to `poll_interval` seconds.
 - Timed bans are address-list entries with a timeout, which RouterOS does not
   keep across a reboot. After a router reboot an address is banned again once
@@ -1129,6 +1323,24 @@ Not yet tried:
   several challenges in one `WWW-Authenticate` header, a user name with a bare
   `&`, and a clock set before 1970. Only the tests make these happen.
 - Notify-only mode on real devices.
+- The own addresses of 0.5.0 on real devices: none of it has been tried
+  yet. Not the addresses this host finds toward a real router and NVR, nor
+  a host name in a device URL, nor the start line and `--check` with real
+  devices. Not the removal of an own address from a real router's
+  address-list either: the `DELETE` request, the answers of RouterOS to it
+  (also for a router user without the `write` policy) and the
+  `own-address-listed` alert. Only the tests and the simulation make these
+  happen.
+- The host names in `ignoreip` of 0.5.0 on a real host: none of it has
+  been tried yet. Not the look-up through a real resolver (with a dynamic
+  DNS name or otherwise), nor the start line and `--check` with a real
+  name. Only the tests and the simulation make these happen.
+- The safe list of 0.5.0 on a real router: none of it has been tried yet.
+  Not the rule command of the setup (with `place-before`), the renewal of a
+  timeout with `PATCH`, the answers of RouterOS to the safe-list requests,
+  the order in which it lists the rules of a table, nor the `action`
+  property in its answer. Only the tests and the simulation make these
+  happen.
 - A ban with a country on real devices: only `--country` and `--check` were
   run against a real database file.
 - MaxMind GeoLite2 City and IPinfo Lite database files.

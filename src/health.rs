@@ -827,4 +827,509 @@ mod tests {
         a.withdraw(&Check::Firewall, T0);
         assert!(a.due(T0 + 5 * AFTER).is_empty());
     }
+
+    // The rules of `Health`: which check a report opens, passes or
+    // withdraws. Each test reports what the engine would and looks at the
+    // notices that `alert_after` later brings.
+
+    const LIMIT: usize = 20;
+    const IP: Ipv4Addr = Ipv4Addr::new(198, 51, 100, 7);
+
+    fn health() -> Health {
+        Health::new(AFTER, LIMIT)
+    }
+
+    /// The problems that are open at `now`: they are alerted `AFTER` later.
+    /// Alerts every open problem, so call it once per test step.
+    fn open_at(h: &mut Health, now: u64) -> Vec<Check> {
+        h.due(now + AFTER)
+            .into_iter()
+            .filter(|n| n.kind == Kind::Alert)
+            .map(|n| n.check)
+            .collect()
+    }
+
+    fn reasons(notices: &[Notice]) -> Vec<(Check, String)> {
+        notices
+            .iter()
+            .map(|n| (n.check.clone(), n.reason.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn nvr_reads_open_and_end_the_nvr_check() {
+        let mut h = health();
+        h.nvr_polled("nvr1", NvrRead::LoginRejected("HTTP 401"), T0);
+        h.nvr_polled("nvr2", NvrRead::Failed("timed out"), T0);
+        h.nvr_polled("nvr3", NvrRead::Read, T0);
+        let due = h.due(T0 + AFTER);
+        assert_eq!(
+            reasons(&due),
+            vec![
+                (nvr("nvr1"), "login rejected (HTTP 401)".to_string()),
+                (nvr("nvr2"), "timed out".to_string()),
+            ]
+        );
+        // backing off: not tried, the problem stays open and is not news
+        h.nvr_polled("nvr1", NvrRead::NotTried, T0 + AFTER + 30);
+        assert!(h.due(T0 + AFTER + 30).is_empty());
+        assert_eq!(h.alerted(), vec!["nvr:nvr1", "nvr:nvr2"]);
+        // a read ends it
+        h.nvr_polled("nvr1", NvrRead::Read, T0 + 2 * AFTER);
+        h.nvr_polled("nvr2", NvrRead::Read, T0 + 2 * AFTER);
+        assert_eq!(
+            kinds(&h.due(T0 + 2 * AFTER)),
+            vec![
+                (nvr("nvr1"), Kind::Recovered),
+                (nvr("nvr2"), Kind::Recovered)
+            ]
+        );
+    }
+
+    #[test]
+    fn not_tried_does_not_open_a_problem() {
+        let mut h = health();
+        h.nvr_polled("nvr1", NvrRead::NotTried, T0);
+        assert!(open_at(&mut h, T0).is_empty());
+    }
+
+    #[test]
+    fn firewall_check_results() {
+        // usable: both the firewall and the rule pass
+        let mut h = health();
+        h.firewall_checked(&Err(HealthError::Unusable("timeout".into())), T0);
+        h.firewall_checked(&Err(HealthError::NotEnforced("no rule".into())), T0);
+        assert_eq!(open_at(&mut h, T0), vec![Check::Rule]);
+        h.firewall_checked(&Ok("rule found".into()), T0 + AFTER);
+        assert_eq!(
+            kinds(&h.due(T0 + AFTER)),
+            vec![(Check::Rule, Kind::Recovered)]
+        );
+
+        // unusable: says nothing about the rule
+        let mut h = health();
+        h.firewall_checked(&Err(HealthError::NotEnforced("no rule".into())), T0);
+        h.firewall_checked(&Err(HealthError::Unusable("timeout".into())), T0);
+        let due = h.due(T0 + AFTER);
+        assert_eq!(
+            reasons(&due),
+            vec![
+                (Check::Firewall, "timeout".to_string()),
+                (Check::Rule, "no rule".to_string()),
+            ]
+        );
+
+        // rule missing or wrong: the firewall itself is usable
+        let mut h = health();
+        h.firewall_checked(&Err(HealthError::Unusable("timeout".into())), T0);
+        assert_eq!(h.due(T0 + AFTER).len(), 1);
+        h.firewall_checked(
+            &Err(HealthError::NotEnforced("rule disabled".into())),
+            T0 + AFTER,
+        );
+        assert_eq!(
+            kinds(&h.due(T0 + AFTER)),
+            vec![(Check::Firewall, Kind::Recovered)]
+        );
+        assert_eq!(
+            reasons(&h.due(T0 + 2 * AFTER)),
+            vec![(Check::Rule, "rule disabled".to_string())]
+        );
+    }
+
+    #[test]
+    fn periodic_check_every_interval() {
+        let mut h = health();
+        // never checked: due at once
+        assert!(h.check_due(T0));
+        h.firewall_checked(&Ok(String::new()), T0);
+        assert!(!h.check_due(T0));
+        assert!(!h.check_due(T0 + HEALTH_CHECK_INTERVAL - 1));
+        assert!(h.check_due(T0 + HEALTH_CHECK_INTERVAL));
+        // a failed check counts as a check
+        h.firewall_checked(&Err(HealthError::Unusable("x".into())), T0 + 1000);
+        assert!(!h.check_due(T0 + 1000 + HEALTH_CHECK_INTERVAL - 1));
+        assert!(h.check_due(T0 + 1000 + HEALTH_CHECK_INTERVAL));
+    }
+
+    #[test]
+    fn periodic_check_after_the_host_clock_went_back() {
+        let mut h = health();
+        h.firewall_checked(&Ok(String::new()), T0);
+        // the next check is at most one interval away
+        assert!(!h.check_due(T0 + HEALTH_CHECK_INTERVAL - 1));
+        assert!(!h.check_due(T0));
+        assert!(h.check_due(T0 - 1));
+        assert!(h.check_due(T0 - 86400));
+    }
+
+    #[test]
+    fn periodic_check_skipped_after_the_ban_loop_was_cut_short() {
+        // A read that works must not end a problem that writes still show.
+        let mut h = health();
+        h.ban_tried(BanAttempt::Unreachable("cannot reach the firewall"), T0);
+        h.bans_ended(BansEnded::CutShort, 3, T0);
+        assert!(!h.check_due(T0));
+        assert!(!h.check_due(T0 + 10 * HEALTH_CHECK_INTERVAL));
+        // the next ban loop that is not cut short lets it run again
+        for end in [
+            BansEnded::Complete,
+            BansEnded::RateLimited,
+            BansEnded::Stopped,
+        ] {
+            h.bans_ended(BansEnded::CutShort, 3, T0);
+            assert!(!h.check_due(T0 + 1000));
+            h.bans_ended(end, 3, T0 + 1000);
+            assert!(h.check_due(T0 + 1000), "{:?}", end);
+        }
+        assert_eq!(
+            reasons(&h.due(T0 + 1000 + AFTER)),
+            vec![
+                (Check::Firewall, "cannot reach the firewall".to_string()),
+                (
+                    Check::RateLimit,
+                    "3 address(es) waiting, limit 20 per hour".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn accepted_or_listed_ban_passes_firewall_and_ban_refused() {
+        for attempt in [BanAttempt::Accepted, BanAttempt::Listed] {
+            let mut h = health();
+            h.ban_tried(BanAttempt::Unreachable("timeout"), T0);
+            h.ban_tried(
+                BanAttempt::Refused {
+                    ip: IP,
+                    error: "HTTP 400",
+                },
+                T0,
+            );
+            assert_eq!(h.due(T0 + AFTER).len(), 2);
+            h.ban_tried(attempt, T0 + AFTER + 60);
+            assert_eq!(
+                kinds(&h.due(T0 + AFTER + 60)),
+                vec![
+                    (Check::Firewall, Kind::Recovered),
+                    (Check::BanRefused, Kind::Recovered)
+                ],
+                "{:?}",
+                attempt
+            );
+            // and opens nothing
+            assert!(h.alerted().is_empty());
+            assert!(open_at(&mut h, T0 + AFTER + 60).is_empty());
+        }
+    }
+
+    #[test]
+    fn refused_ban_is_ended_only_by_an_accepted_ban() {
+        let mut h = health();
+        h.ban_tried(
+            BanAttempt::Refused {
+                ip: IP,
+                error: "HTTP 400: not allowed",
+            },
+            T0,
+        );
+        let due = h.due(T0 + AFTER);
+        assert_eq!(
+            reasons(&due),
+            vec![(
+                Check::BanRefused,
+                "198.51.100.7: HTTP 400: not allowed".to_string()
+            )]
+        );
+        assert_eq!(
+            due[0].text(),
+            "\u{26a0}\u{fe0f} hik-f2b: the firewall refuses bans for 10 min: \
+             198.51.100.7: HTTP 400: not allowed"
+        );
+        // a successful read, a complete ban loop with bans still waiting, a
+        // poll: none of these end it
+        h.firewall_checked(&Ok(String::new()), T0 + AFTER);
+        h.bans_ended(BansEnded::Complete, 1, T0 + AFTER);
+        h.poll_ended(T0 + AFTER);
+        assert!(h.due(T0 + AFTER).is_empty());
+        assert_eq!(h.alerted(), vec!["ban-refused"]);
+        h.ban_tried(BanAttempt::Accepted, T0 + 2 * AFTER);
+        assert_eq!(
+            kinds(&h.due(T0 + 2 * AFTER)),
+            vec![(Check::BanRefused, Kind::Recovered)]
+        );
+    }
+
+    #[test]
+    fn refused_ban_is_withdrawn_when_no_ban_waits() {
+        for end in [
+            BansEnded::Complete,
+            BansEnded::RateLimited,
+            BansEnded::CutShort,
+            BansEnded::Stopped,
+        ] {
+            let mut h = health();
+            h.ban_tried(
+                BanAttempt::Refused {
+                    ip: IP,
+                    error: "HTTP 400",
+                },
+                T0,
+            );
+            assert_eq!(h.due(T0 + AFTER).len(), 1);
+            h.bans_ended(end, 1, T0 + AFTER);
+            assert!(h.due(T0 + AFTER).is_empty());
+            h.bans_ended(end, 0, T0 + 2 * AFTER);
+            let notices = h.due(T0 + 2 * AFTER);
+            let refused: Vec<_> = kinds(&notices)
+                .into_iter()
+                .filter(|(c, _)| *c == Check::BanRefused)
+                .collect();
+            assert_eq!(
+                refused,
+                vec![(Check::BanRefused, Kind::Unknown)],
+                "{:?}",
+                end
+            );
+            assert!(!h.alerted().contains(&"ban-refused".to_string()));
+        }
+        // not yet alerted: withdrawn silently
+        let mut h = health();
+        h.ban_tried(
+            BanAttempt::Refused {
+                ip: IP,
+                error: "HTTP 400",
+            },
+            T0,
+        );
+        h.bans_ended(BansEnded::Complete, 0, T0);
+        assert!(open_at(&mut h, T0).is_empty());
+    }
+
+    #[test]
+    fn unreachable_firewall_during_bans_is_one_firewall_problem() {
+        let mut h = health();
+        h.ban_tried(
+            BanAttempt::Unreachable("cannot reach the firewall: timed out"),
+            T0,
+        );
+        h.bans_ended(BansEnded::CutShort, 2, T0);
+        // the same trouble, reported again by later loops: still one alert
+        h.ban_tried(
+            BanAttempt::Unreachable("the firewall refuses our login: HTTP 401"),
+            T0 + 300,
+        );
+        h.bans_ended(BansEnded::CutShort, 2, T0 + 300);
+        let due = h.due(T0 + AFTER);
+        assert_eq!(
+            reasons(&due),
+            vec![(
+                Check::Firewall,
+                "the firewall refuses our login: HTTP 401".to_string()
+            )]
+        );
+        assert_eq!(due[0].lasted, AFTER);
+        assert!(h.due(T0 + 2 * AFTER).is_empty());
+    }
+
+    #[test]
+    fn rate_limit_passes_only_after_a_complete_ban_loop() {
+        let mut h = health();
+        h.bans_ended(BansEnded::RateLimited, 5, T0);
+        let due = h.due(T0 + AFTER);
+        assert_eq!(
+            due[0].text(),
+            "\u{26a0}\u{fe0f} hik-f2b: new bans are held back by max_bans_per_hour for \
+             10 min: 5 address(es) waiting, limit 20 per hour"
+        );
+        // cut short by an unreachable firewall, or stopped: not known
+        h.bans_ended(BansEnded::CutShort, 5, T0 + AFTER + 30);
+        h.bans_ended(BansEnded::Stopped, 5, T0 + AFTER + 60);
+        assert!(h.due(T0 + AFTER + 60).is_empty());
+        assert_eq!(h.alerted(), vec!["rate-limit"]);
+        h.bans_ended(BansEnded::Complete, 0, T0 + 2 * AFTER);
+        assert_eq!(
+            kinds(&h.due(T0 + 2 * AFTER)),
+            vec![(Check::RateLimit, Kind::Recovered)]
+        );
+        // the reason gives the bans that wait now and the limit
+        let mut h = Health::new(AFTER, 3);
+        h.bans_ended(BansEnded::RateLimited, 1, T0);
+        h.bans_ended(BansEnded::RateLimited, 7, T0 + 60);
+        assert_eq!(
+            reasons(&h.due(T0 + AFTER)),
+            vec![(
+                Check::RateLimit,
+                "7 address(es) waiting, limit 3 per hour".to_string()
+            )]
+        );
+    }
+
+    fn bypass(h: &mut Health, banned_at: Option<u64>, now: u64) {
+        h.ban_tried(
+            BanAttempt::Bypassed {
+                ip: IP,
+                list: "cctv_ban on router",
+                banned_at,
+                nvr: "nvr1",
+            },
+            now,
+        );
+    }
+
+    #[test]
+    fn bypassed_reason_and_what_else_it_passes() {
+        let mut h = health();
+        h.ban_tried(BanAttempt::Unreachable("timeout"), T0 - 2 * AFTER);
+        assert_eq!(h.due(T0 - AFTER).len(), 1);
+        bypass(&mut h, Some(T0 - 3 * 3600), T0);
+        bypass(&mut h, None, T0 + 60);
+        let due = h.due(T0 + 60);
+        assert_eq!(kinds(&due), vec![(Check::Firewall, Kind::Recovered)]);
+        let due = h.due(T0 + AFTER);
+        assert_eq!(
+            reasons(&due),
+            vec![(
+                Check::Bypassed,
+                "198.51.100.7 is in cctv_ban on router and still reached nvr1".to_string()
+            )]
+        );
+        let mut h = health();
+        bypass(&mut h, Some(T0 - 3 * 3600), T0);
+        assert_eq!(
+            h.due(T0 + AFTER)[0].text(),
+            "\u{26a0}\u{fe0f} hik-f2b: banned addresses still reach an NVR for 10 min: \
+             198.51.100.7 has been in cctv_ban on router for 3 h and still reached nvr1"
+        );
+        // an address listed within the grace period opens nothing
+        let mut h = health();
+        h.ban_tried(BanAttempt::Listed, T0);
+        h.poll_ended(T0);
+        assert!(open_at(&mut h, T0).is_empty());
+    }
+
+    #[test]
+    fn bypass_ends_after_alert_after_in_a_poll_that_read_every_nvr() {
+        let mut h = health();
+        bypass(&mut h, None, T0);
+        h.poll_ended(T0);
+        h.nvr_polled("nvr1", NvrRead::Read, T0 + AFTER - 1);
+        h.poll_ended(T0 + AFTER - 1);
+        let due = h.due(T0 + AFTER - 1);
+        assert!(due.is_empty());
+        // alerted: the problem lasted alert_after without a pause that long
+        h.nvr_polled("nvr1", NvrRead::Read, T0 + AFTER);
+        let due = h.due(T0 + AFTER);
+        assert_eq!(kinds(&due), vec![(Check::Bypassed, Kind::Alert)]);
+        // the end is decided at the end of the poll
+        assert!(h.due(T0 + AFTER).is_empty());
+        h.poll_ended(T0 + AFTER);
+        assert_eq!(
+            kinds(&h.due(T0 + AFTER)),
+            vec![(Check::Bypassed, Kind::Recovered)]
+        );
+        // over: later polls say nothing
+        h.poll_ended(T0 + 10 * AFTER);
+        assert!(h.due(T0 + 10 * AFTER).is_empty());
+    }
+
+    #[test]
+    fn bypass_does_not_end_in_a_poll_that_missed_an_nvr() {
+        for missed in [
+            NvrRead::Failed("timed out"),
+            NvrRead::LoginRejected("HTTP 401"),
+            NvrRead::NotTried,
+        ] {
+            let mut h = health();
+            bypass(&mut h, None, T0);
+            h.poll_ended(T0);
+            assert_eq!(h.due(T0 + AFTER).len(), 1);
+            h.nvr_polled("nvr1", NvrRead::Read, T0 + 2 * AFTER);
+            h.nvr_polled("nvr2", missed, T0 + 2 * AFTER);
+            h.poll_ended(T0 + 2 * AFTER);
+            assert_eq!(h.alerted(), vec!["ban-bypassed"], "{:?}", missed);
+            // only that poll: the next one that reads every NVR ends it
+            h.nvr_polled("nvr1", NvrRead::Read, T0 + 3 * AFTER);
+            h.nvr_polled("nvr2", NvrRead::Read, T0 + 3 * AFTER);
+            h.poll_ended(T0 + 3 * AFTER);
+            let due = h.due(T0 + 3 * AFTER);
+            assert!(
+                due.iter()
+                    .any(|n| n.check == Check::Bypassed && n.kind == Kind::Recovered),
+                "{:?}",
+                missed
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_bypass_restarts_the_timer() {
+        let mut h = health();
+        bypass(&mut h, None, T0);
+        h.poll_ended(T0);
+        bypass(&mut h, None, T0 + AFTER - 1);
+        h.poll_ended(T0 + AFTER - 1);
+        h.poll_ended(T0 + AFTER);
+        h.poll_ended(T0 + 2 * AFTER - 2);
+        assert_eq!(h.alerted(), Vec::<String>::new());
+        assert_eq!(
+            kinds(&h.due(T0 + 2 * AFTER - 2)),
+            vec![(Check::Bypassed, Kind::Alert)]
+        );
+        h.poll_ended(T0 + 2 * AFTER - 1);
+        assert_eq!(
+            kinds(&h.due(T0 + 2 * AFTER - 1)),
+            vec![(Check::Bypassed, Kind::Recovered)]
+        );
+    }
+
+    #[test]
+    fn bypass_timer_after_the_host_clock_went_back() {
+        let mut h = health();
+        bypass(&mut h, None, T0);
+        h.poll_ended(T0);
+        // a day back: counted from then, neither ended at once nor never
+        let back = T0 - 86400;
+        h.poll_ended(back);
+        assert!(h.due(back).is_empty());
+        h.poll_ended(back + AFTER - 1);
+        assert_eq!(
+            kinds(&h.due(back + AFTER)),
+            vec![(Check::Bypassed, Kind::Alert)]
+        );
+        h.poll_ended(back + AFTER);
+        assert_eq!(
+            kinds(&h.due(back + AFTER)),
+            vec![(Check::Bypassed, Kind::Recovered)]
+        );
+    }
+
+    #[test]
+    fn recoveries_come_in_the_order_reported() {
+        let mut h = health();
+        h.nvr_polled("nvr1", NvrRead::Failed("x"), T0);
+        h.firewall_checked(&Err(HealthError::NotEnforced("x".into())), T0);
+        // a bypass passes the firewall check: reported before it fails
+        bypass(&mut h, None, T0);
+        h.ban_tried(BanAttempt::Unreachable("x"), T0);
+        h.bans_ended(BansEnded::RateLimited, 1, T0);
+        h.poll_ended(T0);
+        assert_eq!(h.due(T0 + AFTER).len(), 5);
+        let now = T0 + 2 * AFTER;
+        h.nvr_polled("nvr1", NvrRead::Read, now);
+        h.ban_tried(BanAttempt::Accepted, now);
+        h.bans_ended(BansEnded::Complete, 0, now);
+        h.poll_ended(now);
+        h.firewall_checked(&Ok(String::new()), now);
+        assert_eq!(
+            kinds(&h.due(now)),
+            vec![
+                (nvr("nvr1"), Kind::Recovered),
+                (Check::Firewall, Kind::Recovered),
+                (Check::RateLimit, Kind::Recovered),
+                (Check::Bypassed, Kind::Recovered),
+                (Check::Rule, Kind::Recovered),
+            ]
+        );
+    }
 }

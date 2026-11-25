@@ -31,6 +31,12 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   about banned addresses) moved into their own module, `src/ledger.rs`,
   with unit tests of their own. hik-f2b behaves as before: the hik-f2b log,
   the notifications, the config and the state file are unchanged.
+- The rules that decide which health check an NVR read, a firewall check or
+  a ban attempt opens or ends (for example that only a ban the router
+  accepts ends `ban-refused`, and when `ban-bypassed` is over) moved next to
+  the health checks in `src/health.rs`, with unit tests of their own.
+  hik-f2b behaves as before: the health alerts and the times they are sent
+  are unchanged.
 
 ### Fixed
 

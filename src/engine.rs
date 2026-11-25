@@ -11,19 +11,16 @@
 //! read, whether the firewall could be used and whether bans are held back;
 //! that module decides when this is worth an alert.
 
-use crate::action::{
-    render, BanError, BanInfo, BanTime, Firewall, HealthError, Notifier, NotifyError,
-};
+use crate::action::{render, BanError, BanInfo, Firewall, HealthError, Notifier, NotifyError};
 use crate::config::{Config, DEFAULT_MESSAGE};
 use crate::country::{self, Code};
 use crate::health::{Alerts, Check, CheckLine, Kind, Notice, Status};
+use crate::ledger::{Outcome, Rules, Turn, MAX_FUTURE};
 use crate::mikrotik::Mikrotik;
 use crate::nvr::{Event, Nvr, NvrError, Search};
-use crate::state::{
-    NvrState, Pending, State, MAX_BANNED, MAX_FAIL_TIMES, MAX_PENDING, MAX_SEEN, MAX_TRACKED,
-};
+use crate::state::{NvrState, State, MAX_SEEN};
 use crate::telegram::Telegram;
-use crate::util;
+use crate::util::{self, host_i64};
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
@@ -39,8 +36,6 @@ const MAX_NOTIFY_WAIT: u64 = 3600;
 /// Polls in a row that may fail for a reason other than authentication
 /// before the read cursor is moved past whatever blocks it.
 const MAX_FAILED_POLLS: u32 = 10;
-/// Entries more than this far in the (host) future are not counted.
-const MAX_FUTURE: i64 = 300;
 /// A change of the device-minus-host offset larger than this between two
 /// reads, in either direction, is a clock jump, not drift or a slow
 /// request. Well below a DST change, well above what slow polls of several
@@ -48,11 +43,6 @@ const MAX_FUTURE: i64 = 300;
 /// it and read after it are converted with the new offset, so their host
 /// times can be off by up to this much.
 pub const CLOCK_JUMP: i64 = 900;
-/// With `bantime = permanent` the router keeps the ban for ever, but what
-/// hik-f2b remembers about an address still needs an end: how long a ban
-/// that cannot be applied keeps waiting, and how long a reported address is
-/// not reported again.
-const PERMANENT_MEMORY: u64 = 86400;
 /// Time between two health checks of the firewall.
 pub const HEALTH_CHECK_INTERVAL: u64 = 300;
 /// Searches of one NVR's log per poll, when the NVR lists newest first and
@@ -105,14 +95,6 @@ fn describe_log(search: &Search) -> String {
     out
 }
 
-/// How long the engine remembers a ban (see `PERMANENT_MEMORY`).
-fn memory(bantime: BanTime) -> u64 {
-    match bantime {
-        BanTime::Seconds(s) => s,
-        BanTime::Permanent => PERMANENT_MEMORY,
-    }
-}
-
 pub struct Engine {
     pub cfg: Config,
     pub state: State,
@@ -137,26 +119,6 @@ pub struct Engine {
     dropped_notifications: usize,
     /// Host time before which the messenger asked not to be sent anything.
     notify_after: u64,
-}
-
-/// Addresses that can never be a remote attacker, whatever the log says.
-fn never_ban(ip: Ipv4Addr) -> bool {
-    ip.is_loopback()
-        || ip.is_unspecified()
-        || ip.is_broadcast()
-        || ip.is_multicast()
-        || ip.is_link_local()
-        || ip.octets()[0] == 0
-        || ip.octets()[0] >= 240
-}
-
-/// Never banned: in `ignoreip`, or in a range `never_ban` names.
-fn exempt(cfg: &Config, ip: Ipv4Addr) -> bool {
-    never_ban(ip) || cfg.ignored(ip)
-}
-
-fn host_i64(host_now: u64) -> i64 {
-    i64::try_from(host_now).unwrap_or(i64::MAX)
 }
 
 /// New failed logins of one NVR and the offset (device minus host time)
@@ -513,139 +475,33 @@ fn read_log(
     Ok(Polled { fresh, offset })
 }
 
-/// How many failure times are kept per address, and for how many addresses
-/// at most: the newest `4 * maxretry` (at least 16) times, for as many
-/// addresses as `MAX_FAIL_TIMES` allows, at most `MAX_TRACKED`.
-pub fn fail_limits(maxretry: usize) -> (usize, usize) {
-    let per_address = maxretry.saturating_mul(4).max(16);
-    let addresses = (MAX_FAIL_TIMES / per_address).clamp(1, MAX_TRACKED);
-    (per_address, addresses)
-}
-
-/// Forgets the addresses whose last failure is the oldest until at most
-/// `keep` are tracked.
-fn forget_oldest(state: &mut State, keep: usize) {
-    if state.fails.len() <= keep {
-        return;
-    }
-    let mut by_age: Vec<(i64, Ipv4Addr)> = state
-        .fails
-        .iter()
-        .map(|(ip, times)| (times.iter().copied().max().unwrap_or(0), *ip))
-        .collect();
-    by_age.sort_unstable();
-    let extra = state.fails.len() - keep;
-    for (_, ip) in by_age.into_iter().take(extra) {
-        state.fails.remove(&ip);
-    }
-}
-
-/// Remembers that `ip` is handled until `until` (see `State::banned`). With
-/// `MAX_BANNED` addresses remembered, the one whose end is nearest is
-/// forgotten first: it would be the next to expire anyway.
-fn remember_ban(state: &mut State, ip: Ipv4Addr, until: u64) {
-    if !state.banned.contains_key(&ip) && state.banned.len() >= MAX_BANNED {
-        let first = state
-            .banned
-            .iter()
-            .min_by_key(|(ip, until)| (**until, **ip))
-            .map(|(ip, _)| *ip);
-        if let Some(first) = first {
-            state.banned.remove(&first);
-        }
-    }
-    state.banned.insert(ip, until);
-}
-
-/// Counts one failure at host time `ts`. Returns the ban to apply when the
-/// limit is reached.
+/// Counts one failure at host time `ts` in the ledger, which queues the
+/// ban when the limit is reached.
 fn register(
     ev: &Event,
     ts: i64,
     host_now: i64,
-    cfg: &Config,
+    rules: &Rules,
     state: &mut State,
     report_once: bool,
-) -> Option<(Ipv4Addr, Pending)> {
+) {
     let user = util::sanitize(&ev.user, 32);
-    let ip = match ev.ip? {
-        IpAddr::V4(ip) => ip,
-        IpAddr::V6(ip) => {
+    let ip = match ev.ip {
+        None => return,
+        Some(IpAddr::V4(ip)) => ip,
+        Some(IpAddr::V6(ip)) => {
             crate::info!(
                 "{}: failed login from {} (user={:?}): IPv6 is not handled",
                 ev.nvr,
                 ip,
                 user
             );
-            return None;
+            return;
         }
     };
-    if exempt(cfg, ip) {
-        crate::info!(
-            "{}: failed login from {} (user={:?}): never banned (ignoreip or reserved), not counted",
-            ev.nvr,
-            ip,
-            user
-        );
-        return None;
-    }
-    if state.pending.contains_key(&ip) {
-        return None;
-    }
-    // Without a firewall (or in a dry run) nothing stops the address, so it
-    // would be reported again with every burst; once per bantime (24 hours
-    // for a permanent one) is enough.
-    if report_once
-        && state
-            .banned
-            .get(&ip)
-            .is_some_and(|until| host_i64(*until) > host_now)
-    {
-        crate::info!(
-            "{}: failed login from {} (user={:?}): already reported",
-            ev.nvr,
-            ip,
-            user
-        );
-        return None;
-    }
-    let (cap, addresses) = fail_limits(cfg.maxretry);
-    if !state.fails.contains_key(&ip) && state.fails.len() >= addresses {
-        // Forget the address whose last failure is the oldest.
-        forget_oldest(state, addresses - 1);
-    }
-    let times = state.fails.entry(ip).or_default();
-    times.push(ts);
-    times.sort_unstable();
-    let horizon = host_now.saturating_sub(cfg.findtime);
-    times.retain(|t| *t >= horizon);
-    if times.len() > cap {
-        let extra = times.len() - cap;
-        times.drain(..extra);
-    }
-    let count = times.len();
-    crate::info!(
-        "{}: failed login from {} (user={:?}) at {} [{}/{}]",
-        ev.nvr,
-        ip,
-        user,
-        util::fmt_ts(ts),
-        count,
-        cfg.maxretry
-    );
-    if count >= cfg.maxretry {
-        Some((
-            ip,
-            Pending {
-                ts,
-                count,
-                nvr: ev.nvr.clone(),
-                user,
-            },
-        ))
-    } else {
-        None
-    }
+    state
+        .ledger
+        .failed_login(rules, ip, ts, host_now, &ev.nvr, user, report_once);
 }
 
 impl Engine {
@@ -696,53 +552,8 @@ impl Engine {
             dropped_notifications: 0,
             notify_after: 0,
         };
-        // The state may come from a run with another `ignoreip`, or with a
-        // `maxretry` that kept more failure times.
-        engine.drop_exempt();
-        let (cap, addresses) = fail_limits(engine.cfg.maxretry);
-        for times in engine.state.fails.values_mut() {
-            if times.len() > cap {
-                let extra = times.len() - cap;
-                times.drain(..extra);
-            }
-        }
-        forget_oldest(&mut engine.state, addresses);
+        engine.state.ledger.fit(&Rules::of(&engine.cfg));
         Ok(engine)
-    }
-
-    /// Forgets the waiting ban and the counted failed logins of every
-    /// address that is never banned. `register` keeps such addresses out,
-    /// but `ignoreip` may have changed since they were counted (a restart
-    /// with a new config), and a waiting ban must not be applied then.
-    fn drop_exempt(&mut self) {
-        let cfg = &self.cfg;
-        let mut addresses: Vec<Ipv4Addr> = self
-            .state
-            .pending
-            .keys()
-            .chain(self.state.fails.keys())
-            .copied()
-            .filter(|ip| exempt(cfg, *ip))
-            .collect();
-        addresses.sort_unstable();
-        addresses.dedup();
-        for ip in addresses {
-            let waiting = self.state.pending.remove(&ip).is_some();
-            let counted = self.state.fails.remove(&ip).map_or(0, |times| times.len());
-            let what = match (waiting, counted) {
-                (true, 0) => "waiting ban dropped".to_string(),
-                (true, n) => format!(
-                    "waiting ban dropped, {} counted failed login(s) forgotten",
-                    n
-                ),
-                (false, n) => format!("{} counted failed login(s) forgotten", n),
-            };
-            crate::info!(
-                "{}: {}: the address is in ignoreip or a reserved range and is never banned",
-                ip,
-                what
-            );
-        }
     }
 
     /// The flag that stops the service: set it (from a signal handler) and
@@ -1122,101 +933,33 @@ impl Engine {
                 );
                 continue;
             }
-            if let Some((ip, pending)) =
-                register(ev, host_ts, now, &self.cfg, &mut self.state, report_once)
-            {
-                self.queue_ban(ip, pending);
-            }
+            let rules = Rules::of(&self.cfg);
+            register(ev, host_ts, now, &rules, &mut self.state, report_once);
         }
-    }
-
-    fn queue_ban(&mut self, ip: Ipv4Addr, pending: Pending) {
-        if self.state.pending.len() >= MAX_PENDING {
-            let oldest = self
-                .state
-                .pending
-                .iter()
-                .min_by_key(|(ip, p)| (p.ts, **ip))
-                .map(|(ip, _)| *ip);
-            if let Some(oldest) = oldest {
-                self.state.pending.remove(&oldest);
-                crate::warn!(
-                    "{} bans are already waiting; the oldest ({}) is dropped",
-                    MAX_PENDING,
-                    oldest
-                );
-            }
-        }
-        self.state.pending.insert(ip, pending);
     }
 
     /// Applies waiting bans. Returns true when the firewall turned out to be
     /// unusable (unreachable, refusing our login or answering with an
     /// error), which ends the attempts for this cycle.
     fn flush_pending(&mut self, now: u64) -> bool {
-        // A ban time in the future can only come from the host clock having
-        // been ahead; keep it as "now" so it still counts for an hour.
-        for t in self.state.recent_bans.iter_mut() {
-            *t = (*t).min(now);
-        }
-        self.state
-            .recent_bans
-            .retain(|t| now.saturating_sub(*t) < 3600);
-        self.drop_exempt();
-
         let bantime = self.cfg.bantime;
-        let keep = memory(bantime);
-        let expired: Vec<Ipv4Addr> = self
-            .state
-            .pending
-            .iter()
-            .filter(|(_, p)| host_i64(now).saturating_sub(p.ts) > host_i64(keep))
-            .map(|(ip, _)| *ip)
-            .collect();
-        let limit = match bantime {
-            BanTime::Seconds(s) => format!("bantime ({} s)", s),
-            BanTime::Permanent => format!("{} s", keep),
-        };
-        for ip in expired {
-            crate::warn!(
-                "{}: the ban could not be applied within {} and is dropped",
-                ip,
-                limit
-            );
-            self.state.pending.remove(&ip);
-        }
-
-        // Oldest first: the address that reached the threshold first has
-        // been waiting longest.
-        let mut order: Vec<(i64, Ipv4Addr)> = self
-            .state
-            .pending
-            .iter()
-            .map(|(ip, p)| (p.ts, *ip))
-            .collect();
-        order.sort_unstable();
+        let due = self.state.ledger.due(&Rules::of(&self.cfg), now);
         let mut limited = false;
         let mut unreachable = false;
         let mut stopped = false;
-        for (_, ip) in order {
+        for ip in due {
             if self.stopping() {
                 stopped = true;
                 break;
             }
-            let Some(p) = self.state.pending.get(&ip).cloned() else {
-                continue;
+            let p = match self.state.ledger.next_ban(&Rules::of(&self.cfg), ip) {
+                Turn::Ban(p) => p,
+                Turn::Gone => continue,
+                Turn::RateLimited => {
+                    limited = true;
+                    break;
+                }
             };
-            // A safety valve: whatever goes wrong upstream, never flood the
-            // router's address-list (or the chat).
-            if self.state.recent_bans.len() >= self.cfg.max_bans_per_hour {
-                crate::warn!(
-                    "ban rate limit reached ({} per hour), {} address(es) are waiting",
-                    self.cfg.max_bans_per_hour,
-                    self.state.pending.len()
-                );
-                limited = true;
-                break;
-            }
             // Display only, and looked up after every decision is made.
             let code = self.country(ip);
             // At the end: after the fixed-format time, where the user name
@@ -1238,21 +981,25 @@ impl Engine {
                 None => ip.to_string(),
             };
             let duration = bantime.phrase();
-            // (what happened, uses rate-limit allowance, worth a notification)
-            let (action, counted, notify) = match &self.firewall {
+            // (what happened, how it ended for the ledger, worth a notification)
+            let (action, outcome, notify) = match &self.firewall {
                 None => {
                     crate::warn!(
                         "DETECTED {} (no firewall configured, not banned) ({})",
                         shown,
                         comment
                     );
-                    ("detected, no firewall configured".to_string(), true, true)
+                    (
+                        "detected, no firewall configured".to_string(),
+                        Outcome::Reported,
+                        true,
+                    )
                 }
                 Some(_) if self.cfg.dry_run => {
                     crate::warn!("DRY RUN: would ban {} {} ({})", shown, duration, comment);
                     (
                         format!("would be banned {} (dry run)", duration),
-                        true,
+                        Outcome::Reported,
                         true,
                     )
                 }
@@ -1263,7 +1010,7 @@ impl Engine {
                         // ban the firewall accepts does.
                         let reason = format!("{}: {}", ip, e);
                         self.alerts.fail(Check::BanRefused, &reason, now);
-                        continue;
+                        (String::new(), Outcome::NotApplied, false)
                     }
                     Err(e) => {
                         // The firewall cannot be reached, refuses our login
@@ -1286,7 +1033,7 @@ impl Engine {
                         self.alerts.pass(&Check::Firewall, now);
                         self.alerts.pass(&Check::BanRefused, now);
                         crate::warn!("BAN {} {} ({})", shown, duration, comment);
-                        (format!("banned {}", duration), true, true)
+                        (format!("banned {}", duration), Outcome::Banned, true)
                     }
                     Ok(false) => {
                         self.alerts.pass(&Check::Firewall, now);
@@ -1294,13 +1041,9 @@ impl Engine {
                         // The router is the source of truth for bans. A
                         // listed address should not reach the NVR, unless
                         // these failures were logged just before our ban.
-                        // The time of the ban is kept (see below), so an
+                        // The time of the ban is kept (`Ledger::outcome`), so an
                         // attacker that keeps going cannot hide this.
-                        let banned_at = self
-                            .state
-                            .banned
-                            .get(&ip)
-                            .map(|until| until.saturating_sub(keep));
+                        let banned_at = self.state.ledger.ban_began(&Rules::of(&self.cfg), ip);
                         let grace = self.cfg.poll_interval.saturating_mul(2).saturating_add(60);
                         if now.saturating_sub(banned_at.unwrap_or(0)) > grace {
                             crate::warn!(
@@ -1323,20 +1066,13 @@ impl Engine {
                         } else {
                             crate::info!("{} is already in {}", ip, fw.describe());
                         }
-                        (String::new(), false, false)
+                        (String::new(), Outcome::AlreadyListed, false)
                     }
                 },
             };
-            // Already listed: keep the time of the ban this engine knows, if
-            // any (an address listed by hand counts from now).
-            if counted || !self.state.banned.contains_key(&ip) {
-                remember_ban(&mut self.state, ip, now.saturating_add(keep));
-            }
-            self.state.fails.remove(&ip);
-            self.state.pending.remove(&ip);
-            if counted {
-                self.state.recent_bans.push(now);
-            }
+            self.state
+                .ledger
+                .outcome(&Rules::of(&self.cfg), ip, now, outcome);
             if notify && self.notifier.is_some() {
                 // The flag only goes to the chat.
                 let country = code
@@ -1361,14 +1097,14 @@ impl Engine {
         if limited {
             let reason = format!(
                 "{} address(es) waiting, limit {} per hour",
-                self.state.pending.len(),
+                self.state.ledger.waiting(),
                 self.cfg.max_bans_per_hour
             );
             self.alerts.fail(Check::RateLimit, &reason, now);
         } else if !unreachable && !stopped {
             self.alerts.pass(&Check::RateLimit, now);
         }
-        if self.state.pending.is_empty() {
+        if self.state.ledger.waiting() == 0 {
             // Every refused ban expired or was dropped: nothing is left to
             // show whether the firewall would accept one now.
             self.alerts.withdraw(&Check::BanRefused, now);
@@ -1439,19 +1175,7 @@ impl Engine {
     }
 
     fn cleanup(&mut self, host_now: u64) {
-        let keep = memory(self.cfg.bantime);
-        // An end further away than `keep` can only come from the host clock
-        // having been ahead; such an entry would otherwise live for years.
-        self.state
-            .banned
-            .retain(|_, until| *until > host_now && *until - host_now <= keep);
-        let now = host_i64(host_now);
-        let horizon = now.saturating_sub(self.cfg.findtime);
-        let future = now.saturating_add(MAX_FUTURE);
-        self.state.fails.retain(|_, times| {
-            times.retain(|t| *t >= horizon && *t <= future);
-            !times.is_empty()
-        });
+        self.state.ledger.cleanup(&Rules::of(&self.cfg), host_now);
     }
 
     /// Notifications waiting to be sent (for tests and diagnostics).

@@ -1,8 +1,9 @@
-//! Persistent state: where each NVR log was read up to, failure counters,
-//! bans that still have to be applied and the ban rate limit. A plain
-//! line-based text file; anything that does not parse or is out of range is
-//! ignored, so a damaged or hand-edited file can never make the daemon do
-//! arithmetic on absurd values.
+//! Persistent state: where each NVR log was read up to, and the ban ledger
+//! (failure counters, bans that still have to be applied, remembered bans
+//! and the ban rate limit, see `ledger.rs`), which writes and reads its own
+//! lines. A plain line-based text file; anything that does not parse or is
+//! out of range is ignored, so a damaged or hand-edited file can never make
+//! the daemon do arithmetic on absurd values.
 //!
 //! A file that cannot be used at all (too large, unreadable, not text, of
 //! another version) is not silently replaced: `load` says why at WARNING
@@ -10,10 +11,10 @@
 //! banned. The file is written and read line by line, so neither needs a
 //! copy of it in memory.
 
+use crate::ledger::Ledger;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::Hasher;
 use std::io::{BufRead, Write};
-use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
 /// Version 2 changed the meaning of the failure times (host time instead of
@@ -21,21 +22,8 @@ use std::path::{Path, PathBuf};
 const HEADER: &str = "hik-f2b-state 2";
 pub const MAX_FILE: u64 = 16 * 1024 * 1024;
 
-/// Upper bound on addresses with a running failure counter.
-pub const MAX_TRACKED: usize = 10_000;
-/// Upper bound on the failure times of all addresses together. With
-/// `maxretry` above 5 the engine keeps more times per address (see
-/// `engine::register`) and so tracks fewer addresses.
-pub const MAX_FAIL_TIMES: usize = 200_000;
-/// Upper bound on bans waiting to be applied.
-pub const MAX_PENDING: usize = 1000;
 /// Upper bound on remembered log entries per NVR.
 pub const MAX_SEEN: usize = 50_000;
-/// Failure times kept per address (the engine keeps fewer).
-const MAX_TIMES: usize = 4096;
-/// Upper bound on banned (or reported) addresses remembered.
-pub const MAX_BANNED: usize = 100_000;
-const MAX_RATE: usize = 10_000;
 /// 9999-12-31T23:59:59Z: anything later is not a time.
 pub const MAX_TIME: i64 = 253_402_300_799;
 
@@ -52,36 +40,20 @@ pub struct NvrState {
     pub seen: HashMap<String, u32>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
-pub struct Pending {
-    /// Host time of the failure that reached the threshold.
-    pub ts: i64,
-    pub count: usize,
-    pub nvr: String,
-    /// Already sanitised to printable ASCII.
-    pub user: String,
-}
-
 #[derive(Default, Debug, PartialEq)]
 pub struct State {
     pub nvr: BTreeMap<String, NvrState>,
-    /// Host times of recent failures per address.
-    pub fails: BTreeMap<Ipv4Addr, Vec<i64>>,
-    /// Host time until which an address counts as handled (banned, or
-    /// reported in notify-only mode).
-    pub banned: BTreeMap<Ipv4Addr, u64>,
-    pub pending: BTreeMap<Ipv4Addr, Pending>,
-    /// Host times of the bans applied in the last hour (the rate limit).
-    pub recent_bans: Vec<u64>,
+    /// Failure counters, waiting and remembered bans, the rate limit.
+    pub ledger: Ledger,
 }
 
-fn time(text: &str) -> Option<i64> {
+pub(crate) fn time(text: &str) -> Option<i64> {
     text.parse::<i64>()
         .ok()
         .filter(|t| (0..=MAX_TIME).contains(t))
 }
 
-fn utime(text: &str) -> Option<u64> {
+pub(crate) fn utime(text: &str) -> Option<u64> {
     time(text).map(|t| t as u64)
 }
 
@@ -150,24 +122,7 @@ impl State {
                 writeln!(out, "seen {} {} {}", name, key, count)?;
             }
         }
-        for (ip, times) in &self.fails {
-            for t in times {
-                writeln!(out, "fail {} {}", ip, t)?;
-            }
-        }
-        for (ip, until) in &self.banned {
-            writeln!(out, "ban {} {}", ip, until)?;
-        }
-        for (ip, p) in &self.pending {
-            writeln!(
-                out,
-                "pending {} {} {} {} {}",
-                ip, p.ts, p.count, p.nvr, p.user
-            )?;
-        }
-        for t in &self.recent_bans {
-            writeln!(out, "rate {}", t)?;
-        }
+        self.ledger.write_to(out)?;
         Ok(())
     }
 
@@ -253,64 +208,7 @@ impl Reader {
                 nvr.seen.insert(key.to_string(), count);
                 true
             }
-            ["fail", ip, t] => {
-                let (Ok(ip), Some(t)) = (ip.parse::<Ipv4Addr>(), time(t)) else {
-                    return false;
-                };
-                if st.fails.len() >= MAX_TRACKED && !st.fails.contains_key(&ip) {
-                    return false;
-                }
-                let times = st.fails.entry(ip).or_default();
-                if times.len() >= MAX_TIMES {
-                    return false;
-                }
-                times.push(t);
-                true
-            }
-            ["ban", ip, until] => {
-                let (Ok(ip), Some(until)) = (ip.parse::<Ipv4Addr>(), utime(until)) else {
-                    return false;
-                };
-                if st.banned.len() >= MAX_BANNED {
-                    return false;
-                }
-                st.banned.insert(ip, until);
-                true
-            }
-            ["pending", ip, ts, count, nvr, user @ ..] if name_ok(nvr) => {
-                let count = count
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|c| (1..=1_000_000).contains(c));
-                let (Ok(ip), Some(ts), Some(count)) = (ip.parse::<Ipv4Addr>(), time(ts), count)
-                else {
-                    return false;
-                };
-                if st.pending.len() >= MAX_PENDING {
-                    return false;
-                }
-                st.pending.insert(
-                    ip,
-                    Pending {
-                        ts,
-                        count,
-                        nvr: nvr.to_string(),
-                        user: crate::util::sanitize(&user.join(" "), 64),
-                    },
-                );
-                true
-            }
-            ["rate", t] => {
-                let Some(t) = utime(t) else {
-                    return false;
-                };
-                if st.recent_bans.len() >= MAX_RATE {
-                    return false;
-                }
-                st.recent_bans.push(t);
-                true
-            }
-            _ => false,
+            _ => st.ledger.read_line(&f),
         }
     }
 
@@ -325,9 +223,7 @@ impl Reader {
             }
             keep
         });
-        for times in st.fails.values_mut() {
-            times.sort_unstable();
-        }
+        st.ledger.finish_reading();
         dropped
     }
 }
@@ -447,31 +343,94 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ledger::{Sizes, MAX_BANNED, MAX_FAIL_TIMES, MAX_PENDING, MAX_RATE, MAX_TRACKED};
+    use std::net::Ipv4Addr;
 
     const KEY: &str = "0123456789abcdef0123456789abcdef";
 
     #[test]
     fn round_trip() {
-        let mut st = State::default();
-        let nvr = st.nvr.entry("nvr1".to_string()).or_default();
-        nvr.since = 1_700_000_000;
-        nvr.offset = Some(-7200);
-        nvr.seen.insert(KEY.to_string(), 2);
-        st.nvr.entry("nvr2".to_string()).or_default().since = 5;
-        let ip: Ipv4Addr = "198.51.100.7".parse().unwrap();
-        st.fails.insert(ip, vec![10, 20]);
-        st.banned.insert("203.0.113.5".parse().unwrap(), 99);
-        st.pending.insert(
-            ip,
-            Pending {
-                ts: 30,
-                count: 5,
-                nvr: "nvr1".to_string(),
-                user: "illegal usernam".to_string(),
-            },
+        let text = format!(
+            "hik-f2b-state 2\n\
+             nvr nvr1 1700000000 -7200\nseen nvr1 {k} 2\nnvr nvr2 5 -\n\
+             fail 198.51.100.7 10\nfail 198.51.100.7 20\nban 203.0.113.5 99\n\
+             pending 198.51.100.7 30 5 nvr1 illegal usernam\n\
+             rate 1700000100\nrate 1700000200\n",
+            k = KEY
         );
-        st.recent_bans = vec![1_700_000_100, 1_700_000_200];
+        let st = State::parse(&text);
+        assert_eq!(st.nvr["nvr1"].since, 1_700_000_000);
+        assert_eq!(st.nvr["nvr1"].offset, Some(-7200));
+        assert_eq!(st.nvr["nvr1"].seen[KEY], 2);
+        assert_eq!(st.nvr["nvr2"].since, 5);
+        assert_eq!(st.nvr["nvr2"].offset, None);
+        let ip: Ipv4Addr = "198.51.100.7".parse().unwrap();
+        assert_eq!(st.ledger.failed_logins(ip), 2);
+        assert!(st.ledger.is_waiting(ip));
+        assert_eq!(
+            st.ledger.banned_until("203.0.113.5".parse().unwrap()),
+            Some(99)
+        );
+        assert_eq!(st.ledger.sizes().recent_bans, 2);
+        assert_eq!(st.serialize(), text);
         assert_eq!(State::parse(&st.serialize()), st);
+    }
+
+    /// A state file that the previous version (before the ban ledger had
+    /// its own module) wrote after a poll with two NVRs, two bans, a ban
+    /// held back by the rate limit and failed logins still counted: it is
+    /// read, and written back byte for byte the same.
+    #[test]
+    fn a_file_of_the_previous_version_is_written_back_unchanged() {
+        const FILE: &str = "\
+            hik-f2b-state 2\n\
+            nvr nvr1 1768039291 7200\n\
+            seen nvr1 3acef02754e82624ce9302764bb76879 1\n\
+            seen nvr1 3dffe93f39e5e6698f1a188a1992cf8e 1\n\
+            seen nvr1 41d06f148b8eeedaf78d742a07251ed1 1\n\
+            seen nvr1 576414dc480a8a72c1cb37dd5329ffa9 1\n\
+            seen nvr1 6a6f68847c4f65ce4d4c59c5a2d417c5 1\n\
+            seen nvr1 88142b55b7a9ac86e6670313ee870abf 1\n\
+            seen nvr1 9b0267f3e8ed1056e6fdd5e3e06927da 1\n\
+            seen nvr1 a5e05930af0e57330685a5816dce2a3f 1\n\
+            seen nvr1 a762449af7a1de68d01036ef6672c82b 1\n\
+            seen nvr1 a81d9a53896c2fd1e2e9eefb26a64345 1\n\
+            seen nvr1 bc5f6f9c7e8176632ca68b9f7e6c1721 1\n\
+            seen nvr1 bdcde40604eb84b67772e6481e1f948c 1\n\
+            seen nvr1 be2fdbfa6793b5e96c7e0d86a19b1469 1\n\
+            seen nvr1 cec3f6917bf527bde6834f32639cddd9 1\n\
+            seen nvr1 d3cd1b11f858d3b041bb4dc3a4a1c3bc 1\n\
+            seen nvr1 db15252bc5d4d1ab4ac82623dcc744bd 1\n\
+            seen nvr1 dc871377edb798f6768211345e3d5004 1\n\
+            nvr nvr2 1768039200 7200\n\
+            fail 192.0.2.44 1768032090\n\
+            fail 192.0.2.44 1768032091\n\
+            fail 198.51.100.3 1768032080\n\
+            fail 198.51.100.3 1768032081\n\
+            fail 198.51.100.3 1768032082\n\
+            fail 198.51.100.3 1768032083\n\
+            fail 198.51.100.3 1768032084\n\
+            ban 198.51.100.1 1768118520\n\
+            ban 198.51.100.2 1768118520\n\
+            pending 198.51.100.3 1768032084 5 nvr1 no such user\n\
+            rate 1768032120\n\
+            rate 1768032120\n";
+        let st = State::parse(FILE);
+        assert_eq!(st.nvr.len(), 2);
+        let sizes = st.ledger.sizes();
+        assert_eq!((sizes.tracked, sizes.fail_times), (2, 7));
+        assert_eq!(
+            (sizes.remembered, sizes.waiting, sizes.recent_bans),
+            (2, 1, 2)
+        );
+        assert_eq!(st.serialize(), FILE);
+        let dir = temp_dir("previous");
+        let path = dir.join("state");
+        std::fs::write(&path, FILE).unwrap();
+        let loaded = State::load_at(&path, 5).unwrap();
+        loaded.save(&path).unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), FILE);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -488,8 +447,8 @@ mod tests {
         let st = State::parse(
             "hik-f2b-state 2\nfail not-an-ip 5\nban 1.2.3.4 x\nwhatever\nfail 198.51.100.7 5\n",
         );
-        assert_eq!(st.fails.len(), 1);
-        assert!(st.banned.is_empty());
+        assert_eq!(st.ledger.sizes().tracked, 1);
+        assert_eq!(st.ledger.sizes().remembered, 0);
     }
 
     #[test]
@@ -509,10 +468,7 @@ mod tests {
         assert_eq!(st.nvr.keys().collect::<Vec<_>>(), vec!["e"]);
         assert_eq!(st.nvr["e"].offset, Some(-7200));
         assert!(st.nvr["e"].seen.is_empty());
-        assert!(st.fails.is_empty());
-        assert!(st.banned.is_empty());
-        assert!(st.pending.is_empty());
-        assert!(st.recent_bans.is_empty());
+        assert_eq!(st.ledger, Ledger::default());
     }
 
     fn temp_dir(name: &str) -> PathBuf {
@@ -595,7 +551,7 @@ mod tests {
         .unwrap();
         crate::util::capture_log();
         let st = State::load_at(&path, 5).unwrap();
-        assert_eq!(st.banned.len(), 1);
+        assert_eq!(st.ledger.sizes().remembered, 1);
         assert!(st.nvr.is_empty());
         let log = crate::util::captured_log();
         assert_eq!(log.len(), 1, "{:?}", log);
@@ -621,24 +577,40 @@ mod tests {
         }
         let address = |i: usize| Ipv4Addr::from(0xC000_0000u32 + i as u32);
         let per_address = MAX_FAIL_TIMES / MAX_TRACKED;
+        let mut lines = String::new();
         for i in 0..MAX_TRACKED {
-            st.fails.insert(address(i), vec![MAX_TIME; per_address]);
+            for _ in 0..per_address {
+                lines.push_str(&format!("fail {} {}\n", address(i), MAX_TIME));
+            }
         }
         for i in 0..MAX_BANNED {
-            st.banned.insert(address(i), MAX_TIME as u64);
+            lines.push_str(&format!("ban {} {}\n", address(i), MAX_TIME));
         }
         for i in 0..MAX_PENDING {
-            st.pending.insert(
+            lines.push_str(&format!(
+                "pending {} {} 1000000 {} {}\n",
                 address(i),
-                Pending {
-                    ts: MAX_TIME,
-                    count: 1_000_000,
-                    nvr: "x".repeat(32),
-                    user: "u".repeat(32),
-                },
-            );
+                MAX_TIME,
+                "x".repeat(32),
+                "u".repeat(32)
+            ));
         }
-        st.recent_bans = vec![MAX_TIME as u64; MAX_RATE];
+        for _ in 0..MAX_RATE {
+            lines.push_str(&format!("rate {}\n", MAX_TIME));
+        }
+        st.ledger = State::parse(&format!("{}\n{}", HEADER, lines)).ledger;
+        assert_eq!(
+            st.ledger.sizes(),
+            Sizes {
+                tracked: MAX_TRACKED,
+                fail_times: MAX_TRACKED * per_address,
+                most_fail_times: per_address,
+                remembered: MAX_BANNED,
+                waiting: MAX_PENDING,
+                recent_bans: MAX_RATE,
+            }
+        );
+        assert!(st.serialize().ends_with(&lines));
         let size = st.serialize().len() as u64;
         println!("a full state with two NVRs: {} bytes", size);
         assert!(size <= MAX_FILE, "{} bytes", size);
@@ -655,9 +627,17 @@ mod tests {
         let mut st = State::default();
         let empty = st.digest();
         assert_eq!(State::default().digest(), empty);
-        st.recent_bans.push(5);
+        st = State::parse("hik-f2b-state 2\nrate 5\n");
         assert_ne!(st.digest(), empty);
-        st.recent_bans.clear();
+        // an hour later the ban no longer counts for the rate limit
+        let rules = crate::ledger::Rules {
+            maxretry: 5,
+            findtime: 600,
+            bantime: crate::action::BanTime::Seconds(3600),
+            max_bans_per_hour: 30,
+            ignore: &[],
+        };
+        assert!(st.ledger.due(&rules, 5 + 3600).is_empty());
         assert_eq!(st.digest(), empty);
     }
 }

@@ -40,6 +40,7 @@ pub mod country;
 pub mod engine;
 pub mod health;
 pub mod http;
+pub mod ledger;
 pub mod mikrotik;
 pub mod nvr;
 pub mod state;

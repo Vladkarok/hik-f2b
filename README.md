@@ -1168,11 +1168,11 @@ Each scenario comes from a seed. To run more seeds, set `HIK_F2B_SIM_SEEDS`
 (seeds per class) and `HIK_F2B_SIM_START` (the first seed). To replay one
 seed and print its trace, set `HIK_F2B_SIM_SEED`.
 
-The decision logic (`src/engine.rs`) talks to the router and to Telegram only
+The engine (`src/engine.rs`) talks to the router and to Telegram only
 through the `Firewall` and `Notifier` traits in `src/action.rs`, so another
-firewall or messenger can be added by implementing one trait. When a problem
-is worth a health alert is decided in `src/health.rs`, which does no I/O and
-is tested on its own.
+firewall or messenger can be added by implementing one trait. Which bans are
+due is decided in `src/ledger.rs`, and when a problem is worth a health alert
+in `src/health.rs`. Neither does I/O, and each is tested on its own.
 
 CI also runs `.github/scripts/repo-guard.sh`, which keeps addresses of real
 devices and other private data out of the repository, and

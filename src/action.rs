@@ -97,6 +97,13 @@ pub trait Firewall {
     /// actually blocked. `Ok` carries a short description of what was found.
     /// Must change nothing on the firewall.
     fn check(&self) -> Result<String, HealthError>;
+    /// The ids of the address-list entries for `ip`; empty when it is not
+    /// listed. For own addresses only (see `remove`).
+    fn entries(&self, ip: Ipv4Addr) -> Result<Vec<String>, BanError>;
+    /// Removes the address-list entry `id`, one of those `entries` gave for
+    /// `ip`. An entry that is gone counts as removed. hik-f2b removes an
+    /// entry only for an own address (ADR 0005).
+    fn remove(&self, ip: Ipv4Addr, id: &str) -> Result<(), BanError>;
     /// A short human-readable name for log lines, e.g. the address-list.
     fn describe(&self) -> String;
 }

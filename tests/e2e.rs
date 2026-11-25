@@ -3179,7 +3179,8 @@ fn a_forged_entry_with_an_own_address_is_not_counted() {
         "{:?}",
         log
     );
-    // the router is never asked to ban it
+    // the router is asked about the own address once per firewall check,
+    // never asked to ban it
     let f = h.fake.lock().unwrap();
     assert!(f.put_log.iter().all(|(a, _)| a != OWN), "{:?}", f.put_log);
 }
@@ -3324,6 +3325,215 @@ fn check_prints_the_own_addresses() {
         "FAILED   own addresses: router 127.0.0.1, nvr1 127.0.0.1; look-up failed: router: no \
          route; nvr1: no route"
     );
+}
+
+/// Layer 3: an own address in the address-list (put there by hand, by
+/// another tool or by an earlier version) is removed at the next firewall
+/// check, with a WARNING and a notification at once. One look-up per own
+/// address outside the reserved ranges and firewall check, no more.
+#[test]
+fn an_own_address_in_the_address_list_is_removed_and_reported_at_once() {
+    let mut h = with_own(Opts {
+        telegram: true,
+        ..Default::default()
+    });
+    // the first poll ran the first periodic check: one look-up, for the one
+    // own address that is not loopback
+    let lookup = format!("list=cctv_ban&address={}&.proplist=.id", OWN);
+    assert_eq!(h.fake.lock().unwrap().lookups, vec![lookup.clone()]);
+    h.fake.lock().unwrap().bans.push(OWN.to_string());
+    run(&mut h, 9, 30); // the next check is due 300 s after the first
+    assert_eq!(h.banned(), vec![OWN]);
+    assert_eq!(h.fake.lock().unwrap().lookups.len(), 1);
+    util::capture_log();
+    h.advance(30);
+    let log = util::captured_log();
+    assert_eq!(
+        exactly(
+            &log,
+            "WARNING 192.0.2.200 is an own address of hik-f2b and was in MikroTik address-list \
+             cctv_ban: the entry is removed"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    assert!(h.banned().is_empty());
+    {
+        let f = h.fake.lock().unwrap();
+        assert_eq!(f.delete_log, vec![(OWN.to_string(), "removed")]);
+        assert_eq!(f.lookups, vec![lookup.clone(), lookup.clone()]);
+    }
+    assert_eq!(
+        telegram_texts(&h),
+        vec![format!(
+            "{}192.0.2.200 is an own address of hik-f2b and was in MikroTik address-list \
+             cctv_ban; the entry is removed. hik-f2b never bans its own addresses: it was added \
+             by hand, by another tool or by an earlier version.",
+            WARN
+        )]
+    );
+    assert!(h.engine.alerted_problems().is_empty());
+    // the check at the start of the service does it too
+    h.fake.lock().unwrap().bans.push(OWN.to_string());
+    h.restart();
+    assert!(h.engine.startup_check(h.host as u64));
+    assert!(h.banned().is_empty());
+    h.advance(30);
+    assert_eq!(telegram_texts(&h).len(), 2);
+    // nothing listed: nothing removed, nothing sent
+    run(&mut h, 20, 30);
+    assert_eq!(telegram_texts(&h).len(), 2);
+    assert_eq!(h.fake.lock().unwrap().delete_log.len(), 2);
+}
+
+/// A removal that the router refuses opens `own-address-listed`, reported
+/// once at once and alerted after `alert_after`; a later removal ends it.
+#[test]
+fn a_removal_that_fails_is_a_health_problem_until_the_address_is_gone() {
+    let mut h = with_own(Opts {
+        telegram: true,
+        general: "alert_after = 60",
+        ..Default::default()
+    });
+    {
+        let mut f = h.fake.lock().unwrap();
+        f.bans.push(OWN.to_string());
+        f.refuse_writes = true;
+    }
+    util::capture_log();
+    run(&mut h, 10, 30); // the check at 10:05:00 finds it
+    let log = util::captured_log();
+    assert_eq!(
+        exactly(
+            &log,
+            "ERROR cannot remove own address 192.0.2.200 from MikroTik address-list cctv_ban, \
+             will retry at the next firewall check: refused: HTTP 400: {\"detail\":\"not enough \
+             permissions (9)\",\"error\":400,\"message\":\"Bad Request\"}"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    // reported at once
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 1, "{:?}", texts);
+    assert!(h.engine.alerted_problems().is_empty());
+    // and alerted after alert_after
+    run(&mut h, 2, 30);
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 2, "{:?}", texts);
+    assert_eq!(
+        texts[0],
+        format!(
+            "{}192.0.2.200 is an own address of hik-f2b and is in MikroTik address-list \
+             cctv_ban, and cannot be removed: refused: HTTP 400: {{\"detail\":\"not enough \
+             permissions (9)\",\"error\":400,\"message\":\"Bad Request\"}}. Remove it by hand.",
+            WARN
+        )
+    );
+    assert!(
+        texts[1].starts_with(&format!(
+            "{}an own address of hik-f2b is in the address-list and cannot be removed for 1 \
+             min: 192.0.2.200 is in MikroTik address-list cctv_ban; remove it by hand and check \
+             that the router user may write: refused: HTTP 400",
+            WARN
+        )),
+        "{}",
+        texts[1]
+    );
+    assert_eq!(h.engine.alerted_problems(), vec!["own-address-listed"]);
+    // the next checks try again, without a second message
+    run(&mut h, 10, 30);
+    assert_eq!(telegram_texts(&h).len(), 2);
+    assert_eq!(h.banned(), vec![OWN]);
+    assert_eq!(h.engine.alerted_problems(), vec!["own-address-listed"]);
+    // the router user may write again
+    h.fake.lock().unwrap().refuse_writes = false;
+    run(&mut h, 10, 30);
+    assert!(h.banned().is_empty());
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 4, "{:?}", texts);
+    assert!(texts[2].contains("the entry is removed"), "{}", texts[2]);
+    assert!(
+        texts[3].starts_with(&format!(
+            "{}no own address of hik-f2b is in the address-list any more (after ",
+            OK
+        )),
+        "{}",
+        texts[3]
+    );
+    assert!(h.engine.alerted_problems().is_empty());
+    // the entry gone by itself (it timed out) also ends the problem
+    {
+        let mut f = h.fake.lock().unwrap();
+        f.bans.push(OWN.to_string());
+        f.refuse_writes = true;
+    }
+    run(&mut h, 14, 30);
+    assert_eq!(h.engine.alerted_problems(), vec!["own-address-listed"]);
+    h.fake.lock().unwrap().bans.clear();
+    run(&mut h, 10, 30);
+    assert!(h.engine.alerted_problems().is_empty());
+    assert!(telegram_texts(&h)
+        .last()
+        .unwrap()
+        .contains("no own address of hik-f2b is in the address-list any more"));
+}
+
+/// A dry run reports an own address in the address-list once and removes
+/// nothing; notify-only mode asks no router.
+#[test]
+fn own_address_in_the_address_list_in_a_dry_run_and_in_notify_only_mode() {
+    let mut h = with_own(Opts {
+        telegram: true,
+        general: "dry_run = true",
+        ..Default::default()
+    });
+    h.fake.lock().unwrap().bans.push(OWN.to_string());
+    util::capture_log();
+    run(&mut h, 25, 30); // two checks
+    let log = util::captured_log();
+    assert_eq!(
+        exactly(
+            &log,
+            "WARNING DRY RUN: 192.0.2.200 is an own address of hik-f2b and is in MikroTik \
+             address-list cctv_ban: it would be removed"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    assert_eq!(h.banned(), vec![OWN]);
+    assert!(h.fake.lock().unwrap().delete_log.is_empty());
+    assert_eq!(h.fake.lock().unwrap().lookups.len(), 3);
+    assert_eq!(
+        telegram_texts(&h),
+        vec![format!(
+            "{}192.0.2.200 is an own address of hik-f2b and is in MikroTik address-list \
+             cctv_ban. Dry run: it is not removed; remove it by hand.",
+            WARN
+        )]
+    );
+    assert!(h.engine.alerted_problems().is_empty());
+    // once it is gone and listed again, it is reported again
+    h.fake.lock().unwrap().bans.clear();
+    run(&mut h, 10, 30);
+    h.fake.lock().unwrap().bans.push(OWN.to_string());
+    run(&mut h, 10, 30);
+    assert_eq!(telegram_texts(&h).len(), 2);
+
+    // notify-only mode: no router to ask; own failed logins still do not count
+    let mut h = with_own(Opts {
+        telegram: true,
+        mikrotik: false,
+        ..Default::default()
+    });
+    h.burst("10:01", OWN, 6);
+    run(&mut h, 25, 30);
+    assert_eq!(h.fake.lock().unwrap().router_requests, 0);
+    assert_eq!(h.fails(OWN), 0);
+    assert!(telegram_texts(&h).is_empty());
 }
 
 // ------------------------------------------------------------------ --check

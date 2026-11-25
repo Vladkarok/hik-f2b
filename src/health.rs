@@ -56,6 +56,9 @@ pub enum Check {
     /// address reaches `maxretry` again; over once none has for
     /// `alert_after` in polls that read every NVR (see `Health::poll_ended`).
     Bypassed,
+    /// An own address is in the address-list and hik-f2b could not remove
+    /// it. Over once a look-up of every own address finds none listed.
+    OwnListed,
 }
 
 impl Check {
@@ -68,6 +71,7 @@ impl Check {
             Check::RateLimit => "rate-limit".to_string(),
             Check::BanRefused => "ban-refused".to_string(),
             Check::Bypassed => "ban-bypassed".to_string(),
+            Check::OwnListed => "own-address-listed".to_string(),
         }
     }
 
@@ -79,6 +83,9 @@ impl Check {
             Check::RateLimit => "new bans are held back by max_bans_per_hour".to_string(),
             Check::BanRefused => "the firewall refuses bans".to_string(),
             Check::Bypassed => "banned addresses still reach an NVR".to_string(),
+            Check::OwnListed => {
+                "an own address of hik-f2b is in the address-list and cannot be removed".to_string()
+            }
         }
     }
 
@@ -90,6 +97,9 @@ impl Check {
             Check::RateLimit => "bans are no longer held back".to_string(),
             Check::BanRefused => "the firewall accepts bans again".to_string(),
             Check::Bypassed => "banned addresses no longer reach the NVRs".to_string(),
+            Check::OwnListed => {
+                "no own address of hik-f2b is in the address-list any more".to_string()
+            }
         }
     }
 
@@ -301,6 +311,17 @@ pub enum BanAttempt<'a> {
     Unreachable(&'a str),
 }
 
+/// An own address that is still in the address-list after hik-f2b tried
+/// to remove it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OwnStuck<'a> {
+    pub ip: Ipv4Addr,
+    /// The address-list, as the firewall describes it.
+    pub list: &'a str,
+    /// Why the removal failed.
+    pub error: &'a str,
+}
+
 /// How the ban loop of a poll ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BansEnded {
@@ -450,6 +471,23 @@ impl Health {
             self.alerts.withdraw(&Check::BanRefused, now);
         }
         self.cut_short = end == BansEnded::CutShort;
+    }
+
+    /// Every own address that is worth asking was looked up in the
+    /// address-list at `now`, and each one found was removed (`None`), or
+    /// this one is still listed after its removal failed. Only a look-up
+    /// that finds no own address left ends the problem.
+    pub fn own_swept(&mut self, stuck: Option<OwnStuck>, now: u64) {
+        match stuck {
+            None => self.alerts.pass(&Check::OwnListed, now),
+            Some(OwnStuck { ip, list, error }) => {
+                let reason = format!(
+                    "{} is in {}; remove it by hand and check that the router user may write: {}",
+                    ip, list, error
+                );
+                self.alerts.fail(Check::OwnListed, &reason, now);
+            }
+        }
     }
 
     /// The end of a poll at `now`. Ends the `Check::Bypassed` problem once
@@ -798,6 +836,7 @@ mod tests {
         assert_eq!(Check::RateLimit.key(), "rate-limit");
         assert_eq!(Check::BanRefused.key(), "ban-refused");
         assert_eq!(Check::Bypassed.key(), "ban-bypassed");
+        assert_eq!(Check::OwnListed.key(), "own-address-listed");
     }
 
     #[test]
@@ -1303,6 +1342,48 @@ mod tests {
             kinds(&h.due(back + AFTER)),
             vec![(Check::Bypassed, Kind::Recovered)]
         );
+    }
+
+    #[test]
+    fn an_own_address_that_cannot_be_removed_until_none_is_listed() {
+        let stuck = OwnStuck {
+            ip: Ipv4Addr::new(192, 0, 2, 200),
+            list: "MikroTik address-list cctv_ban",
+            error: "refused: HTTP 400",
+        };
+        let mut h = health();
+        h.own_swept(Some(stuck), T0);
+        let due = h.due(T0 + AFTER);
+        assert_eq!(kinds(&due), vec![(Check::OwnListed, Kind::Alert)]);
+        assert_eq!(
+            due[0].text(),
+            "\u{26a0}\u{fe0f} hik-f2b: an own address of hik-f2b is in the address-list and \
+             cannot be removed for 10 min: 192.0.2.200 is in MikroTik address-list cctv_ban; \
+             remove it by hand and check that the router user may write: refused: HTTP 400"
+        );
+        // nothing else ends it: a firewall check, a ban, a poll
+        h.firewall_checked(&Ok(String::new()), T0 + AFTER);
+        h.ban_tried(BanAttempt::Accepted, T0 + AFTER);
+        h.bans_ended(BansEnded::Complete, 0, T0 + AFTER);
+        h.poll_ended(T0 + AFTER);
+        assert!(h.due(T0 + AFTER).is_empty());
+        assert_eq!(h.alerted(), vec!["own-address-listed"]);
+        // still stuck: no news until the reminder
+        h.own_swept(Some(stuck), T0 + 2 * AFTER);
+        assert!(h.due(T0 + 2 * AFTER).is_empty());
+        // none listed any more
+        h.own_swept(None, T0 + 3 * AFTER);
+        let due = h.due(T0 + 3 * AFTER);
+        assert_eq!(kinds(&due), vec![(Check::OwnListed, Kind::Recovered)]);
+        assert_eq!(
+            due[0].text(),
+            "\u{2705} hik-f2b: no own address of hik-f2b is in the address-list any more \
+             (after 30 min)"
+        );
+        // a short one says nothing
+        h.own_swept(Some(stuck), T0 + 4 * AFTER);
+        h.own_swept(None, T0 + 4 * AFTER + 60);
+        assert!(h.due(T0 + 6 * AFTER).is_empty());
     }
 
     #[test]

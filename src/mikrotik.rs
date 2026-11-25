@@ -1,5 +1,6 @@
-//! RouterOS v7 REST client: adds addresses to a firewall address-list and
-//! checks that a firewall rule blocks that list.
+//! RouterOS v7 REST client: adds addresses to a firewall address-list,
+//! checks that a firewall rule blocks that list, and finds and removes the
+//! entries of own addresses.
 //!
 //! There is no JSON parser here. Where an answer is needed, the router is
 //! asked to filter (`property=value` in the query string) and to return only
@@ -61,6 +62,23 @@ fn left_out(disabled: usize, invalid: usize) -> String {
     } else {
         format!("; left out: {}", parts.join(", "))
     }
+}
+
+/// Longest address-list entry id taken from the router; RouterOS ids are
+/// `*` and a hexadecimal number.
+const MAX_ID: usize = 24;
+
+/// The value of the `.id` member of one object of a reply limited by
+/// `.proplist`, if it looks like a RouterOS id: it goes into a URL path.
+fn id_of(object: &str) -> Option<&str> {
+    let at = object.find("\".id\"")?;
+    let rest = object[at + 5..].trim_start().strip_prefix(':')?;
+    let rest = rest.trim_start().strip_prefix('"')?;
+    let id = &rest[..rest.find('"')?];
+    let ok = !id.is_empty()
+        && id.len() <= MAX_ID
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '*');
+    ok.then_some(id)
 }
 
 /// The start of an answer, for an error message.
@@ -173,6 +191,30 @@ impl Mikrotik {
             ".id",
         )
         .map(|entries| !entries.is_empty())
+    }
+
+    /// The ids of the entries for `ip` in the address-list.
+    fn ids(&self, ip: Ipv4Addr) -> Result<Vec<String>, BanError> {
+        let address = ip.to_string();
+        let path = "ip/firewall/address-list";
+        let entries = self.get_list(
+            path,
+            &[("list", self.list.as_str()), ("address", address.as_str())],
+            ".id",
+            ".id",
+        )?;
+        entries
+            .iter()
+            .map(|entry| {
+                id_of(entry).map(str::to_string).ok_or_else(|| {
+                    BanError::Router(format!(
+                        "the answer to /{} has an entry id that is not a RouterOS id: {}",
+                        path,
+                        shown(entry)
+                    ))
+                })
+            })
+            .collect()
     }
 
     /// The rules in `table` that use the address-list.
@@ -355,6 +397,53 @@ impl Firewall for Mikrotik {
         )))
     }
 
+    /// `GET /rest/ip/firewall/address-list?list=<list>&address=<ip>&.proplist=.id`,
+    /// the request a refused ban already uses.
+    fn entries(&self, ip: Ipv4Addr) -> Result<Vec<String>, BanError> {
+        self.ids(ip)
+    }
+
+    /// `DELETE /rest/ip/firewall/address-list/<id>`. As for a ban, the
+    /// wording of an error is not an interface: after an answer about this
+    /// request (HTTP 4xx other than 401 and 403) the router is asked whether
+    /// the entry is still there.
+    fn remove(&self, ip: Ipv4Addr, id: &str) -> Result<(), BanError> {
+        if id_of(&format!("{{\".id\":\"{}\"}}", id)) != Some(id) {
+            return Err(BanError::Router(format!(
+                "{:?} is not a RouterOS id",
+                util::sanitize(id, 40)
+            )));
+        }
+        let result = self
+            .agent
+            .delete(&format!("{}/ip/firewall/address-list/{}", self.base, id))
+            .set("Authorization", &self.auth)
+            .call();
+        match result {
+            Ok(resp) if (200..300).contains(&resp.status()) => {
+                // read, so that the connection can be used again
+                http::read_body(resp, MAX_BODY).map_err(BanError::Transport)?;
+                Ok(())
+            }
+            Ok(resp) => Err(BanError::Router(format!(
+                "unexpected HTTP {}",
+                resp.status()
+            ))),
+            Err(ureq::Error::Status(code, resp))
+                if (400..500).contains(&code) && code != 401 && code != 403 =>
+            {
+                let message = Self::failure(code, resp);
+                match self.ids(ip) {
+                    Ok(ids) if !ids.iter().any(|i| i == id) => Ok(()),
+                    Ok(_) => Err(BanError::Refused(message)),
+                    Err(e) => Err(e),
+                }
+            }
+            Err(ureq::Error::Status(code, resp)) => Err(Self::status_error(code, resp)),
+            Err(e) => Err(BanError::Transport(util::sanitize(&e.to_string(), 200))),
+        }
+    }
+
     fn describe(&self) -> String {
         format!("MikroTik address-list {}", self.list)
     }
@@ -415,6 +504,24 @@ mod tests {
         assert!(is_object("{\".id\":\"*1\",\"list\":\"x\"}\n"));
         assert!(!is_object("<html></html>"));
         assert!(!is_object("[]"));
+    }
+
+    #[test]
+    fn takes_entry_ids_that_look_like_routeros_ids() {
+        assert_eq!(id_of(r#"{".id":"*1A"}"#), Some("*1A"));
+        assert_eq!(id_of(r#"{ ".id" : "*C0000264" }"#), Some("*C0000264"));
+        for bad in [
+            r#"{".id":""}"#,
+            r#"{".id":"*1/../x"}"#,
+            r#"{".id":"*1?x=1"}"#,
+            r#"{".id":"*1 2"}"#,
+            r#"{".id":1}"#,
+            r#"{"address":"192.0.2.1"}"#,
+        ] {
+            assert_eq!(id_of(bad), None, "{}", bad);
+        }
+        let long = format!("{{\".id\":\"*{}\"}}", "F".repeat(MAX_ID));
+        assert_eq!(id_of(&long), None);
     }
 
     #[test]

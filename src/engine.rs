@@ -18,12 +18,15 @@
 //! sends what it can.
 //!
 //! The own addresses (`own.rs`) are looked up again at the start of every
-//! poll and given to the ledger with the rules.
+//! poll and given to the ledger with the rules. With every firewall check
+//! the engine asks the router whether an own address is in the
+//! address-list, and removes it if it is (`sweep_own`): the only ban
+//! hik-f2b ever removes (ADR 0005).
 
 use crate::action::{render, BanError, BanInfo, Firewall, HealthError, Notifier};
 use crate::config::{Config, DEFAULT_MESSAGE};
 use crate::country::{self, Code};
-use crate::health::{BanAttempt, BansEnded, Health, Kind, Notice, NvrRead};
+use crate::health::{self, BanAttempt, BansEnded, Health, Kind, Notice, NvrRead, OwnStuck};
 use crate::ledger::{Outcome, Rules, Turn, MAX_USER};
 use crate::nvr::{Nvr, NvrError};
 use crate::outbox::Outbox;
@@ -31,6 +34,7 @@ use crate::own::OwnAddresses;
 use crate::reader::{LogReader, Login, Logins, Poll};
 use crate::state::State;
 use crate::util::{self, host_i64};
+use std::collections::BTreeSet;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -55,6 +59,10 @@ pub struct Engine {
     startup: Startup,
     /// The own addresses, never banned.
     own: OwnAddresses,
+    /// Own addresses found in the address-list and reported, that are not
+    /// removed (a dry run, or a removal that failed): reported once while
+    /// they stay listed.
+    own_reported: BTreeSet<Ipv4Addr>,
 }
 
 /// The first grace period (`Engine::grace`) after the engine started. The
@@ -148,6 +156,7 @@ impl Engine {
             stop: Arc::new(AtomicBool::new(false)),
             startup: Startup::NotPolled,
             own,
+            own_reported: BTreeSet::new(),
         };
         engine
             .state
@@ -202,8 +211,10 @@ impl Engine {
     /// later.
     /// Returns whether the firewall answered (so that more can be asked of
     /// it without waiting for a second timeout).
+    /// Like every firewall check that the router answers, it is followed by
+    /// the look-up of the own addresses in the address-list (`sweep_own`).
     pub fn startup_check(&mut self, host_now: u64) -> bool {
-        match self.check_firewall(host_now) {
+        let answered = match self.check_firewall(host_now) {
             None => false,
             Some(Ok(found)) => {
                 crate::info!("firewall check ok: {}", found);
@@ -216,7 +227,11 @@ impl Engine {
                 );
                 matches!(e, HealthError::NotEnforced(_))
             }
+        };
+        if answered {
+            self.sweep_own(host_now);
         }
+        answered
     }
 
     /// Logs the own addresses found at the start, and the look-ups that
@@ -282,16 +297,126 @@ impl Engine {
     }
 
     /// The periodic firewall check, at most once per cycle, when health
-    /// says it is due (see `Health::check_due`).
+    /// says it is due (see `Health::check_due`). When the router answered
+    /// it, the own addresses are looked up in the address-list.
     fn periodic_check(&mut self, host_now: u64) {
         if !self.health.check_due(host_now) {
             return;
         }
-        match self.check_firewall(host_now) {
-            Some(Err(e)) => crate::warn!("firewall check failed: {}", e),
-            Some(Ok(found)) => crate::debug!("firewall check ok: {}", found),
-            None => {}
+        let answered = match self.check_firewall(host_now) {
+            Some(Err(e)) => {
+                crate::warn!("firewall check failed: {}", e);
+                matches!(e, HealthError::NotEnforced(_))
+            }
+            Some(Ok(found)) => {
+                crate::debug!("firewall check ok: {}", found);
+                true
+            }
+            None => false,
+        };
+        if answered && !self.stopping() {
+            self.sweep_own(host_now);
         }
+    }
+
+    /// Asks the firewall whether an own address is in the address-list, one
+    /// request per own address outside the reserved ranges, and removes
+    /// each entry found: the only ban hik-f2b removes (ADR 0005). Each
+    /// removal is a WARNING and a notification at once. In a dry run it is
+    /// reported (once while it stays listed) and not removed. A removal
+    /// that fails is an ERROR, a notification once while the address stays
+    /// listed and the health problem `own-address-listed`, which only a
+    /// look-up of every own address that finds none left ends.
+    fn sweep_own(&mut self, now: u64) {
+        let Some(fw) = &self.firewall else {
+            return;
+        };
+        let addresses = self.own.to_ask();
+        self.own_reported.retain(|ip| addresses.contains(ip));
+        let list = fw.describe();
+        let mut stuck: Option<(Ipv4Addr, String)> = None;
+        for ip in addresses {
+            if self.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            let ids = match fw.entries(ip) {
+                Ok(ids) => ids,
+                Err(e) => {
+                    // Not every own address was asked: the problem stays as
+                    // it is.
+                    crate::warn!(
+                        "cannot ask {} whether own address {} is listed: {}",
+                        list,
+                        ip,
+                        e
+                    );
+                    return;
+                }
+            };
+            if ids.is_empty() {
+                self.own_reported.remove(&ip);
+                continue;
+            }
+            if self.cfg.dry_run {
+                if self.own_reported.insert(ip) {
+                    crate::warn!(
+                        "DRY RUN: {} is an own address of hik-f2b and is in {}: it would be \
+                         removed",
+                        ip,
+                        list
+                    );
+                    self.outbox.queue(format!(
+                        "\u{26a0}\u{fe0f} hik-f2b: {} is an own address of hik-f2b and is in {}. \
+                         Dry run: it is not removed; remove it by hand.",
+                        ip, list
+                    ));
+                }
+                continue;
+            }
+            let removed = ids.iter().try_for_each(|id| fw.remove(ip, id));
+            match removed {
+                Ok(()) => {
+                    self.own_reported.remove(&ip);
+                    crate::warn!(
+                        "{} is an own address of hik-f2b and was in {}: the entry is removed",
+                        ip,
+                        list
+                    );
+                    self.outbox.queue(format!(
+                        "\u{26a0}\u{fe0f} hik-f2b: {} is an own address of hik-f2b and was in {}; \
+                         the entry is removed. hik-f2b never bans its own addresses: it was added \
+                         by hand, by another tool or by an earlier version.",
+                        ip, list
+                    ));
+                }
+                Err(e) => {
+                    let error = e.to_string();
+                    crate::error!(
+                        "cannot remove own address {} from {}, will retry at the next firewall \
+                         check: {}",
+                        ip,
+                        list,
+                        error
+                    );
+                    if self.own_reported.insert(ip) {
+                        self.outbox.queue(format!(
+                            "\u{26a0}\u{fe0f} hik-f2b: {} is an own address of hik-f2b and is in \
+                             {}, and cannot be removed: {}. Remove it by hand.",
+                            ip,
+                            list,
+                            health::clean_reason(&error)
+                        ));
+                    }
+                    stuck = Some((ip, error));
+                }
+            }
+        }
+        let stuck = stuck.as_ref().map(|(ip, error)| OwnStuck {
+            ip: *ip,
+            list: &list,
+            error,
+        });
+        self.health.own_swept(stuck, now);
     }
 
     /// Logs the health notices that are due and queues them for the chat

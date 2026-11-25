@@ -149,6 +149,12 @@ pub struct Fake {
     /// listed), `down` or `status` (answered with `rest_status` or
     /// `put_status`).
     pub put_log: Vec<(String, &'static str)>,
+    /// (address, outcome) of every DELETE of an address-list entry that
+    /// reached the router: `removed`, `refused` (`refuse_writes`), `status`
+    /// (`delete_status` or `rest_status`), `down` or `no such item`.
+    pub delete_log: Vec<(String, &'static str)>,
+    /// Answer every DELETE with this HTTP status, reads work.
+    pub delete_status: Option<u16>,
     // --- Telegram
     pub tg_sent: Vec<String>,
     pub tg_attempts: u32,
@@ -302,11 +308,18 @@ fn route(
                 "<html><head><title>Proxy</title></head><body>Please log in</body></html>",
             );
         }
-        let status = f.rest_status.or(f.put_status.filter(|_| method == "PUT"));
+        let status = f
+            .rest_status
+            .or(f.put_status.filter(|_| method == "PUT"))
+            .or(f.delete_status.filter(|_| method == "DELETE"));
         if let Some(code) = status {
             if path.starts_with("/rest/ip/firewall/address-list") && method == "PUT" {
                 let address = between(body, "\"address\":\"", "\"").to_string();
                 f.put_log.push((address, "status"));
+            }
+            if let Some(id) = path.strip_prefix("/rest/ip/firewall/address-list/") {
+                let address = address_of(&f, id);
+                f.delete_log.push((address, "status"));
             }
             let message = match code {
                 401 => "Unauthorized",
@@ -429,8 +442,39 @@ fn route(
             let list = param(query, "list").unwrap_or_default();
             let address = param(query, "address").unwrap_or_default();
             let found = list == "cctv_ban" && f.bans.contains(&address);
-            let out = if found { "[{\".id\":\"*1\"}]" } else { "[]" };
+            let out = match address.parse::<Ipv4Addr>() {
+                Ok(ip) if found => format!("[{{\".id\":\"{}\"}}]", entry_id(ip)),
+                _ => "[]".to_string(),
+            };
             return reply(200, json, out);
+        }
+        if method == "DELETE" {
+            let id = path.trim_start_matches("/rest/ip/firewall/address-list/");
+            let address = address_of(&f, id);
+            if f.router_down {
+                f.delete_log.push((address, "down"));
+                return reply(500, json, "{\"error\":500,\"message\":\"down\"}");
+            }
+            if f.refuse_writes {
+                f.delete_log.push((address, "refused"));
+                return reply(
+                    400,
+                    json,
+                    "{\"detail\":\"not enough permissions (9)\",\"error\":400,\
+                     \"message\":\"Bad Request\"}",
+                );
+            }
+            if !f.bans.contains(&address) {
+                f.delete_log.push((address, "no such item"));
+                return reply(
+                    400,
+                    json,
+                    "{\"detail\":\"no such item\",\"error\":400,\"message\":\"Bad Request\"}",
+                );
+            }
+            f.bans.retain(|b| *b != address);
+            f.delete_log.push((address, "removed"));
+            return reply(204, json, "");
         }
         if method == "GET" {
             let list: Vec<String> = f
@@ -507,6 +551,22 @@ fn route(
         return reply(200, json, "{\"ok\":true}");
     }
     reply(404, "text/plain", "not found")
+}
+
+/// The id of the fake router's address-list entry for `ip`: `*` and the
+/// address as a hexadecimal number, so it stays the same while the entry
+/// exists (RouterOS ids are `*` and a hexadecimal number too).
+pub fn entry_id(ip: Ipv4Addr) -> String {
+    format!("*{:X}", u32::from(ip))
+}
+
+/// The address whose entry has the id `id`, as text (empty when none).
+fn address_of(f: &Fake, id: &str) -> String {
+    f.bans
+        .iter()
+        .find(|b| b.parse::<Ipv4Addr>().is_ok_and(|ip| entry_id(ip) == id))
+        .cloned()
+        .unwrap_or_default()
 }
 
 fn serve(stream: TcpStream, fake: Arc<Mutex<Fake>>) {

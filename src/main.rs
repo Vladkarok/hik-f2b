@@ -6,6 +6,7 @@ use hik_f2b::config::{self, Config};
 use hik_f2b::country;
 use hik_f2b::engine::Engine;
 use hik_f2b::health::Status;
+use hik_f2b::ignored::IgnoredNames;
 use hik_f2b::mikrotik::Mikrotik;
 use hik_f2b::nvr::Nvr;
 use hik_f2b::own::{OwnAddresses, System};
@@ -248,11 +249,13 @@ fn one_shot(
 ) -> Result<(), String> {
     if args.check {
         let own = OwnAddresses::new(cfg, Box::new(System));
+        let ignored = IgnoredNames::new(cfg, Box::new(System));
         let lines = check::check_all(
             cfg,
             nvrs,
             mikrotik.map(|m| m as &dyn Firewall),
             &own,
+            &ignored,
             util::unix_now(),
         );
         for line in &lines {
@@ -425,7 +428,8 @@ fn run() -> Result<(), String> {
     let firewall = mikrotik.map(|m| Box::new(m) as Box<dyn Firewall>);
     let notifier = telegram.map(|t| Box::new(t) as Box<dyn Notifier>);
     let own = OwnAddresses::new(&cfg, Box::new(System));
-    let mut engine = Engine::new(cfg, state, firewall, notifier, own)?;
+    let ignored = IgnoredNames::new(&cfg, Box::new(System));
+    let mut engine = Engine::new(cfg, state, firewall, notifier, own, ignored)?;
 
     // A stop takes effect between the steps of a cycle (see
     // `Engine::cycle_at`); the state is saved before hik-f2b exits.
@@ -436,6 +440,7 @@ fn run() -> Result<(), String> {
     }
 
     engine.startup_own();
+    engine.startup_names();
     engine.startup_country();
     // Also in a dry run: that is when the setup is being checked. The size
     // of the address-list is asked only of a router that answered it, so an

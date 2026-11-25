@@ -41,6 +41,7 @@ pub mod country;
 pub mod engine;
 pub mod health;
 pub mod http;
+pub mod ignored;
 pub mod ledger;
 pub mod mikrotik;
 pub mod names;

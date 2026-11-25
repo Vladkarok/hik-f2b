@@ -24,6 +24,12 @@
 //! address-list, and removes it if it is (`sweep_own`): the only ban
 //! hik-f2b ever removes (ADR 0005). With a safe list, the same checks keep
 //! the own address toward the router in it (`keep_safe`, ADR 0006).
+//!
+//! The host names of `ignoreip` (`ignored.rs`) are looked up again at the
+//! start of every poll too (each at most every `names::RESOLVE_EVERY`), and
+//! the addresses they resolve to are given to the ledger with the rules.
+//! They are not own addresses: no ban is removed for them and none goes to
+//! the safe list (ADR 0007).
 
 use crate::action::{render, BanError, BanInfo, Firewall, HealthError, Kept, Notifier};
 use crate::config::{Config, DEFAULT_MESSAGE};
@@ -32,6 +38,7 @@ use crate::health::{
     self, BanAttempt, BansEnded, Health, Kind, Notice, NvrRead, OwnStuck, SafeWrite,
     HEALTH_CHECK_INTERVAL,
 };
+use crate::ignored::IgnoredNames;
 use crate::ledger::{Outcome, Rules, Turn, MAX_USER};
 use crate::names::RESOLVE_EVERY;
 use crate::nvr::{Nvr, NvrError};
@@ -72,6 +79,8 @@ pub struct Engine {
     startup: Startup,
     /// The own addresses, never banned.
     own: OwnAddresses,
+    /// The host names of `ignoreip`: what they resolve to is never banned.
+    ignored: IgnoredNames,
     /// Own addresses found in the address-list and reported, that are not
     /// removed (a dry run, or a removal that failed): reported once while
     /// they stay listed.
@@ -141,14 +150,15 @@ impl Engine {
     /// An engine that starts from `state` (what the state file held, or
     /// an empty state) with the given firewall and notifier (either may be
     /// absent; `main.rs` gives it the router and Telegram clients the
-    /// configuration asks for) and the own addresses of `cfg`. It sets up a
-    /// client per NVR of `cfg`.
+    /// configuration asks for), the own addresses of `cfg` and the host
+    /// names of its `ignoreip`. It sets up a client per NVR of `cfg`.
     pub fn new(
         cfg: Config,
         state: State,
         firewall: Option<Box<dyn Firewall>>,
         notifier: Option<Box<dyn Notifier>>,
         own: OwnAddresses,
+        ignored: IgnoredNames,
     ) -> Result<Engine, String> {
         let readers = cfg
             .nvrs
@@ -172,13 +182,15 @@ impl Engine {
             stop: Arc::new(AtomicBool::new(false)),
             startup: Startup::NotPolled,
             own,
+            ignored,
             own_reported: BTreeSet::new(),
             safe_kept: BTreeSet::new(),
         };
-        engine
-            .state
-            .ledger
-            .fit(&Rules::of(&engine.cfg, engine.own.set()));
+        engine.state.ledger.fit(&Rules::of(
+            &engine.cfg,
+            engine.own.set(),
+            engine.ignored.addresses(),
+        ));
         Ok(engine)
     }
 
@@ -273,6 +285,12 @@ impl Engine {
                 failures.join("; ")
             );
         }
+    }
+
+    /// Logs what the host names of `ignoreip` resolve to at the start, and
+    /// the names that do not resolve; nothing without a name.
+    pub fn startup_names(&self) {
+        self.ignored.log_start();
     }
 
     /// Logs which country database is configured, or why it cannot be
@@ -623,6 +641,7 @@ impl Engine {
         self.startup.polled(host_now, self.grace());
         if !self.stopping() {
             self.own.refresh(host_now);
+            self.ignored.refresh(host_now);
         }
         let report_once = self.firewall.is_none() || self.cfg.dry_run;
         for i in 0..self.readers.len() {
@@ -684,7 +703,7 @@ impl Engine {
     /// counting window) and queues the bans they call for.
     fn count(&mut self, logins: Logins, now: i64, report_once: bool) {
         for login in logins {
-            let rules = Rules::of(&self.cfg, self.own.set());
+            let rules = Rules::of(&self.cfg, self.own.set(), self.ignored.addresses());
             register(&login, now, &rules, &mut self.state, report_once);
         }
     }
@@ -694,21 +713,20 @@ impl Engine {
     /// attempts for this cycle.
     fn flush_pending(&mut self, now: u64) {
         let bantime = self.cfg.bantime;
-        let due = self
-            .state
-            .ledger
-            .due(&Rules::of(&self.cfg, self.own.set()), now);
+        let due = self.state.ledger.due(
+            &Rules::of(&self.cfg, self.own.set(), self.ignored.addresses()),
+            now,
+        );
         let mut end = BansEnded::Complete;
         for ip in due {
             if self.stopping() {
                 end = BansEnded::Stopped;
                 break;
             }
-            let p = match self
-                .state
-                .ledger
-                .next_ban(&Rules::of(&self.cfg, self.own.set()), ip)
-            {
+            let p = match self.state.ledger.next_ban(
+                &Rules::of(&self.cfg, self.own.set(), self.ignored.addresses()),
+                ip,
+            ) {
                 Turn::Ban(p) => p,
                 Turn::Gone => continue,
                 Turn::RateLimited => {
@@ -795,10 +813,10 @@ impl Engine {
                         // attacker that keeps going cannot hide this. Right
                         // after the start that time may come from another
                         // `bantime` (see `Startup`).
-                        let banned_at = self
-                            .state
-                            .ledger
-                            .ban_began(&Rules::of(&self.cfg, self.own.set()), ip);
+                        let banned_at = self.state.ledger.ban_began(
+                            &Rules::of(&self.cfg, self.own.set(), self.ignored.addresses()),
+                            ip,
+                        );
                         let recent = now.saturating_sub(banned_at.unwrap_or(0)) <= self.grace();
                         if !recent && !self.startup.running() {
                             crate::warn!(
@@ -824,9 +842,12 @@ impl Engine {
                     }
                 },
             };
-            self.state
-                .ledger
-                .outcome(&Rules::of(&self.cfg, self.own.set()), ip, now, outcome);
+            self.state.ledger.outcome(
+                &Rules::of(&self.cfg, self.own.set(), self.ignored.addresses()),
+                ip,
+                now,
+                outcome,
+            );
             if notify {
                 // The flag only goes to the chat.
                 let country = code
@@ -859,9 +880,10 @@ impl Engine {
     }
 
     fn cleanup(&mut self, host_now: u64) {
-        self.state
-            .ledger
-            .cleanup(&Rules::of(&self.cfg, self.own.set()), host_now);
+        self.state.ledger.cleanup(
+            &Rules::of(&self.cfg, self.own.set(), self.ignored.addresses()),
+            host_now,
+        );
     }
 
     /// Notifications waiting to be sent (for tests and diagnostics).

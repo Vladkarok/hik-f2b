@@ -34,7 +34,8 @@ const MAX_REASON: usize = 200;
 /// Where the answers about own addresses come from.
 pub trait Source {
     /// The IPv4 addresses of `host` (a name or an IPv4 address, as the URL
-    /// gives it), for connections to `port`.
+    /// gives it), for connections to `port`. A host name of `ignoreip`
+    /// (`ignored.rs`) is resolved with port 0: no connection goes to it.
     fn resolve(&mut self, host: &str, port: u16) -> Result<Vec<Ipv4Addr>, String>;
     /// The local address this host would send from to reach `peer` at
     /// `port`.

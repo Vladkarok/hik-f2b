@@ -5,6 +5,7 @@ use crate::action::{Checked, Firewall, HealthError, SafeEntry};
 use crate::config::Config;
 use crate::country;
 use crate::health::{CheckLine, Status};
+use crate::ignored::IgnoredNames;
 use crate::nvr::{Nvr, NvrError, Search};
 use crate::own::OwnAddresses;
 use crate::util::{self, host_i64};
@@ -110,15 +111,50 @@ fn safe_list_line(
     }
 }
 
+/// One line per host name of `ignoreip`: what it resolves to now. A name
+/// that does not resolve is a failed check: the operator wrote it to keep
+/// an address from being banned, and it keeps none.
+fn ignored_lines(ignored: &IgnoredNames) -> Vec<CheckLine> {
+    ignored
+        .each()
+        .map(|(name, known, error)| {
+            let (status, detail) = match error {
+                None => (
+                    Status::Ok,
+                    format!(
+                        "resolves to {} (never banned)",
+                        known
+                            .iter()
+                            .map(|ip| ip.to_string())
+                            .collect::<Vec<_>>()
+                            .join(" and ")
+                    ),
+                ),
+                Some(e) => (
+                    Status::Failed,
+                    format!("does not resolve, so it exempts no address: {}", e),
+                ),
+            };
+            CheckLine {
+                item: format!("ignoreip {}", name),
+                status,
+                detail,
+            }
+        })
+        .collect()
+}
+
 /// `--check`: every health check once, with the NVR clients `nvrs` (one per
-/// `cfg.nvrs`, in that order) and the firewall, if there is one, and the
-/// own addresses as `own` found them. Nothing is sent. `host_now` is the
-/// host's Unix time.
+/// `cfg.nvrs`, in that order) and the firewall, if there is one, the own
+/// addresses as `own` found them and the host names of `ignoreip` as
+/// `ignored` resolved them. Nothing is sent. `host_now` is the host's Unix
+/// time.
 pub fn check_all(
     cfg: &Config,
     nvrs: &mut [Nvr],
     firewall: Option<&dyn Firewall>,
     own: &OwnAddresses,
+    ignored: &IgnoredNames,
     host_now: u64,
 ) -> Vec<CheckLine> {
     let mut out = Vec::new();
@@ -197,6 +233,7 @@ pub fn check_all(
         status,
         detail,
     });
+    out.extend(ignored_lines(ignored));
     let (status, detail) = match &cfg.telegram {
         None => (Status::Off, "not configured".to_string()),
         Some(t) => (

@@ -200,7 +200,12 @@ pub struct Config {
     pub alert_after: u64,
     pub max_bans_per_hour: usize,
     pub state_file: PathBuf,
+    /// The addresses and networks of `ignoreip`.
     pub ignore: Vec<Net>,
+    /// The host names of `ignoreip` (lower case, each once), in the order
+    /// of the config. Not resolved here: `ignored.rs` resolves them now and
+    /// then, and a name that does not resolve is no config error.
+    pub ignore_names: Vec<String>,
     pub meta_id: String,
     pub log_filter: Regex,
     pub dry_run: bool,
@@ -252,6 +257,33 @@ impl Net {
     pub fn contains(&self, ip: Ipv4Addr) -> bool {
         u32::from(ip) & self.mask == self.addr
     }
+}
+
+/// Whether an item of `ignoreip` is meant as an address or a network: it
+/// has a `/` or only digits and dots. Anything else is read as a host name.
+fn looks_like_address(item: &str) -> bool {
+    item.contains('/') || item.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+/// Whether `text` is a host name that `ignoreip` takes: at least two labels
+/// separated by dots, each of 1 to 63 letters, digits and hyphens that
+/// neither starts nor ends with a hyphen, at most 253 characters in all,
+/// and a last label that is not all digits. A name of one label would be
+/// completed by the resolver's search domains, so it is refused.
+pub fn is_host_name(text: &str) -> bool {
+    let labels: Vec<&str> = text.split('.').collect();
+    text.len() <= 253
+        && labels.len() >= 2
+        && labels.iter().all(|label| {
+            !label.is_empty()
+                && label.len() <= 63
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+                && label.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+        && !labels
+            .last()
+            .is_some_and(|label| label.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// Reads the INI text. Every section and every setting must be known (a
@@ -546,13 +578,28 @@ impl Config {
         let g = ini.get("general").unwrap_or(&empty);
 
         let mut ignore = Vec::new();
+        let mut ignore_names: Vec<String> = Vec::new();
         let list = g
             .get("ignoreip")
             .map(|s| s.as_str())
             .unwrap_or(DEFAULT_IGNORE);
         for item in list.split(|c: char| c == ',' || c.is_whitespace()) {
-            if !item.is_empty() {
+            if item.is_empty() {
+                continue;
+            }
+            if looks_like_address(item) {
                 ignore.push(Net::parse(item).map_err(|e| format!("ignoreip: {}", e))?);
+            } else if is_host_name(item) {
+                let name = item.to_ascii_lowercase();
+                if !ignore_names.contains(&name) {
+                    ignore_names.push(name);
+                }
+            } else {
+                return Err(format!(
+                    "ignoreip: {} is not an IPv4 address, network or host name (a host name \
+                     has a dot, such as home.example.net)",
+                    item
+                ));
             }
         }
 
@@ -665,6 +712,7 @@ impl Config {
             max_bans_per_hour: number(g, "max_bans_per_hour", 20, 1, 10000)? as usize,
             state_file: PathBuf::from(state_file),
             ignore,
+            ignore_names,
             meta_id,
             log_filter,
             dry_run: boolean(g, "dry_run", false)?,
@@ -793,6 +841,114 @@ mod tests {
         assert!(!cfg
             .log_filter
             .is_match("log.hikvision.com/Exception/videoLost/30"));
+    }
+
+    /// `ignoreip` takes addresses, networks and host names; the default
+    /// list is the private ranges and no name.
+    #[test]
+    fn ignoreip_takes_addresses_networks_and_host_names() {
+        let cfg = Config::parse(BASE).unwrap();
+        assert_eq!(
+            cfg.ignore,
+            [
+                "127.0.0.0/8",
+                "10.0.0.0/8",
+                "172.16.0.0/12",
+                "192.168.0.0/16"
+            ]
+            .map(|n| Net::parse(n).unwrap())
+        );
+        assert!(cfg.ignore_names.is_empty());
+        let cfg = Config::parse(&format!(
+            "[general]\nignoreip = 203.0.113.7, 198.51.100.0/24 Home.Example.NET,\
+             vpn-1.example.org home.example.net xn--e1afmkfd.example\n{}",
+            BASE
+        ))
+        .unwrap();
+        assert_eq!(
+            cfg.ignore,
+            ["203.0.113.7", "198.51.100.0/24"].map(|n| Net::parse(n).unwrap())
+        );
+        // lower case, each once, in the order of the config
+        assert_eq!(
+            cfg.ignore_names,
+            [
+                "home.example.net",
+                "vpn-1.example.org",
+                "xn--e1afmkfd.example"
+            ]
+        );
+        assert!(cfg.ignored("203.0.113.7".parse().unwrap()));
+        // a name exempts nothing by itself: what it resolves to is looked
+        // up at run time (`ignored.rs`)
+        assert!(!cfg.ignored("192.168.1.5".parse().unwrap()));
+        // only names
+        let cfg =
+            Config::parse(&format!("[general]\nignoreip = home.example.net\n{}", BASE)).unwrap();
+        assert!(cfg.ignore.is_empty());
+        assert_eq!(cfg.ignore_names, ["home.example.net"]);
+    }
+
+    /// An item that is neither an address, a network nor a host name is a
+    /// config error that names it; an address that is wrong stays an error
+    /// about the address, never a name.
+    #[test]
+    fn ignoreip_refuses_what_is_no_host_name() {
+        let error = |list: &str| {
+            Config::parse(&format!("[general]\nignoreip = {}\n{}", list, BASE))
+                .err()
+                .unwrap_or_else(|| panic!("{} was accepted", list))
+        };
+        let long = format!("{}.example.net", "a".repeat(64));
+        let label = "a".repeat(63);
+        let too_long = format!("{l}.{l}.{l}.{}.example", "a".repeat(54), l = label);
+        for item in [
+            "banana",
+            "-home.example.net",
+            "home-.example.net",
+            "home..example.net",
+            ".example.net",
+            "home.example.net.",
+            "home_1.example.net",
+            "home.example.123",
+            "2001:db8::1",
+            "home.example.net:80",
+            "*.example.net",
+            long.as_str(),
+            too_long.as_str(),
+        ] {
+            assert_eq!(
+                error(&format!("192.168.0.0/16, {}", item)),
+                format!(
+                    "ignoreip: {} is not an IPv4 address, network or host name (a host name \
+                     has a dot, such as home.example.net)",
+                    item
+                ),
+                "{}",
+                item
+            );
+        }
+        assert_eq!(
+            error("192.0.2"),
+            "ignoreip: 192.0.2 is not an IPv4 address or network"
+        );
+        assert_eq!(
+            error("192.0.2.300"),
+            "ignoreip: 192.0.2.300 is not an IPv4 address or network"
+        );
+        assert_eq!(
+            error("home.example.net/24"),
+            "ignoreip: home.example.net/24 is not an IPv4 address or network"
+        );
+        assert_eq!(
+            error("192.0.2.0/33"),
+            "ignoreip: bad prefix in 192.0.2.0/33"
+        );
+        // the longest name that is taken
+        let longest = format!("{l}.{l}.{l}.{}.example", "a".repeat(53), l = label);
+        assert_eq!(longest.len(), 253);
+        assert!(is_host_name(&longest));
+        assert!(is_host_name(&format!("{}.example.net", "a".repeat(63))));
     }
 
     #[test]

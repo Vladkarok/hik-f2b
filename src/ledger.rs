@@ -85,19 +85,28 @@ pub struct Rules<'a> {
     /// The own addresses (`own.rs`), as last found. The ledger is told
     /// them; it never looks anything up.
     pub own: &'a BTreeSet<Ipv4Addr>,
+    /// The addresses the host names of `ignoreip` resolve to, as last
+    /// found (`ignored.rs`), each with its name. Exempt like `ignore`.
+    pub named: &'a BTreeMap<Ipv4Addr, String>,
 }
 
 /// Why an address is never banned.
 #[derive(Clone, Copy, Debug, PartialEq)]
-enum Exempt {
+enum Exempt<'a> {
     /// In `ignoreip`, or in a range `never_ban` names.
     Ignored,
     /// An own address of hik-f2b.
     Own,
+    /// What this host name of `ignoreip` resolves to.
+    Named(&'a str),
 }
 
 impl<'a> Rules<'a> {
-    pub fn of(cfg: &'a Config, own: &'a BTreeSet<Ipv4Addr>) -> Rules<'a> {
+    pub fn of(
+        cfg: &'a Config,
+        own: &'a BTreeSet<Ipv4Addr>,
+        named: &'a BTreeMap<Ipv4Addr, String>,
+    ) -> Rules<'a> {
         Rules {
             maxretry: cfg.maxretry,
             findtime: cfg.findtime,
@@ -105,14 +114,17 @@ impl<'a> Rules<'a> {
             max_bans_per_hour: cfg.max_bans_per_hour,
             ignore: &cfg.ignore,
             own,
+            named,
         }
     }
 
     /// Why `ip` is never banned, if it is: a reserved range first (its
     /// line has always said "ignoreip or reserved"), then an own address,
-    /// then `ignoreip`. An own address in `ignoreip` (a private host address
-    /// in the default list) is named as an own address: that says more.
-    fn exempt(&self, ip: Ipv4Addr) -> Option<Exempt> {
+    /// then `ignoreip`: its addresses and networks, then what its host
+    /// names resolve to. An own address in `ignoreip` (a private host
+    /// address in the default list) is named as an own address: that says
+    /// more.
+    fn exempt(&self, ip: Ipv4Addr) -> Option<Exempt<'a>> {
         if never_ban(ip) {
             Some(Exempt::Ignored)
         } else if self.own.contains(&ip) {
@@ -120,7 +132,7 @@ impl<'a> Rules<'a> {
         } else if self.ignore.iter().any(|net| net.contains(ip)) {
             Some(Exempt::Ignored)
         } else {
-            None
+            self.named.get(&ip).map(|name| Exempt::Named(name))
         }
     }
 }
@@ -212,7 +224,8 @@ impl Ledger {
     /// address that is never banned. `failed_login` keeps such addresses
     /// out, but `ignoreip` may have changed since they were counted (a
     /// restart with a new config), or the address may have become an own
-    /// address, and a waiting ban must not be applied then.
+    /// address or what a host name of `ignoreip` resolves to, and a waiting
+    /// ban must not be applied then.
     fn drop_exempt(&mut self, rules: &Rules) {
         let mut addresses: Vec<Ipv4Addr> = self
             .pending
@@ -239,6 +252,13 @@ impl Ledger {
                     "{}: {}: the address is now an own address of hik-f2b and is never banned",
                     ip,
                     what
+                ),
+                Some(Exempt::Named(name)) => crate::info!(
+                    "{}: {}: the address is now what the ignoreip name {} resolves to and is \
+                     never banned",
+                    ip,
+                    what,
+                    name
                 ),
                 _ => crate::info!(
                     "{}: {}: the address is in ignoreip or a reserved range and is never banned",
@@ -318,6 +338,17 @@ impl Ledger {
                     nvr,
                     ip,
                     user
+                );
+                return;
+            }
+            Some(Exempt::Named(name)) => {
+                crate::info!(
+                    "{}: failed login from {} (user={:?}): never banned (ignoreip name {}), not \
+                     counted",
+                    nvr,
+                    ip,
+                    user,
+                    name
                 );
                 return;
             }
@@ -660,6 +691,7 @@ mod tests {
     const T0: i64 = 1_768_000_000;
     const NO_IGNORE: &[Net] = &[];
     static NO_OWN: BTreeSet<Ipv4Addr> = BTreeSet::new();
+    static NO_NAMED: BTreeMap<Ipv4Addr, String> = BTreeMap::new();
 
     fn ip(text: &str) -> Ipv4Addr {
         text.parse().unwrap()
@@ -678,6 +710,7 @@ mod tests {
             max_bans_per_hour: 2,
             ignore,
             own: &NO_OWN,
+            named: &NO_NAMED,
         }
     }
 
@@ -1135,6 +1168,118 @@ mod tests {
         assert_eq!(captured_log(), expected);
         assert_eq!(l.next_ban(&r, ip("192.0.2.200")), Turn::Gone);
         assert_eq!(l.failed_logins(ip("198.51.100.7")), 1);
+    }
+
+    /// An address that a host name of `ignoreip` resolves to is exempt
+    /// wherever an address written in `ignoreip` is: a failed login is not
+    /// counted (and the line names the name), and a waiting ban and counted
+    /// failed logins are dropped at the start and before bans are
+    /// attempted. Once the name no longer resolves to it, it is counted
+    /// again, from nothing.
+    #[test]
+    fn addresses_of_ignoreip_names_are_exempt_like_ignoreip() {
+        let home: BTreeMap<Ipv4Addr, String> =
+            [(ip("203.0.113.7"), "home.example.net".to_string())].into();
+        let r = Rules {
+            named: &home,
+            ..rules(NO_IGNORE)
+        };
+        let mut l = Ledger::default();
+        capture_log();
+        for k in 0..5 {
+            fail(&mut l, &r, ip("203.0.113.7"), T0 + k);
+        }
+        let log = captured_log();
+        assert_eq!(log.len(), 5);
+        assert_eq!(
+            log[0],
+            "INFO nvr1: failed login from 203.0.113.7 (user=\"admin\"): never banned (ignoreip \
+             name home.example.net), not counted"
+        );
+        assert_eq!(l.sizes(), Sizes::default());
+        // also in notify-only mode and in a dry run
+        l.failed_login(&r, ip("203.0.113.7"), T0, T0, "nvr1", "admin".into(), true);
+        assert_eq!(l.sizes(), Sizes::default());
+        // an address the name does not resolve to is counted
+        fail(&mut l, &r, ip("203.0.113.8"), T0);
+        assert_eq!(l.failed_logins(ip("203.0.113.8")), 1);
+        // in ignoreip as an address too, or an own address: those lines
+        let ignore = [Net::parse("203.0.113.0/24").unwrap()];
+        let own: BTreeSet<Ipv4Addr> = [ip("203.0.113.7")].into();
+        let both = Rules {
+            named: &home,
+            ..rules(&ignore)
+        };
+        let all = Rules {
+            own: &own,
+            named: &home,
+            ..rules(NO_IGNORE)
+        };
+        capture_log();
+        fail(&mut l, &both, ip("203.0.113.7"), T0);
+        fail(&mut l, &all, ip("203.0.113.7"), T0);
+        let log = captured_log();
+        assert!(log[0].ends_with("never banned (ignoreip or reserved), not counted"));
+        assert!(log[1].contains("an own address of hik-f2b"), "{}", log[1]);
+
+        // an address that a name starts to resolve to
+        let text = format!(
+            "fail 203.0.113.7 {t}\nfail 203.0.113.7 {t}\nfail 203.0.113.7 {t}\n\
+             fail 203.0.113.9 {t}\nfail 198.51.100.7 {t}\n\
+             pending 203.0.113.7 {t} 3 nvr1 admin\npending 203.0.113.10 {t} 3 nvr1 admin\n",
+            t = T0
+        );
+        let named: BTreeMap<Ipv4Addr, String> = [
+            (ip("203.0.113.7"), "home.example.net".to_string()),
+            (ip("203.0.113.9"), "home.example.net".to_string()),
+            (ip("203.0.113.10"), "vpn.example.org".to_string()),
+        ]
+        .into();
+        let r = Rules {
+            named: &named,
+            ..rules(NO_IGNORE)
+        };
+        let expected = vec![
+            "INFO 203.0.113.7: waiting ban dropped, 3 counted failed login(s) forgotten: the \
+             address is now what the ignoreip name home.example.net resolves to and is never \
+             banned",
+            "INFO 203.0.113.9: 1 counted failed login(s) forgotten: the address is now what the \
+             ignoreip name home.example.net resolves to and is never banned",
+            "INFO 203.0.113.10: waiting ban dropped: the address is now what the ignoreip name \
+             vpn.example.org resolves to and is never banned",
+        ];
+        // at the start
+        let mut l = read(&text);
+        capture_log();
+        l.fit(&r);
+        assert_eq!(captured_log(), expected);
+        assert_eq!(l.waiting(), 0);
+        assert_eq!(l.sizes().tracked, 1);
+        // and before bans are attempted (the re-check before a ban)
+        let mut l = read(&text);
+        assert_eq!(l.due(&rules(NO_IGNORE), at(T0 + 10)).len(), 2);
+        capture_log();
+        assert!(l.due(&r, at(T0 + 10)).is_empty());
+        assert_eq!(captured_log(), expected);
+        assert_eq!(l.next_ban(&r, ip("203.0.113.7")), Turn::Gone);
+        assert_eq!(l.failed_logins(ip("198.51.100.7")), 1);
+
+        // the name no longer resolves to 203.0.113.7: counted again, from
+        // nothing (what was dropped does not come back)
+        let moved: BTreeMap<Ipv4Addr, String> =
+            [(ip("203.0.113.8"), "home.example.net".to_string())].into();
+        let r = Rules {
+            named: &moved,
+            ..rules(NO_IGNORE)
+        };
+        assert_eq!(l.failed_logins(ip("203.0.113.7")), 0);
+        make_waiting(&mut l, &r, ip("203.0.113.7"), T0 + 20);
+        assert_eq!(l.failed_logins(ip("203.0.113.7")), 3);
+        assert_eq!(l.due(&r, at(T0 + 30)), vec![ip("203.0.113.7")]);
+        assert_eq!(
+            l.next_ban(&r, ip("203.0.113.7")),
+            Turn::Ban(pending(T0 + 20, 3))
+        );
     }
 
     #[test]

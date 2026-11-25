@@ -3536,6 +3536,254 @@ fn own_address_in_the_address_list_in_a_dry_run_and_in_notify_only_mode() {
     assert!(telegram_texts(&h).is_empty());
 }
 
+// ------------------------------------------------------- names in ignoreip
+
+/// The administrator's dynamic DNS name, and the addresses it resolves to
+/// in these tests.
+const HOME: &str = "home.example.net";
+const HOME_IP: &str = "203.0.113.7";
+const NEXT_IP: &str = "203.0.113.8";
+const WITH_HOME: &str = "ignoreip = 192.168.0.0/16, home.example.net";
+
+fn with_home(opts: Opts) -> Harness {
+    Harness::with(Opts {
+        general: WITH_HOME,
+        own: ip(OWN),
+        names: &[(HOME, &[HOME_IP])],
+        ..opts
+    })
+}
+
+/// The administrator's scenario, from start to end: wrong passwords from
+/// the address the name resolves to are never counted; the name then
+/// follows the administrator to a new address, whose waiting ban is
+/// dropped, and the old address is banned on its next failed logins.
+#[test]
+fn an_administrator_behind_an_ignoreip_name_is_never_banned() {
+    let mut h = with_home(Opts::default());
+    util::capture_log();
+    h.engine.startup_names();
+    assert_eq!(
+        util::captured_log(),
+        vec!["INFO ignoreip names, never banned: home.example.net 203.0.113.7"]
+    );
+    // eight wrong passwords from home, and an attacker
+    h.burst("10:01", HOME_IP, 8);
+    h.burst("10:01", ATTACKER, 5);
+    h.cycle("10:02:00");
+    let log = util::captured_log();
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    assert_eq!(h.fails(HOME_IP), 0);
+    assert_eq!(
+        exactly(
+            &log,
+            "INFO nvr1: failed login from 203.0.113.7 (user=\"admin\"): never banned (ignoreip \
+             name home.example.net), not counted"
+        ),
+        8,
+        "{:?}",
+        log
+    );
+    // the administrator's next address has failed logins before the name
+    // follows it, while the router cannot be reached: its ban waits
+    h.fake.lock().unwrap().router_unreachable = true;
+    h.burst("10:03", NEXT_IP, 5);
+    h.cycle("10:04:00");
+    assert!(h.engine.state().ledger.is_waiting(ip(NEXT_IP)));
+    // the name follows; its answer is looked up again 5 min after the first
+    // poll, not before
+    h.own.set_name(HOME, Ok(vec![ip(NEXT_IP)]));
+    h.cycle("10:04:59");
+    assert!(h.engine.state().ledger.is_waiting(ip(NEXT_IP)));
+    util::capture_log();
+    h.cycle("10:05:00");
+    let log = util::captured_log();
+    assert_eq!(
+        exactly(
+            &log,
+            "INFO ignoreip: home.example.net now resolves to 203.0.113.8 (was 203.0.113.7)"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    assert_eq!(
+        exactly(
+            &log,
+            "INFO 203.0.113.8: waiting ban dropped, 5 counted failed login(s) forgotten: the \
+             address is now what the ignoreip name home.example.net resolves to and is never \
+             banned"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    assert!(!h.engine.state().ledger.is_waiting(ip(NEXT_IP)));
+    // the router is back: nothing is banned for what was dropped
+    h.fake.lock().unwrap().router_unreachable = false;
+    h.cycle("10:05:30");
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    // the old address is exempt no more: its next failed logins are counted
+    // from nothing and banned; the new one is exempt
+    util::capture_log();
+    h.burst("10:06", HOME_IP, 5);
+    h.burst("10:06", NEXT_IP, 5);
+    h.cycle("10:07:00");
+    let log = util::captured_log();
+    assert_eq!(h.banned(), vec![ATTACKER, HOME_IP]);
+    assert_eq!(h.fails(NEXT_IP), 0);
+    assert_eq!(
+        exactly(
+            &log,
+            "INFO nvr1: failed login from 203.0.113.7 (user=\"admin\") at 2026-01-10T08:06:10Z \
+             [1/5]"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    assert_eq!(
+        exactly(
+            &log,
+            "INFO nvr1: failed login from 203.0.113.8 (user=\"admin\"): never banned (ignoreip \
+             name home.example.net), not counted"
+        ),
+        5,
+        "{:?}",
+        log
+    );
+}
+
+/// A resolver that fails at the start: the name exempts nothing, which the
+/// start says once, and no poll says it again. Once the name resolves (at
+/// its next look-up, 5 min after the first poll), its address is exempt
+/// and what was counted of it is forgotten.
+#[test]
+fn an_ignoreip_name_that_does_not_resolve_at_the_start_exempts_nothing_until_it_does() {
+    let mut h = Harness::build(Opts {
+        general: WITH_HOME,
+        own: ip(OWN),
+        ..Default::default()
+    });
+    util::capture_log();
+    h.engine.startup_names();
+    assert_eq!(
+        util::captured_log(),
+        vec![
+            "INFO ignoreip names, never banned: home.example.net not resolved",
+            "WARNING ignoreip: home.example.net does not resolve, so it exempts no address until \
+             it does; it is tried again every 5 min: cannot resolve home.example.net: no such \
+             name",
+        ]
+    );
+    h.tick(); // the first poll, at 10:00:00
+    h.burst("10:01", HOME_IP, 3);
+    h.cycle("10:02:00");
+    assert_eq!(h.fails(HOME_IP), 3);
+    h.own.set_name(HOME, Ok(vec![ip(HOME_IP)]));
+    h.cycle("10:04:59");
+    assert_eq!(h.fails(HOME_IP), 3);
+    h.cycle("10:05:00");
+    assert_eq!(h.fails(HOME_IP), 0);
+    let log = util::captured_log();
+    assert_eq!(
+        log.iter()
+            .filter(|l| l.contains("ignoreip"))
+            .collect::<Vec<_>>(),
+        vec![
+            "INFO ignoreip: home.example.net now resolves to 203.0.113.7 (was none)",
+            "INFO 203.0.113.7: 3 counted failed login(s) forgotten: the address is now what the \
+             ignoreip name home.example.net resolves to and is never banned",
+        ]
+    );
+    h.burst("10:06", HOME_IP, 5);
+    h.cycle("10:07:00");
+    assert_eq!(h.fails(HOME_IP), 0);
+    assert!(h.banned().is_empty());
+}
+
+/// `--check` prints what each name resolves to now, one line per name; a
+/// name that does not resolve is a failed check.
+#[test]
+fn check_prints_what_each_ignoreip_name_resolves_to() {
+    use hik_f2b::health::Status;
+    let h = Harness::build(Opts {
+        general: "ignoreip = 192.168.0.0/16, home.example.net, vpn.example.org",
+        own: ip(OWN),
+        names: &[(HOME, &[NEXT_IP, HOME_IP])],
+        ..Default::default()
+    });
+    let lines = h.check();
+    let text: Vec<String> = lines.iter().map(|l| l.to_string()).collect();
+    assert_eq!(
+        text[1..],
+        [
+            "ok       nvr nvr1 log: order not known, page size not known (0 entries read from \
+             the last 24 h)",
+            "ok       firewall: 1 enabled rule(s) in /ip/firewall/raw with \
+             src-address-list=cctv_ban",
+            "ok       own addresses: router 127.0.0.1 from 192.0.2.200, nvr1 127.0.0.1 from \
+             192.0.2.200 (never banned)",
+            "ok       ignoreip home.example.net: resolves to 203.0.113.7 and 203.0.113.8 (never \
+             banned)",
+            "FAILED   ignoreip vpn.example.org: does not resolve, so it exempts no address: \
+             cannot resolve vpn.example.org: no such name",
+            "off      telegram: not configured",
+            "off      country database: not configured",
+        ],
+        "{:#?}",
+        text
+    );
+    assert!(
+        text[0].starts_with("ok       nvr nvr1: login accepted"),
+        "{}",
+        text[0]
+    );
+    assert_eq!(
+        lines.iter().filter(|l| l.status == Status::Failed).count(),
+        1
+    );
+    // without a name, no such line
+    let h = with_own(Opts::default());
+    assert!(!h.check().iter().any(|l| l.item.starts_with("ignoreip")));
+}
+
+/// An address that a name of `ignoreip` resolves to is not an own address:
+/// found in the address-list, it is not removed (hik-f2b removes a ban only
+/// for an own address, ADR 0005), the router is not even asked about it,
+/// and it never goes into the safe list.
+#[test]
+fn an_address_of_an_ignoreip_name_in_the_address_list_is_not_removed() {
+    let mut h = with_home(Opts {
+        mikrotik_extra: "safe_list = cctv_safe",
+        ..Default::default()
+    });
+    h.fake.lock().unwrap().bans.push(HOME_IP.to_string());
+    h.burst("10:01", HOME_IP, 6);
+    run(&mut h, 25, 30); // two firewall checks after the first
+    assert_eq!(h.banned(), vec![HOME_IP]);
+    assert_eq!(h.fails(HOME_IP), 0);
+    let f = h.fake.lock().unwrap();
+    assert!(f.delete_log.is_empty(), "{:?}", f.delete_log);
+    // every look-up in a list is for the own address: one in the
+    // address-list and one in the safe list per check
+    assert_eq!(f.lookups.len(), 6, "{:?}", f.lookups);
+    assert!(
+        f.lookups
+            .iter()
+            .all(|l| l.contains(&format!("&address={}&", OWN))),
+        "{:?}",
+        f.lookups
+    );
+    assert!(!f.safe_log.is_empty());
+    assert!(
+        f.safe_log.iter().all(|(_, address, _)| address == OWN),
+        "{:?}",
+        f.safe_log
+    );
+    assert!(f.listed.iter().all(|e| e.address == OWN), "{:?}", f.listed);
+}
+
 // --------------------------------------------------------------- safe list
 
 /// The requests of one firewall check that the router answers, without a

@@ -13,6 +13,7 @@ use hik_f2b::check;
 use hik_f2b::config::Config;
 use hik_f2b::engine::Engine;
 use hik_f2b::health::CheckLine;
+use hik_f2b::ignored::IgnoredNames;
 use hik_f2b::mikrotik::Mikrotik;
 use hik_f2b::nvr::{parse_kv, Nvr};
 use hik_f2b::own::{Fixed, OwnAddresses};
@@ -1226,6 +1227,9 @@ pub struct Opts {
     /// fakes listen on loopback, so by default it is loopback, as the
     /// operating system would answer.
     pub own: Ipv4Addr,
+    /// What host names resolve to (`own::Fixed::set_name`) when the engine
+    /// starts: for the names of `ignoreip` in `general`.
+    pub names: &'static [(&'static str, &'static [&'static str])],
 }
 
 impl Default for Opts {
@@ -1238,6 +1242,7 @@ impl Default for Opts {
             mikrotik_extra: "",
             telegram_extra: "",
             own: Ipv4Addr::LOCALHOST,
+            names: &[],
         }
     }
 }
@@ -1251,8 +1256,10 @@ pub struct Harness {
     pub ini: String,
     pub port: u16,
     pub host: i64,
-    /// The answers about own addresses that the engine gets; change them to
-    /// change its own addresses (from its next poll on).
+    /// The answers about own addresses that the engine gets, and for the
+    /// host names of `ignoreip` (`set_name`); change them to change its own
+    /// addresses (from its next poll on) and what a name resolves to (from
+    /// its next look-up).
     pub own: Fixed,
     /// The fakes' servers, stopped when the harness is dropped. The last
     /// field: the fields of a struct are dropped in their order.
@@ -1360,6 +1367,12 @@ impl Harness {
             ));
         }
         let own = Fixed::new(opts.own);
+        for (name, addresses) in opts.names {
+            own.set_name(
+                name,
+                Ok(addresses.iter().map(|a| a.parse().unwrap()).collect()),
+            );
+        }
         let engine = start(&ini, State::default(), &own);
         let mut h = Harness {
             fake,
@@ -1525,18 +1538,21 @@ impl Harness {
         let mut nvrs: Vec<Nvr> = cfg.nvrs.iter().map(|n| Nvr::new(n).unwrap()).collect();
         let router = cfg.mikrotik.as_ref().map(|m| Mikrotik::new(m).unwrap());
         let own = OwnAddresses::new(&cfg, Box::new(self.own.clone()));
+        let ignored = IgnoredNames::new(&cfg, Box::new(self.own.clone()));
         check::check_all(
             &cfg,
             &mut nvrs,
             router.as_ref().map(|m| m as &dyn Firewall),
             &own,
+            &ignored,
             self.host as u64,
         )
     }
 }
 
 /// An engine with the router and Telegram clients `ini` asks for, set up
-/// as `main.rs` sets them up, and own addresses from `own`.
+/// as `main.rs` sets them up, and own addresses and the answers for the
+/// host names of `ignoreip` from `own`.
 fn start(ini: &str, state: State, own: &Fixed) -> Engine {
     let cfg = Config::parse(ini).unwrap();
     let firewall = cfg
@@ -1547,8 +1563,9 @@ fn start(ini: &str, state: State, own: &Fixed) -> Engine {
         .telegram
         .as_ref()
         .map(|t| Box::new(Telegram::new(t).unwrap()) as Box<dyn Notifier>);
+    let ignored = IgnoredNames::new(&cfg, Box::new(own.clone()));
     let own = OwnAddresses::new(&cfg, Box::new(own.clone()));
-    Engine::new(cfg, state, firewall, notifier, own).unwrap()
+    Engine::new(cfg, state, firewall, notifier, own, ignored).unwrap()
 }
 
 /// Runs `n` cycles, `step` seconds apart.

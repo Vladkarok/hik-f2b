@@ -30,6 +30,7 @@ documentation uses the same word.
 | remove a ban | зняти бан | Delete the address-list entry on the router. | Видалити запис з address-list на роутері. | lift a ban, unban; розбанити |
 | address-list | address-list | The RouterOS list that holds banned addresses (`cctv_ban`). | Список RouterOS, у якому лежать забанені адреси (`cctv_ban`). | ban list, block list; бан-лист, чорний список |
 | address-list entry | запис в address-list | One address in the address-list, with or without a timeout. | Одна адреса в address-list, з таймаутом чи без. | ban entry |
+| safe list | безпечний список | The optional second address-list (`safe_list`) in which hik-f2b keeps its own address toward the router; a rule above the drop rule accepts it. | Необов'язковий другий address-list (`safe_list`), у якому hik-f2b тримає власну адресу в бік роутера; правило над правилом відкидання її пропускає. | allow list, whitelist; білий список |
 | drop rule | правило відкидання | The firewall rule that blocks addresses from the address-list. | Правило фаєрвола, яке блокує адреси з address-list. | block rule, ban rule; правило блокування |
 | config | конфіг | The file `hik-f2b.ini`. | Файл `hik-f2b.ini`. | configuration file, settings file; файл налаштувань, конфігурація (про файл) |
 | setting | параметр | One `key = value` line in the config. | Один рядок `ключ = значення` у конфігу. | option (for this); опція (про це) |

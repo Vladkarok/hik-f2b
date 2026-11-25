@@ -13,7 +13,9 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 - hik-f2b never bans its own addresses: the addresses of the router and of
   each NVR (from the URLs in the config, a host name resolved) and the
   address this host uses to reach each of them. It finds them at startup
-  and again in every poll. A failed login from one is not counted, and the
+  and again in every poll; a host name in a URL is resolved again at most
+  every 5 minutes, so that a slow resolver does not hold up every poll. A
+  failed login from one is not counted, and the
   log line says that it came from an own address of hik-f2b, which is what
   the NVR logs when hik-f2b's own NVR password is wrong. Before, those
   failed logins could get the host banned once the password was right
@@ -33,6 +35,19 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   works as before, except that own addresses are never banned and are
   removed from the address-list. Neither has been tried on real devices
   yet; see "Not yet tried" in the README.
+- An optional safe list: with `safe_list = <name>` in `[mikrotik]`,
+  hik-f2b keeps this host's address toward the router in that address-list,
+  with a timeout of 30 minutes, renewed at every firewall check. With one
+  accept rule above the drop rule (the README gives the command), the
+  router then never blocks that address, whatever the address-list holds.
+  The firewall check also checks that this rule is enabled and comes before
+  the drop rule (new health alert `safe-list-rule`); a write the router
+  refuses is the new health alert `safe-list-refused`. `--check` prints a
+  line `safe list`. A dry run writes nothing and says once what it would
+  write. Without the setting nothing of this happens and no request is
+  sent. Not tried on a real router yet; see "Not yet tried" in the README.
+- `--test-ban` refuses an own address of hik-f2b: it says why, exits with
+  status 1 and sends nothing to the router.
 
 ## [0.4.1] - 2026-11-25
 

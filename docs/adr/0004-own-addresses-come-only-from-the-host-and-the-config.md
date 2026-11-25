@@ -22,8 +22,9 @@ rules and looks nothing up.
 
 ## Consequences
 
-The set is looked up at startup and in every poll; a failed look-up keeps
-what was last found for that device. With NAT between the host and a
+The set is looked up at startup and in every poll (a host name at most
+every 5 minutes, `src/names.rs`); a failed look-up keeps what was last
+found for that device. With NAT between the host and a
 device, the device sees another address, which hik-f2b cannot know; the
 operator puts it into `ignoreip`. `src/own.rs` has an in-memory adapter,
 `Fixed`, next to the one of the operating system: a third place beside the

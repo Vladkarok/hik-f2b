@@ -70,6 +70,8 @@ Before a release, also run
 - Nothing read from an NVR log may reach the set of own addresses
   (`src/own.rs`, ADR 0004). hik-f2b removes an address-list entry only for
   an own address (ADR 0005).
+- Only own addresses go into the safe list, and hik-f2b adds or changes no
+  firewall rule (ADR 0006).
 - Releases are made by tags, as [RELEASING.md](RELEASING.md) says. Try a
   release candidate on real hardware first.
 - There is no automatic deployment, by design: hik-f2b changes a firewall,

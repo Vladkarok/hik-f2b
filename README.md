@@ -119,7 +119,19 @@ to connections that your own LAN opened. hik-f2b checks at startup and every 5
 minutes that such a rule exists and is enabled. If the rule is gone, hik-f2b
 sends a health alert (see [Health alerts](#health-alerts)).
 
-4. Export the CA certificate:
+4. Optional: add the rule for the safe list, see [Safe list](#safe-list).
+   If you do not set `safe_list`, skip this step.
+   If you set it, add this rule above the drop rule:
+
+```
+/ip firewall raw add chain=prerouting src-address-list=cctv_safe action=accept comment="hik-f2b: accept safe" place-before=[find comment="hik-f2b: drop banned"]
+```
+
+The rule must be in the same table and chain as the drop rule, and above it.
+`place-before` puts it right above the drop rule from step 3. Use the name
+of your `safe_list` in place of `cctv_safe`.
+
+5. Export the CA certificate:
 
 ```
 /certificate export-certificate f2b-ca
@@ -127,7 +139,7 @@ sends a health alert (see [Health alerts](#health-alerts)).
 
 The router now has the file `cert_export_f2b-ca.crt` in its files.
 
-5. Copy this file to the host. The [Host](#3-host) step saves it as
+6. Copy this file to the host. The [Host](#3-host) step saves it as
    `router-ca.crt`, the name that the example config expects. With Compose or
    without a container, name it `router-ca.crt` yourself.
 
@@ -456,6 +468,11 @@ address-list is blocked some other way, set it to `false`. Examples: a rule
 that uses the address-list as `dst-address-list`, or blocking on another
 device.
 
+`safe_list` in the `[mikrotik]` section (not set by default) names a second
+address-list, in which hik-f2b keeps its own address toward the router, see
+[Safe list](#safe-list). It follows the rules of `address_list` for a name
+and must differ from it.
+
 hik-f2b does not use a state file that was written by an older version
 (format 1), whose first line is damaged, that cannot be read or that is
 larger than 16 MiB. It logs a WARNING that says why and renames the file to
@@ -473,7 +490,9 @@ and of each NVR, taken from the URLs in the config (a host name is
 resolved), and the address this host uses to reach each of them. hik-f2b
 finds them at run time, when it starts and again in every poll, so an
 address that changes (DHCP, a VPN that reconnects) counts from the next
-poll on. There is no setting for them, and this cannot be turned off.
+poll on. A host name in a URL is resolved when hik-f2b starts and then at
+most every 5 minutes, so that a slow resolver does not hold up every poll.
+There is no setting for them, and this cannot be turned off.
 
 - The start of the service logs them in one INFO line
   (`own addresses, never banned: ...`): for each device, its address and
@@ -507,6 +526,47 @@ The limit: with NAT between this host and a device, the device sees another
 address, which hik-f2b cannot know. Put that address into `ignoreip`. A
 host name in a URL is resolved by this host's resolver, so whoever controls
 the answer for that name also decides which address is exempt.
+
+### Safe list
+
+The safe list is an optional second address-list on the router, named by
+`safe_list` in `[mikrotik]`, for example `cctv_safe`. hik-f2b keeps one
+address in it: the address of this host toward the router, one of the own
+addresses. Nothing read from an NVR log can get into it. Together with an
+accept rule above the drop rule (step 4 of the [router setup](#1-router)),
+the router does not block that address, whatever the address-list holds.
+Without `safe_list` none of this happens, and hik-f2b sends no request for
+it.
+
+- hik-f2b adds the entry when it starts, with a timeout of 30 minutes. At
+  every firewall check that the router answers (every 5 minutes), it renews
+  the timeout. So the entry outlives five failed checks in a row, and it
+  expires by itself when the service stops or the host moves. Each check
+  sends four requests more: the order of the rules, the rules that use the
+  safe list, the look-up of the entry, and the renewal
+  (`PATCH /rest/ip/firewall/address-list/<id>`) or the new entry.
+- The start logs `... added to the safe list cctv_safe for 00:30:00`. If
+  the address of this host toward the router changes, hik-f2b adds the new
+  one. It leaves the old one to expire and logs that once. An entry without
+  a timeout, added by hand, is left as it is.
+- The firewall check also checks the rule: one rule in the table of the
+  drop rule must have `src-address-list` set to `safe_list` and the action
+  `accept`. It must be enabled, valid and come before the first enabled
+  drop rule. If not, hik-f2b logs `safe list check failed: ...` with what to
+  add or move, and the problem is a health alert (`safe-list-rule`).
+- If the router refuses to write the entry, hik-f2b logs an ERROR at each
+  check, and the problem is a health alert (`safe-list-refused`). A router
+  that cannot be reached is the firewall problem, as for a ban.
+- A dry run writes nothing to the router. It says once what it would write
+  (`DRY RUN: would keep ...`). The rule is checked as usual.
+- `--check` prints a line `safe list`: the rule, and whether the address is
+  in the list. It writes nothing. Without the service, the entry expires
+  after 30 minutes, and `--check` then says that it is not in the list.
+
+What the safe list does not do: whoever has the router account can remove
+the rule or the entry, as they can change any other rule. Most setups do not
+need the safe list: the drop rule matches only packets from the WAN, and the
+host usually reaches the router from the LAN.
 
 ### Permanent bans
 
@@ -801,6 +861,16 @@ and always in its log. It watches:
   that finds no own address in the address-list. When hik-f2b finds the
   entry, it also sends one message at once, not after `alert_after`, see
   [Own addresses](#own-addresses).
+- **The rule of the safe list** (only with `safe_list`): no enabled, valid
+  rule with `src-address-list` set to `safe_list` and the action `accept`
+  comes before the first enabled drop rule, in the same table
+  (`safe-list-rule`). The reason says what to add, enable or move. hik-f2b
+  reads the ids of the table's rules in their order
+  (`GET /rest/ip/firewall/raw?.proplist=.id`) and the rules of the safe list
+  with their `disabled`, `invalid` and `action`. See [Safe list](#safe-list).
+- **A refused write to the safe list** (only with `safe_list`): the router
+  answers, but refuses to add or renew the entry of this host
+  (`safe-list-refused`). Only a write that works ends it.
 
 The router checks also run in a dry run, where they help with the setup. A dry
 run sends no bans, so the refused-ban check does not run in a dry run. In
@@ -983,6 +1053,11 @@ whatever they typed). It is built accordingly:
   own failed logins after a password change nor a forged entry with the
   host's address can get the host banned, so that the router would block
   hik-f2b itself. See [Own addresses](#own-addresses).
+- **Safe list (optional).** With `safe_list` and its accept rule, the
+  router does not block the address of this host toward it, whatever the
+  address-list holds. hik-f2b writes only that own address to the safe
+  list, and it never adds or changes a firewall rule. See
+  [Safe list](#safe-list).
 - **TLS.** Certificate verification cannot be turned off. An https router URL
   needs `ca_file`: with a path, only that CA is trusted; `ca_file = public`
   trusts the public CA roots built into hik-f2b, which has to be written out.
@@ -1046,6 +1121,8 @@ What it does not protect against:
   rules above cannot tell from a real one. Both NVRs tested here escape `<`
   and cut the logged name to 15 characters, so they are not affected.
 - A ban is per address, so it also affects anyone sharing that address.
+- An attacker with the router account or root on the host. They can remove
+  the rule of the safe list or its entry, or ban any address.
 
 Never attach your real config, router export or `--dump --raw` output to an
 issue unchanged. They hold passwords, public addresses and serial numbers, and
@@ -1194,6 +1271,12 @@ Not yet tried:
   address-list either: the `DELETE` request, the answers of RouterOS to it
   (also for a router user without the `write` policy) and the
   `own-address-listed` alert. Only the tests and the simulation make these
+  happen.
+- The safe list of 0.5.0 on a real router: none of it has been tried yet.
+  Not the rule command of the setup (with `place-before`), the renewal of a
+  timeout with `PATCH`, the answers of RouterOS to the safe-list requests,
+  the order in which it lists the rules of a table, nor the `action`
+  property in its answer. Only the tests and the simulation make these
   happen.
 - A ban with a country on real devices: only `--country` and `--check` were
   run against a real database file.

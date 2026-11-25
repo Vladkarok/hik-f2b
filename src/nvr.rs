@@ -583,11 +583,6 @@ pub struct Nvr {
     pub url: String,
     agent: ureq::Agent,
     auth: DigestAuth,
-    /// Host time before which this NVR is not contacted (after a rejected login).
-    pub retry_after: u64,
-    /// Polls in a row that failed for a reason other than our login being
-    /// rejected (kept in memory only).
-    pub failed_polls: u32,
 }
 
 impl Nvr {
@@ -598,8 +593,6 @@ impl Nvr {
             agent: http::agent(&cfg.url, cfg.ca_file.as_deref(), http::DEFAULT_TIMEOUT)
                 .map_err(|e| format!("nvr {}: {}", cfg.name, e))?,
             auth: DigestAuth::new(&cfg.user, &cfg.password),
-            retry_after: 0,
-            failed_polls: 0,
         })
     }
 

@@ -37,6 +37,12 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   the health checks in `src/health.rs`, with unit tests of their own.
   hik-f2b behaves as before: the health alerts and the times they are sent
   are unchanged.
+- The reading of an NVR log (where it was read up to, a device clock that
+  changed, the order and the paging of the log, and the conversion of its
+  times to host time) moved into its own module, `src/reader.rs`, with one
+  log reader per NVR and unit tests of its own. hik-f2b behaves as before:
+  the hik-f2b log, what hik-f2b asks the NVR and the state file are
+  unchanged.
 
 ### Fixed
 

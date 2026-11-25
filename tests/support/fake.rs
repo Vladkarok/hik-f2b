@@ -1005,7 +1005,7 @@ impl Drop for Harness {
         // the threads serving them. `stop` also shuts the connections down
         // from the server side, but on Windows that does not wake a thread
         // blocked reading.
-        self.engine.nvrs.clear();
+        self.engine.readers.clear();
         self.engine.firewall = None;
         self.engine.notifier = None;
         sample_conntrack();
@@ -1204,7 +1204,7 @@ impl Harness {
     }
 
     pub fn since(&self, nvr: &str) -> String {
-        device(self.engine.state.nvr[nvr].since)
+        device(self.engine.state.cursors[nvr].since())
     }
 
     /// Saves the state, loads it again and starts a new engine with it, as

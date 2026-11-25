@@ -16,6 +16,9 @@
 //! Notifications (about bans and from health) are rendered here and handed
 //! to the outbox (`outbox.rs`) as texts; at the end of the poll the outbox
 //! sends what it can.
+//!
+//! The own addresses (`own.rs`) are looked up again at the start of every
+//! poll and given to the ledger with the rules.
 
 use crate::action::{render, BanError, BanInfo, Firewall, HealthError, Notifier};
 use crate::config::{Config, DEFAULT_MESSAGE};
@@ -24,6 +27,7 @@ use crate::health::{BanAttempt, BansEnded, Health, Kind, Notice, NvrRead};
 use crate::ledger::{Outcome, Rules, Turn, MAX_USER};
 use crate::nvr::{Nvr, NvrError};
 use crate::outbox::Outbox;
+use crate::own::OwnAddresses;
 use crate::reader::{LogReader, Login, Logins, Poll};
 use crate::state::State;
 use crate::util::{self, host_i64};
@@ -49,6 +53,8 @@ pub struct Engine {
     stop: Arc<AtomicBool>,
     /// The grace period after the engine started.
     startup: Startup,
+    /// The own addresses, never banned.
+    own: OwnAddresses,
 }
 
 /// The first grace period (`Engine::grace`) after the engine started. The
@@ -111,12 +117,14 @@ impl Engine {
     /// An engine that starts from `state` (what the state file held, or
     /// an empty state) with the given firewall and notifier (either may be
     /// absent; `main.rs` gives it the router and Telegram clients the
-    /// configuration asks for). It sets up a client per NVR of `cfg`.
+    /// configuration asks for) and the own addresses of `cfg`. It sets up a
+    /// client per NVR of `cfg`.
     pub fn new(
         cfg: Config,
         state: State,
         firewall: Option<Box<dyn Firewall>>,
         notifier: Option<Box<dyn Notifier>>,
+        own: OwnAddresses,
     ) -> Result<Engine, String> {
         let readers = cfg
             .nvrs
@@ -139,8 +147,12 @@ impl Engine {
             country_failure: None,
             stop: Arc::new(AtomicBool::new(false)),
             startup: Startup::NotPolled,
+            own,
         };
-        engine.state.ledger.fit(&Rules::of(&engine.cfg));
+        engine
+            .state
+            .ledger
+            .fit(&Rules::of(&engine.cfg, engine.own.set()));
         Ok(engine)
     }
 
@@ -204,6 +216,19 @@ impl Engine {
                 );
                 matches!(e, HealthError::NotEnforced(_))
             }
+        }
+    }
+
+    /// Logs the own addresses found at the start, and the look-ups that
+    /// failed.
+    pub fn startup_own(&self) {
+        crate::info!("own addresses, never banned: {}", self.own.describe());
+        let failures = self.own.failures();
+        if !failures.is_empty() {
+            crate::warn!(
+                "own addresses: a look-up failed, it is tried again in every poll: {}",
+                failures.join("; ")
+            );
         }
     }
 
@@ -303,6 +328,9 @@ impl Engine {
     pub fn cycle_at(&mut self, host_now: u64) {
         let now = host_i64(host_now);
         self.startup.polled(host_now, self.grace());
+        if !self.stopping() {
+            self.own.refresh();
+        }
         let report_once = self.firewall.is_none() || self.cfg.dry_run;
         for i in 0..self.readers.len() {
             if self.stopping() {
@@ -363,7 +391,7 @@ impl Engine {
     /// counting window) and queues the bans they call for.
     fn count(&mut self, logins: Logins, now: i64, report_once: bool) {
         for login in logins {
-            let rules = Rules::of(&self.cfg);
+            let rules = Rules::of(&self.cfg, self.own.set());
             register(&login, now, &rules, &mut self.state, report_once);
         }
     }
@@ -373,14 +401,21 @@ impl Engine {
     /// attempts for this cycle.
     fn flush_pending(&mut self, now: u64) {
         let bantime = self.cfg.bantime;
-        let due = self.state.ledger.due(&Rules::of(&self.cfg), now);
+        let due = self
+            .state
+            .ledger
+            .due(&Rules::of(&self.cfg, self.own.set()), now);
         let mut end = BansEnded::Complete;
         for ip in due {
             if self.stopping() {
                 end = BansEnded::Stopped;
                 break;
             }
-            let p = match self.state.ledger.next_ban(&Rules::of(&self.cfg), ip) {
+            let p = match self
+                .state
+                .ledger
+                .next_ban(&Rules::of(&self.cfg, self.own.set()), ip)
+            {
                 Turn::Ban(p) => p,
                 Turn::Gone => continue,
                 Turn::RateLimited => {
@@ -467,7 +502,10 @@ impl Engine {
                         // attacker that keeps going cannot hide this. Right
                         // after the start that time may come from another
                         // `bantime` (see `Startup`).
-                        let banned_at = self.state.ledger.ban_began(&Rules::of(&self.cfg), ip);
+                        let banned_at = self
+                            .state
+                            .ledger
+                            .ban_began(&Rules::of(&self.cfg, self.own.set()), ip);
                         let recent = now.saturating_sub(banned_at.unwrap_or(0)) <= self.grace();
                         if !recent && !self.startup.running() {
                             crate::warn!(
@@ -495,7 +533,7 @@ impl Engine {
             };
             self.state
                 .ledger
-                .outcome(&Rules::of(&self.cfg), ip, now, outcome);
+                .outcome(&Rules::of(&self.cfg, self.own.set()), ip, now, outcome);
             if notify {
                 // The flag only goes to the chat.
                 let country = code
@@ -528,7 +566,9 @@ impl Engine {
     }
 
     fn cleanup(&mut self, host_now: u64) {
-        self.state.ledger.cleanup(&Rules::of(&self.cfg), host_now);
+        self.state
+            .ledger
+            .cleanup(&Rules::of(&self.cfg, self.own.set()), host_now);
     }
 
     /// Notifications waiting to be sent (for tests and diagnostics).

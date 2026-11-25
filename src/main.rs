@@ -8,6 +8,7 @@ use hik_f2b::engine::Engine;
 use hik_f2b::health::Status;
 use hik_f2b::mikrotik::Mikrotik;
 use hik_f2b::nvr::Nvr;
+use hik_f2b::own::{OwnAddresses, System};
 use hik_f2b::state::State;
 use hik_f2b::telegram::Telegram;
 use hik_f2b::{info, util, warn};
@@ -35,9 +36,9 @@ usage: hik-f2b [options]
       --test-notify   send a test Telegram message and exit
       --country IP    print the country of IP from country_db and exit
                       (contacts nothing; non-zero if the file cannot be read)
-      --check         check every NVR, the firewall and its drop rule and
-                      the country database once, print the results and
-                      exit (non-zero if any failed)
+      --check         check every NVR, the firewall and its drop rule, the
+                      own addresses and the country database once, print
+                      the results and exit (non-zero if any failed)
   -v, --verbose       more logging
       --version       print the version and exit
   -h, --help          this text
@@ -246,10 +247,12 @@ fn one_shot(
     telegram: Option<&Telegram>,
 ) -> Result<(), String> {
     if args.check {
+        let own = OwnAddresses::new(cfg, Box::new(System));
         let lines = check::check_all(
             cfg,
             nvrs,
             mikrotik.map(|m| m as &dyn Firewall),
+            &own,
             util::unix_now(),
         );
         for line in &lines {
@@ -411,7 +414,8 @@ fn run() -> Result<(), String> {
     };
     let firewall = mikrotik.map(|m| Box::new(m) as Box<dyn Firewall>);
     let notifier = telegram.map(|t| Box::new(t) as Box<dyn Notifier>);
-    let mut engine = Engine::new(cfg, state, firewall, notifier)?;
+    let own = OwnAddresses::new(&cfg, Box::new(System));
+    let mut engine = Engine::new(cfg, state, firewall, notifier, own)?;
 
     // A stop takes effect between the steps of a cycle (see
     // `Engine::cycle_at`); the state is saved before hik-f2b exits.
@@ -421,6 +425,7 @@ fn run() -> Result<(), String> {
             .map_err(|e| format!("cannot install signal handler: {}", e))?;
     }
 
+    engine.startup_own();
     engine.startup_country();
     // Also in a dry run: that is when the setup is being checked. The size
     // of the address-list is asked only of a router that answered it, so an

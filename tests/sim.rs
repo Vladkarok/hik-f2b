@@ -182,6 +182,9 @@ const OCCASIONAL: [&str; 3] = ["198.51.100.20", "192.0.2.30", "203.0.113.60"];
 const OWNERS: [&str; 3] = ["203.0.113.17", "203.0.113.18", "203.0.113.21"];
 const PRIVATE: [&str; 4] = ["192.168.1.50", "10.0.0.7", "172.16.0.9", "127.0.0.1"];
 const USERS: [&str; 4] = ["admin", "illegal usernam", "", "user1"];
+/// The address the host reaches its devices from (`own::Fixed`): an own
+/// address, which no other part of a scenario uses.
+const OWN: Ipv4Addr = Ipv4Addr::new(192, 0, 2, 200);
 const FAIL: &str = "illlegealAccess";
 const OTHER: &str = "videoLost/30";
 const NOTICES: [(&str, &str); 4] = [
@@ -669,6 +672,7 @@ impl Sim {
             mikrotik: class != Class::NotifyOnly,
             second_nvr: p.nvrs == 2,
             general,
+            own: OWN,
             ..Default::default()
         });
         let nvr = (0..p.nvrs)
@@ -847,6 +851,8 @@ impl Sim {
         for (t, n, address) in backlog {
             self.write(n, t, address, FAIL, address.parse().ok());
         }
+        // as `main.rs` starts the service
+        self.h.engine.startup_own();
         self.h.engine.startup_check(self.host as u64);
         self.startup_lines()?;
         self.note("first poll".to_string());
@@ -1072,6 +1078,7 @@ impl Sim {
         self.health = Health::default();
         self.last_bypass = None;
         self.started_at = None;
+        self.h.engine.startup_own();
         self.h.engine.startup_check(self.host as u64);
         self.startup_lines()
     }

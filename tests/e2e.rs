@@ -3078,6 +3078,254 @@ fn todays_wording_needs_no_lookup() {
     assert!(h.fake.lock().unwrap().lookups.is_empty());
 }
 
+// ---------------------------------------------------------- own addresses
+
+/// The address the host reaches the fakes from in these tests (the fakes
+/// themselves are on loopback, which is never banned anyway).
+const OWN: &str = "192.0.2.200";
+
+fn with_own(opts: Opts) -> Harness {
+    Harness::with(Opts {
+        own: ip(OWN),
+        ..opts
+    })
+}
+
+/// The NVR rejects hik-f2b's login for ten minutes (its password was
+/// changed on the NVR), and logs each refused login as a failed login from
+/// the host's address with hik-f2b's user name. Then the password is right
+/// again and hik-f2b reads those entries. Returns the harness and the log
+/// from the start.
+fn own_wrong_password(own: &str) -> (Harness, Vec<String>) {
+    let mut h = Harness::with(Opts {
+        general: "auth_backoff = 60",
+        own: ip(own),
+        ..Default::default()
+    });
+    util::capture_log();
+    h.fake.lock().unwrap().nvr_auth_ok = false;
+    for _ in 0..20 {
+        let before = h.fake.lock().unwrap().refused_logins;
+        h.advance(30);
+        let refused = h.fake.lock().unwrap().refused_logins - before;
+        for k in 0..refused {
+            let at = device(h.host + SKEW + k as i64);
+            Harness::entry_to(&h.fake, &at, "192.0.2.200", b"f2b", "illlegealAccess");
+        }
+    }
+    let logged_entries = h.fake.lock().unwrap().entries.len();
+    assert!(logged_entries >= 10, "{}", logged_entries);
+    h.fake.lock().unwrap().nvr_auth_ok = true;
+    run(&mut h, 4, 30);
+    (h, util::captured_log())
+}
+
+/// Layer 1, the scenario it is for: hik-f2b's own failed logins are never
+/// counted, and each one says why and what to check.
+#[test]
+fn own_failed_logins_after_a_wrong_password_are_not_counted() {
+    let (h, log) = own_wrong_password(OWN);
+    let entries = h.fake.lock().unwrap().entries.len();
+    assert!(h.banned().is_empty());
+    assert_eq!(h.engine.state().ledger.waiting(), 0);
+    assert_eq!(h.fails(OWN), 0);
+    assert_eq!(
+        exactly(
+            &log,
+            "INFO nvr1: failed login from 192.0.2.200 (user=\"f2b\"): an own address of \
+             hik-f2b, never banned, not counted; if that is hik-f2b's user, the NVR rejected \
+             hik-f2b's own login: check its password"
+        ),
+        entries,
+        "{:?}",
+        log
+    );
+    assert_eq!(
+        logged(&log, "failed login from 192.0.2.200 (user=\"f2b\") at "),
+        0
+    );
+    assert!(logged(&log, "ERROR nvr1: login to the NVR was rejected") >= 10);
+    // the same log from an address that is not an own address is banned:
+    // the scenario reaches maxretry
+    let (h, _) = own_wrong_password("127.0.0.1");
+    assert_eq!(h.banned(), vec![OWN]);
+}
+
+/// A forged log entry cannot get an own address banned, whatever user name
+/// it names.
+#[test]
+fn a_forged_entry_with_an_own_address_is_not_counted() {
+    let mut h = with_own(Opts::default());
+    util::capture_log();
+    for s in 0..8 {
+        h.add_full(
+            &format!("10:01:{:02}", 10 + s),
+            OWN,
+            "admin",
+            "illlegealAccess",
+        );
+    }
+    h.burst("10:01", ATTACKER, 5);
+    h.cycle("10:02:00");
+    let log = util::captured_log();
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    assert_eq!(h.fails(OWN), 0);
+    assert_eq!(
+        logged(
+            &log,
+            "INFO nvr1: failed login from 192.0.2.200 (user=\"admin\"): an own address of hik-f2b"
+        ),
+        8,
+        "{:?}",
+        log
+    );
+    // the router is never asked to ban it
+    let f = h.fake.lock().unwrap();
+    assert!(f.put_log.iter().all(|(a, _)| a != OWN), "{:?}", f.put_log);
+}
+
+/// An address that becomes an own address (DHCP gave it to the host) while
+/// its ban waits: the waiting ban and its counted failed logins are
+/// dropped before bans are attempted, with one INFO line for the change.
+#[test]
+fn an_address_that_becomes_an_own_address_has_its_waiting_ban_dropped() {
+    const NEXT: &str = "198.51.100.9";
+    let mut h = with_own(Opts::default());
+    h.fake.lock().unwrap().router_unreachable = true;
+    h.burst("10:01", ATTACKER, 5);
+    h.add("10:01:30", NEXT);
+    h.cycle("10:02:00");
+    assert!(h.engine.state().ledger.is_waiting(attacker()));
+    assert_eq!(h.fails(NEXT), 1);
+    util::capture_log();
+    h.own.set_local(Ok(attacker()));
+    h.advance(30);
+    let log = util::captured_log();
+    assert_eq!(
+        exactly(
+            &log,
+            "INFO own addresses changed: added 198.51.100.7, removed 192.0.2.200; now router \
+             127.0.0.1 from 198.51.100.7, nvr1 127.0.0.1 from 198.51.100.7"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    assert_eq!(
+        exactly(
+            &log,
+            "INFO 198.51.100.7: waiting ban dropped, 5 counted failed login(s) forgotten: the \
+             address is now an own address of hik-f2b and is never banned"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    assert!(!h.engine.state().ledger.is_waiting(attacker()));
+    // an address that is not an own address keeps its count
+    assert_eq!(h.fails(NEXT), 1);
+    h.fake.lock().unwrap().router_unreachable = false;
+    h.own.set_local(Ok(ip(NEXT)));
+    util::capture_log();
+    h.advance(30);
+    let log = util::captured_log();
+    assert_eq!(
+        exactly(
+            &log,
+            "INFO 198.51.100.9: 1 counted failed login(s) forgotten: the address is now an own \
+             address of hik-f2b and is never banned"
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    // the address that is no longer an own address is not banned for what
+    // was dropped
+    assert!(h.banned().is_empty());
+    assert_eq!(h.engine.state().ledger.waiting(), 0);
+}
+
+/// The start of the service logs the own addresses; a look-up that fails
+/// keeps the last known addresses and is said once.
+#[test]
+fn the_own_addresses_are_logged_at_the_start_and_when_a_look_up_fails() {
+    let mut h = with_own(Opts::default());
+    util::capture_log();
+    h.engine.startup_own();
+    assert_eq!(
+        util::captured_log(),
+        vec![
+            "INFO own addresses, never banned: router 127.0.0.1 from 192.0.2.200, nvr1 \
+             127.0.0.1 from 192.0.2.200"
+        ]
+    );
+    h.own.set_local(Err("no route to 127.0.0.1".to_string()));
+    h.advance(30);
+    h.advance(30);
+    let log = util::captured_log();
+    assert_eq!(
+        log.iter()
+            .filter(|l| l.contains("own addresses"))
+            .collect::<Vec<_>>(),
+        vec![
+            "WARNING own addresses: the look-up for router failed, its last known addresses \
+             stay: no route to 127.0.0.1",
+            "WARNING own addresses: the look-up for nvr1 failed, its last known addresses stay: \
+             no route to 127.0.0.1",
+        ]
+    );
+    // still an own address
+    h.add_full("10:01:10", OWN, "admin", "illlegealAccess");
+    h.advance(30);
+    assert_eq!(h.fails(OWN), 0);
+    // a start with the look-up failing names what is missing
+    let mut h = Harness::build(Opts {
+        own: ip(OWN),
+        ..Default::default()
+    });
+    h.own.set_local(Err("no route".to_string()));
+    h.restart();
+    util::capture_log();
+    h.engine.startup_own();
+    assert_eq!(
+        util::captured_log(),
+        vec![
+            "INFO own addresses, never banned: router 127.0.0.1, nvr1 127.0.0.1",
+            "WARNING own addresses: a look-up failed, it is tried again in every poll: router: \
+             no route; nvr1: no route",
+        ]
+    );
+}
+
+/// `--check` prints the own addresses; a failed look-up is a failed check.
+#[test]
+fn check_prints_the_own_addresses() {
+    use hik_f2b::health::Status;
+    let h = with_own(Opts::default());
+    let line = h
+        .check()
+        .into_iter()
+        .find(|l| l.item == "own addresses")
+        .unwrap();
+    assert_eq!(
+        line.to_string(),
+        "ok       own addresses: router 127.0.0.1 from 192.0.2.200, nvr1 127.0.0.1 from \
+         192.0.2.200 (never banned)"
+    );
+    h.own.set_local(Err("no route".to_string()));
+    let line = h
+        .check()
+        .into_iter()
+        .find(|l| l.item == "own addresses")
+        .unwrap();
+    assert_eq!(line.status, Status::Failed);
+    assert_eq!(
+        line.to_string(),
+        "FAILED   own addresses: router 127.0.0.1, nvr1 127.0.0.1; look-up failed: router: no \
+         route; nvr1: no route"
+    );
+}
+
 // ------------------------------------------------------------------ --check
 
 #[test]
@@ -3106,6 +3354,7 @@ fn check_command_reports_each_item_and_changes_nothing() {
             ("nvr nvr1 log".to_string(), Status::Ok),
             ("nvr nvr2".to_string(), Status::Failed),
             ("firewall".to_string(), Status::Ok),
+            ("own addresses".to_string(), Status::Ok),
             ("telegram".to_string(), Status::Ok),
             ("country database".to_string(), Status::Off),
         ]
@@ -3152,7 +3401,10 @@ fn check_command_reports_each_item_and_changes_nothing() {
     let lines = h.check();
     assert_eq!(lines[2].item, "firewall");
     assert_eq!(lines[2].status, Status::Off);
-    assert_eq!(lines[3].status, Status::Off);
+    // the own addresses are found in notify-only mode too
+    assert_eq!(lines[3].item, "own addresses");
+    assert_eq!(lines[3].status, Status::Ok);
+    assert_eq!(lines[4].status, Status::Off);
     assert_eq!(h.fake.lock().unwrap().router_requests, 0);
 }
 
@@ -3730,6 +3982,8 @@ fn check_prints_one_line_per_item() {
              FAILED   nvr nvr2: login rejected (HTTP 401)\n\
              ok       firewall: 1 enabled rule(s) in /ip/firewall/raw with \
              src-address-list=cctv_ban\n\
+             ok       own addresses: router 127.0.0.1 from 127.0.0.1, nvr1 127.0.0.1 from \
+             127.0.0.1, nvr2 127.0.0.1 from 127.0.0.1 (never banned)\n\
              ok       telegram: configured, health alerts on; nothing sent (see --test-notify)\n\
              off      country database: not configured\n",
             util::fmt_ts(start + SKEW),
@@ -3756,7 +4010,7 @@ fn check_prints_one_line_per_item() {
     let (code, stdout, stderr) = hik_f2b(&h, &h.ini, &["--check"]);
     assert_eq!((code, stderr.as_str()), (Some(0), ""));
     let lines: Vec<&str> = stdout.lines().collect();
-    assert_eq!(lines.len(), 5, "{}", stdout);
+    assert_eq!(lines.len(), 6, "{}", stdout);
     assert!(
         lines[0]
             .starts_with("ok       nvr nvr1: login accepted, device time 2026-01-10T10:00:00Z ("),
@@ -3774,6 +4028,7 @@ fn check_prints_one_line_per_item() {
             "ok       nvr nvr1 log: order not known, page size not known (0 entries read from \
              the last 24 h)",
             "off      firewall: not configured (notify-only mode)",
+            "ok       own addresses: nvr1 127.0.0.1 from 127.0.0.1 (never banned)",
             "off      telegram: not configured",
             "off      country database: not configured",
         ]

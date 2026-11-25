@@ -15,6 +15,7 @@ use hik_f2b::engine::Engine;
 use hik_f2b::health::CheckLine;
 use hik_f2b::mikrotik::Mikrotik;
 use hik_f2b::nvr::{parse_kv, Nvr};
+use hik_f2b::own::{Fixed, OwnAddresses};
 use hik_f2b::state::State;
 use hik_f2b::telegram::Telegram;
 use hik_f2b::util;
@@ -973,6 +974,10 @@ pub struct Opts {
     /// Extra lines for the [mikrotik] and [telegram] sections.
     pub mikrotik_extra: &'static str,
     pub telegram_extra: &'static str,
+    /// The address the host reaches every device from (`own::Fixed`). The
+    /// fakes listen on loopback, so by default it is loopback, as the
+    /// operating system would answer.
+    pub own: Ipv4Addr,
 }
 
 impl Default for Opts {
@@ -984,6 +989,7 @@ impl Default for Opts {
             general: "",
             mikrotik_extra: "",
             telegram_extra: "",
+            own: Ipv4Addr::LOCALHOST,
         }
     }
 }
@@ -997,6 +1003,9 @@ pub struct Harness {
     pub ini: String,
     pub port: u16,
     pub host: i64,
+    /// The answers about own addresses that the engine gets; change them to
+    /// change its own addresses (from its next poll on).
+    pub own: Fixed,
     /// The fakes' servers, stopped when the harness is dropped. The last
     /// field: the fields of a struct are dropped in their order.
     servers: Servers,
@@ -1102,7 +1111,8 @@ impl Harness {
                 port, TOKEN, opts.telegram_extra
             ));
         }
-        let engine = start(&ini, State::default());
+        let own = Fixed::new(opts.own);
+        let engine = start(&ini, State::default(), &own);
         let mut h = Harness {
             fake,
             fake2,
@@ -1111,6 +1121,7 @@ impl Harness {
             ini,
             port,
             host: 0,
+            own,
             servers: Servers(servers),
         };
         h.set_host(host_of("10:00:00"));
@@ -1225,14 +1236,14 @@ impl Harness {
     /// with `ini` as it is now, as a restart of the service does.
     pub fn restart(&mut self) {
         let restored = self.round_trip(self.engine.state());
-        self.engine = start(&self.ini, restored);
+        self.engine = start(&self.ini, restored, &self.own);
     }
 
     /// Starts a new engine with `state` instead of the engine's own, saved
     /// and loaded again, as a restart with that state file does.
     pub fn restart_with(&mut self, state: State) {
         let restored = self.round_trip(&state);
-        self.engine = start(&self.ini, restored);
+        self.engine = start(&self.ini, restored, &self.own);
     }
 
     fn round_trip(&self, state: &State) -> State {
@@ -1265,18 +1276,20 @@ impl Harness {
         let cfg = self.config();
         let mut nvrs: Vec<Nvr> = cfg.nvrs.iter().map(|n| Nvr::new(n).unwrap()).collect();
         let router = cfg.mikrotik.as_ref().map(|m| Mikrotik::new(m).unwrap());
+        let own = OwnAddresses::new(&cfg, Box::new(self.own.clone()));
         check::check_all(
             &cfg,
             &mut nvrs,
             router.as_ref().map(|m| m as &dyn Firewall),
+            &own,
             self.host as u64,
         )
     }
 }
 
 /// An engine with the router and Telegram clients `ini` asks for, set up
-/// as `main.rs` sets them up.
-fn start(ini: &str, state: State) -> Engine {
+/// as `main.rs` sets them up, and own addresses from `own`.
+fn start(ini: &str, state: State, own: &Fixed) -> Engine {
     let cfg = Config::parse(ini).unwrap();
     let firewall = cfg
         .mikrotik
@@ -1286,7 +1299,8 @@ fn start(ini: &str, state: State) -> Engine {
         .telegram
         .as_ref()
         .map(|t| Box::new(Telegram::new(t).unwrap()) as Box<dyn Notifier>);
-    Engine::new(cfg, state, firewall, notifier).unwrap()
+    let own = OwnAddresses::new(&cfg, Box::new(own.clone()));
+    Engine::new(cfg, state, firewall, notifier, own).unwrap()
 }
 
 /// Runs `n` cycles, `step` seconds apart.

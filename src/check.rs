@@ -6,6 +6,7 @@ use crate::config::Config;
 use crate::country;
 use crate::health::{CheckLine, Status};
 use crate::nvr::{Nvr, NvrError, Search};
+use crate::own::OwnAddresses;
 use crate::util::{self, host_i64};
 use std::net::Ipv4Addr;
 
@@ -55,12 +56,14 @@ fn describe_log(search: &Search) -> String {
 }
 
 /// `--check`: every health check once, with the NVR clients `nvrs` (one per
-/// `cfg.nvrs`, in that order) and the firewall, if there is one. Nothing
-/// is sent. `host_now` is the host's Unix time.
+/// `cfg.nvrs`, in that order) and the firewall, if there is one, and the
+/// own addresses as `own` found them. Nothing is sent. `host_now` is the
+/// host's Unix time.
 pub fn check_all(
     cfg: &Config,
     nvrs: &mut [Nvr],
     firewall: Option<&dyn Firewall>,
+    own: &OwnAddresses,
     host_now: u64,
 ) -> Vec<CheckLine> {
     let mut out = Vec::new();
@@ -113,6 +116,25 @@ pub fn check_all(
     };
     out.push(CheckLine {
         item: "firewall".to_string(),
+        status,
+        detail,
+    });
+    // A look-up that failed leaves an address unprotected.
+    let failures = own.failures();
+    let (status, detail) = if failures.is_empty() {
+        (Status::Ok, format!("{} (never banned)", own.describe()))
+    } else {
+        (
+            Status::Failed,
+            format!(
+                "{}; look-up failed: {}",
+                own.describe(),
+                failures.join("; ")
+            ),
+        )
+    };
+    out.push(CheckLine {
+        item: "own addresses".to_string(),
         status,
         detail,
     });

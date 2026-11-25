@@ -12,7 +12,8 @@
 //! copy of it in memory.
 
 use crate::ledger::Ledger;
-use std::collections::{BTreeMap, HashMap};
+use crate::reader::{Cursor, MAX_SEEN};
+use std::collections::BTreeMap;
 use std::hash::Hasher;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -22,27 +23,13 @@ use std::path::{Path, PathBuf};
 const HEADER: &str = "hik-f2b-state 2";
 pub const MAX_FILE: u64 = 16 * 1024 * 1024;
 
-/// Upper bound on remembered log entries per NVR.
-pub const MAX_SEEN: usize = 50_000;
 /// 9999-12-31T23:59:59Z: anything later is not a time.
 pub const MAX_TIME: i64 = 253_402_300_799;
 
-#[derive(Default, Clone, Debug, PartialEq)]
-pub struct NvrState {
-    /// Device time up to which the log has been read.
-    pub since: i64,
-    /// Device clock minus host clock at the last successful read, used to
-    /// notice the device clock jumping. `None` (`-` in the file): not known,
-    /// because a log window was skipped while a resync was due; the next read
-    /// resyncs.
-    pub offset: Option<i64>,
-    /// Entries seen in the last (overlapping) query window, by key hash.
-    pub seen: HashMap<String, u32>,
-}
-
 #[derive(Default, Debug, PartialEq)]
 pub struct State {
-    pub nvr: BTreeMap<String, NvrState>,
+    /// The read cursor of each NVR, see `reader.rs`.
+    pub nvr: BTreeMap<String, Cursor>,
     /// Failure counters, waiting and remembered bans, the rate limit.
     pub ledger: Ledger,
 }

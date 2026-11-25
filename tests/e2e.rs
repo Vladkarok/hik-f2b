@@ -69,7 +69,10 @@ fn first_poll_that_cannot_read_the_log_is_tried_again() {
     h.fake.lock().unwrap().poison = Some(format!("{}09:59:00", DAY));
     h.tick();
     assert!(!h.engine.state.nvr.contains_key("nvr1"));
-    assert_eq!(h.engine.nvrs[0].failed_polls, 0, "no window to skip yet");
+    assert_eq!(
+        h.engine.readers[0].nvr.failed_polls, 0,
+        "no window to skip yet"
+    );
     h.fake.lock().unwrap().poison = None;
     h.burst("10:00", ATTACKER, 5); // before the start that succeeds
     h.cycle("10:00:30");
@@ -249,7 +252,7 @@ fn rejected_nvr_login_backs_off_after_one_attempt() {
     let mut h = Harness::new(false);
     h.fake.lock().unwrap().nvr_auth_ok = false;
     h.cycle("10:01:00");
-    assert!(h.engine.nvrs[0].retry_after > 0);
+    assert!(h.engine.readers[0].nvr.retry_after > 0);
     // exactly one refused login, so the NVR's own lock is not provoked
     assert_eq!(h.fake.lock().unwrap().refused_logins, 1);
     h.fake.lock().unwrap().nvr_auth_ok = true;
@@ -267,7 +270,7 @@ fn host_clock_jumping_back_does_not_stall_the_backoff() {
     let mut h = Harness::new(false);
     h.fake.lock().unwrap().nvr_auth_ok = false;
     h.cycle("10:01:00");
-    assert!(h.engine.nvrs[0].retry_after > 0);
+    assert!(h.engine.readers[0].nvr.retry_after > 0);
     h.fake.lock().unwrap().nvr_auth_ok = true;
     let before = h.fake.lock().unwrap().search_requests;
     // the host clock is set back a year; the device clock stays right
@@ -857,15 +860,18 @@ fn unreadable_log_window_is_skipped_after_ten_polls() {
     h.fake.lock().unwrap().poison = Some(format!("{}10:00:30", DAY));
     for i in 0..9 {
         h.advance(30);
-        assert_eq!(h.engine.nvrs[0].failed_polls, i + 1);
+        assert_eq!(h.engine.readers[0].nvr.failed_polls, i + 1);
         assert_eq!(h.since("nvr1"), format!("{}10:00:00", DAY));
     }
     h.advance(30); // the 10th failure
     assert_eq!(h.since("nvr1"), format!("{}10:05:00", DAY));
     // the clock did not change: no resync, so what follows is counted
     assert_eq!(h.engine.state.nvr["nvr1"].offset, Some(SKEW));
-    assert_eq!(h.engine.nvrs[0].failed_polls, 0);
-    assert_eq!(h.engine.nvrs[0].retry_after, 0, "not an auth problem");
+    assert_eq!(h.engine.readers[0].nvr.failed_polls, 0);
+    assert_eq!(
+        h.engine.readers[0].nvr.retry_after, 0,
+        "not an auth problem"
+    );
 
     h.burst("10:05", ATTACKER, 5);
     h.cycle("10:06:00");
@@ -1049,7 +1055,8 @@ fn paging_status_with_prefix_or_missing() {
         f.search_requests = 0;
     }
     util::capture_log();
-    let search = h.engine.nvrs[0]
+    let search = h.engine.readers[0]
+        .nvr
         .search(
             util::parse_ts(&format!("{}10:00:00", DAY)).unwrap(),
             util::parse_ts(&format!("{}10:05:00", DAY)).unwrap(),
@@ -1090,7 +1097,7 @@ fn last_page_is_cut_to_the_entry_cap() {
         f.raw_pages.push_back(page("MORE"));
         f.raw_pages.push_back(page("OK"));
     }
-    let search = h.engine.nvrs[0].search(0, 1, "", None).unwrap();
+    let search = h.engine.readers[0].nvr.search(0, 1, "", None).unwrap();
     assert_eq!((search.events.len(), search.truncated), (5000, true));
 }
 
@@ -1175,7 +1182,7 @@ fn nonce_rotation_without_stale() {
     }
     for _ in 0..6 {
         h.advance(30);
-        assert_eq!(h.engine.nvrs[0].retry_after, 0, "no auth backoff");
+        assert_eq!(h.engine.readers[0].nvr.retry_after, 0, "no auth backoff");
     }
     h.burst("10:03", ATTACKER, 5);
     h.cycle("10:04:00");
@@ -1202,7 +1209,7 @@ fn wrong_password_with_rotating_nonce_backs_off() {
         f.rotate_every = Some(1);
     }
     h.cycle("10:01:00");
-    assert!(h.engine.nvrs[0].retry_after > 0);
+    assert!(h.engine.readers[0].nvr.retry_after > 0);
     assert_eq!(h.fake.lock().unwrap().refused_logins, 2);
 }
 
@@ -1212,7 +1219,7 @@ fn basic_and_digest_challenges_together() {
     let mut h = Harness::raw(false);
     h.fake.lock().unwrap().basic_first = true;
     h.tick();
-    assert_eq!(h.engine.nvrs[0].retry_after, 0);
+    assert_eq!(h.engine.readers[0].nvr.retry_after, 0);
     h.burst("10:01", ATTACKER, 5);
     h.cycle("10:02:00");
     assert_eq!(h.banned(), vec![ATTACKER]);
@@ -2782,7 +2789,10 @@ fn check_command_reports_each_item_and_changes_nothing() {
     assert!(h.banned().is_empty());
     assert_eq!(h.fake.lock().unwrap().tg_attempts, 0);
     assert!(h.engine.alerted_problems().is_empty());
-    assert_eq!(h.engine.nvrs[1].retry_after, 0, "no backoff from --check");
+    assert_eq!(
+        h.engine.readers[1].nvr.retry_after, 0,
+        "no backoff from --check"
+    );
 
     let mut h = Harness::with(Opts {
         mikrotik: false,

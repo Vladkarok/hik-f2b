@@ -163,7 +163,8 @@ fn check_combination(args: &Args) -> Result<(), String> {
 fn dump(engine: &mut Engine, hours: i64, raw: bool) -> usize {
     let meta_id = engine.cfg.meta_id.clone();
     let mut failed = 0;
-    for nvr in engine.nvrs.iter_mut() {
+    for reader in engine.readers.iter_mut() {
+        let nvr = &mut reader.nvr;
         println!("=== {} ({})", nvr.name, nvr.url);
         let mut sink = Vec::new();
         let result = nvr.now().and_then(|now| {
@@ -347,7 +348,7 @@ fn run() -> Result<(), String> {
             return Err(format!(
                 "{} of {} NVR(s) could not be read",
                 failed,
-                engine.nvrs.len()
+                engine.readers.len()
             ));
         }
         return Ok(());

@@ -131,9 +131,9 @@
 mod fake;
 
 use fake::{Entry, Fake, Harness, Opts, SKEW};
-use hik_f2b::engine::CLOCK_JUMP;
 use hik_f2b::ledger::Ledger;
-use hik_f2b::state::{State, MAX_SEEN};
+use hik_f2b::reader::{CLOCK_JUMP, MAX_SEEN};
+use hik_f2b::state::State;
 use hik_f2b::util;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::net::Ipv4Addr;

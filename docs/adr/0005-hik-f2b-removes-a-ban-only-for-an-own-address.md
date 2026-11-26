@@ -8,7 +8,8 @@ it was not put there by this version: hik-f2b never bans an own address
 (at startup and every 5 minutes) hik-f2b looks up each own address outside
 the reserved ranges in the address-list and removes the entries it finds,
 with a WARNING and a notification at once. This is the only case in which
-hik-f2b removes a ban, and the `Firewall` interface says so.
+hik-f2b removes a ban, and the `Firewall` interface says so: its one
+method that removes a ban is `remove_own`, for an own address.
 
 ## Considered options
 

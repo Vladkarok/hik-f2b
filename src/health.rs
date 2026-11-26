@@ -2,8 +2,8 @@
 //! anything right now.
 //!
 //! The engine reports what happened in a poll to `Health`: how each NVR
-//! read went, the result of a firewall check, how each ban attempt ended,
-//! how the ban loop ended and the end of the poll. `Health` decides which
+//! read went, how a firewall check round ended (`round.rs`), how each ban
+//! attempt ended, how the ban loop ended and the end of the poll. `Health` decides which
 //! check that opens, passes or withdraws, keeps the bypass timer and says
 //! when the periodic firewall check is due. `Alerts` then decides when a
 //! check's state is news. Neither does I/O; both take the host time as an
@@ -20,6 +20,7 @@
 //! State is kept in memory only.
 
 use crate::action::HealthError;
+use crate::round::{Ended, OwnSwept, SafeWritten};
 use crate::util;
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
@@ -334,7 +335,7 @@ pub enum BanAttempt<'a> {
 /// An own address that is still in the address-list after hik-f2b tried
 /// to remove it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OwnStuck<'a> {
+struct OwnStuck<'a> {
     pub ip: Ipv4Addr,
     /// The address-list, as the firewall describes it.
     pub list: &'a str,
@@ -344,7 +345,7 @@ pub struct OwnStuck<'a> {
 
 /// How the write of the own address to the safe list ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SafeWrite<'a> {
+enum SafeWrite<'a> {
     /// Every own address toward the router is in the safe list.
     Written,
     /// The firewall refused to write this one.
@@ -419,9 +420,44 @@ impl Health {
         }
     }
 
+    /// How a firewall check round ended at `now`, at startup or periodic:
+    /// in this order, the write of the safe list (if it ran to its end), the
+    /// firewall check, the check of the safe list's rule (if it was made)
+    /// and the look-up of the own addresses (if every one was asked).
+    pub fn round_ended(&mut self, ended: &Ended, now: u64) {
+        match &ended.safe {
+            None => {}
+            Some(SafeWritten::Written) => self.safe_written(SafeWrite::Written, now),
+            Some(SafeWritten::Refused { ip, list, error }) => self.safe_written(
+                SafeWrite::Refused {
+                    ip: *ip,
+                    list,
+                    error,
+                },
+                now,
+            ),
+        }
+        self.firewall_checked(&ended.firewall, now);
+        if let Some(safe_rule) = &ended.safe_rule {
+            self.safe_rule_checked(safe_rule, now);
+        }
+        match &ended.own {
+            None => {}
+            Some(OwnSwept::Clean) => self.own_swept(None, now),
+            Some(OwnSwept::Stuck { ip, list, error }) => self.own_swept(
+                Some(OwnStuck {
+                    ip: *ip,
+                    list,
+                    error,
+                }),
+                now,
+            ),
+        }
+    }
+
     /// The result of a firewall check at `now`, at startup or periodic. The
     /// next periodic check is due `HEALTH_CHECK_INTERVAL` later.
-    pub fn firewall_checked(&mut self, result: &Result<String, HealthError>, now: u64) {
+    fn firewall_checked(&mut self, result: &Result<String, HealthError>, now: u64) {
         self.next_check = now.saturating_add(HEALTH_CHECK_INTERVAL);
         match result {
             Ok(_) => {
@@ -511,7 +547,7 @@ impl Health {
     /// address-list at `now`, and each one found was removed (`None`), or
     /// this one is still listed after its removal failed. Only a look-up
     /// that finds no own address left ends the problem.
-    pub fn own_swept(&mut self, stuck: Option<OwnStuck>, now: u64) {
+    fn own_swept(&mut self, stuck: Option<OwnStuck>, now: u64) {
         match stuck {
             None => self.alerts.pass(&Check::OwnListed, now),
             Some(OwnStuck { ip, list, error }) => {
@@ -526,7 +562,7 @@ impl Health {
 
     /// The result of the check of the safe list's rule at `now` (made with
     /// a firewall check that found the drop rule).
-    pub fn safe_rule_checked(&mut self, result: &Result<String, String>, now: u64) {
+    fn safe_rule_checked(&mut self, result: &Result<String, String>, now: u64) {
         match result {
             Ok(_) => self.alerts.pass(&Check::SafeRule, now),
             Err(reason) => self.alerts.fail(Check::SafeRule, reason, now),
@@ -536,8 +572,8 @@ impl Health {
     /// How the write of the own address to the safe list ended at `now`.
     /// As for a ban, a refusal is a problem of its own, which only a write
     /// that works ends. (A firewall that cannot be used for the write is
-    /// reported as a failed firewall check, see `Engine::checked`.)
-    pub fn safe_written(&mut self, write: SafeWrite, now: u64) {
+    /// reported as a failed firewall check, see `round.rs`.)
+    fn safe_written(&mut self, write: SafeWrite, now: u64) {
         match write {
             SafeWrite::Written => self.alerts.pass(&Check::SafeRefused, now),
             SafeWrite::Refused { ip, list, error } => {
@@ -1541,5 +1577,70 @@ mod tests {
                 (Check::Rule, Kind::Recovered),
             ]
         );
+    }
+
+    /// A firewall check round is told in the order the round ran: the
+    /// write of the safe list, the check, the safe list's rule, the own
+    /// addresses. What a round did not get to leaves its problem as it is.
+    #[test]
+    fn a_round_is_told_in_the_order_it_ran() {
+        let ip = Ipv4Addr::new(192, 0, 2, 200);
+        let mut h = health();
+        h.round_ended(
+            &Ended {
+                answered: true,
+                safe: Some(SafeWritten::Refused {
+                    ip,
+                    list: "cctv_safe".to_string(),
+                    error: "refused: x".to_string(),
+                }),
+                firewall: Err(HealthError::NotEnforced("no rule".to_string())),
+                safe_rule: Some(Err("no accept rule".to_string())),
+                own: Some(OwnSwept::Stuck {
+                    ip,
+                    list: "MikroTik address-list cctv_ban".to_string(),
+                    error: "refused: y".to_string(),
+                }),
+                notifications: vec![],
+            },
+            T0,
+        );
+        assert_eq!(h.due(T0 + AFTER).len(), 4);
+        // a round that got no further than the check
+        let checked_only = Ended {
+            answered: true,
+            safe: None,
+            firewall: Ok(String::new()),
+            safe_rule: None,
+            own: None,
+            notifications: vec![],
+        };
+        h.round_ended(&checked_only, T0 + AFTER);
+        assert_eq!(
+            kinds(&h.due(T0 + AFTER)),
+            vec![(Check::Rule, Kind::Recovered)]
+        );
+        assert_eq!(
+            h.alerted(),
+            vec!["own-address-listed", "safe-list-rule", "safe-list-refused"]
+        );
+        h.round_ended(
+            &Ended {
+                safe: Some(SafeWritten::Written),
+                safe_rule: Some(Ok(String::new())),
+                own: Some(OwnSwept::Clean),
+                ..checked_only
+            },
+            T0 + 2 * AFTER,
+        );
+        assert_eq!(
+            kinds(&h.due(T0 + 2 * AFTER)),
+            vec![
+                (Check::SafeRefused, Kind::Recovered),
+                (Check::SafeRule, Kind::Recovered),
+                (Check::OwnListed, Kind::Recovered),
+            ]
+        );
+        assert_eq!(h.next_check, T0 + 2 * AFTER + HEALTH_CHECK_INTERVAL);
     }
 }

@@ -8,6 +8,15 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-26
+
+### Changed
+
+- The code was restructured, with no change in behaviour: the firewall
+  check, with the write of the safe list and the look-up of own addresses
+  that follow it, is a module of its own with unit tests, and the service
+  uses one router client instead of two.
+
 ## [0.5.0] - 2026-11-25
 
 ### Added
@@ -503,7 +512,8 @@ be built from source.
   a sandboxed systemd unit, unit and end-to-end tests, CI, and documentation
   in English and Ukrainian.
 
-[Unreleased]: https://github.com/Vladkarok/hik-f2b/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/Vladkarok/hik-f2b/compare/v0.5.1...HEAD
+[0.5.1]: https://github.com/Vladkarok/hik-f2b/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Vladkarok/hik-f2b/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/Vladkarok/hik-f2b/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/Vladkarok/hik-f2b/compare/v0.3.2...v0.4.0

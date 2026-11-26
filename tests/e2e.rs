@@ -2285,7 +2285,7 @@ fn rule_check_reads_the_disabled_member_as_the_router_prints_it() {
             .collect();
     };
     let router = h.router();
-    let check = || router.check();
+    let check = || router.check().map(|c| c.found);
 
     // an enabled raw rule (no `disabled` member) is found with one request
     set(&[("raw", false)]);
@@ -2326,7 +2326,7 @@ fn rule_check_reads_the_disabled_member_as_the_router_prints_it() {
 fn invalid_rules_do_not_count() {
     use hik_f2b::action::HealthError;
     let mut h = Harness::new(true);
-    let check = |h: &Harness| h.router().check();
+    let check = |h: &Harness| h.router().check().map(|c| c.found);
     h.fake.lock().unwrap().rules = vec![Rule::invalid("raw", "cctv_ban")];
     assert_eq!(
         check(&h),
@@ -2376,7 +2376,7 @@ fn an_answer_that_is_not_json_is_an_error() {
         });
         h.fake.lock().unwrap().rest_html = true;
         let fw = h.router();
-        match fw.check() {
+        match fw.check().map(|c| c.found) {
             Err(HealthError::Unusable(e)) => {
                 assert!(
                     e.starts_with("the firewall answers with an error: "),
@@ -4100,7 +4100,7 @@ fn the_safe_list_rule_check_in_every_case() {
     let h = with_safe_list("");
     let check = |rules: Vec<Rule>| {
         h.fake.lock().unwrap().rules = rules;
-        let checked = h.router().check_with_safe_list().unwrap();
+        let checked = h.router().check().unwrap();
         assert_eq!(
             checked.found.split(" with ").next(),
             Some(
@@ -4227,11 +4227,11 @@ fn the_safe_list_rule_check_in_every_case() {
         mikrotik_extra: "safe_list = cctv_safe\ncheck_rule = false",
         ..Default::default()
     });
-    assert_eq!(h.router().check_with_safe_list().unwrap().safe_rule, None);
+    assert_eq!(h.router().check().unwrap().safe_rule, None);
     assert_eq!(h.fake.lock().unwrap().rule_queries.len(), 0);
     // and without a safe list, neither
     let h = Harness::build(Opts::default());
-    assert_eq!(h.router().check_with_safe_list().unwrap().safe_rule, None);
+    assert_eq!(h.router().check().unwrap().safe_rule, None);
     assert_eq!(h.fake.lock().unwrap().rule_queries.len(), 1);
 }
 

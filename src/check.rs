@@ -198,7 +198,7 @@ pub fn check_all(
             });
         }
     }
-    let checked = firewall.map(|fw| fw.check_with_safe_list());
+    let checked = firewall.map(|fw| fw.check());
     let (status, detail) = match &checked {
         None => (Status::Off, "not configured (notify-only mode)".to_string()),
         Some(Ok(checked)) => (Status::Ok, checked.found.clone()),

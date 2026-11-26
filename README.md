@@ -1235,7 +1235,7 @@ vulnerability, see [SECURITY.md](SECURITY.md).
 | --- | --- | --- |
 | DS-7616NI-Q1 | V4.72.109 build 230107 | Failed logins are read and counted; a real brute-forcer was banned and stopped appearing in the log. |
 | DS-7732NXI-K4 | V4.83.013 build 241227 | Failed logins made on purpose over HTTP and from iVMS-4200 are read correctly: same format as above, over HTTP with an extra `additionInformation` field. No real attack to test a ban against. |
-| MikroTik RB5009, RouterOS | 7.18.1 | Setup commands work as written. Bans are added over REST with the CA certificate verified, repeated bans are recognised, entries expire on time, and the `raw` rule drops the banned address's packets. 0.5.0-rc.1 removed an own address from the address-list with `DELETE`. |
+| MikroTik RB5009, RouterOS | 7.18.1 | Setup commands work as written. Bans are added over REST with the CA certificate verified, repeated bans are recognised, entries expire on time, and the `raw` rule drops the banned address's packets. 0.5.0-rc.1 and 0.5.1-rc.1 removed an own address from the address-list with `DELETE`. |
 
 The container image was run with a read-only filesystem, no capabilities,
 Podman secrets and a memory limit. A 25-minute unattended dry run against both
@@ -1322,6 +1322,30 @@ dynamic entry with the comment `hik-f2b own address`. A second `--once` 26
 seconds later renewed it with `PATCH`: the router showed the same entry
 (same creation time) with the timeout back at 30 minutes. `--check` then
 said that the address is in the safe list.
+
+Release candidate 0.5.1-rc.1 (the published `linux/amd64` image) was run on
+26 November 2026 on the same host and against the same router (RB5009,
+RouterOS 7.18.1) and both NVRs. 0.5.1 changes no behaviour: the firewall
+check became a module of its own, and the service uses one router client
+instead of two. The tries were repeated because this code holds the only
+request that removes an entry from the router. `--check` passed, `--dump`
+for 72 hours printed the same lines as 0.5.0, and a 200-second dry run on a
+copy of the state file had no warnings. Its start lines included the count
+of the address-list entries (the line
+`MikroTik address-list ... has N entries`), which 0.5.1 now asks through the
+same client as the firewall check.
+
+The removal was tried the same way as with 0.5.0-rc.1: the host's own
+address was put into the address-list with `--test-ban` of 0.4.0 (an entry
+with a 60-second timeout). With `--once --dry-run`, hik-f2b logged the
+`DRY RUN: ... it would be removed` warning for that address only and left
+the entry, which expired by itself after 60 seconds. With `--once` and bans
+applied, hik-f2b logged that the entry is removed, within one second after
+it was added, and sent the Telegram notification about the removal. The
+router then showed the entry gone and the other entry of the address-list (a
+real ban) untouched. The safe list writes (`PUT`, then `PATCH`) were not
+repeated with 0.5.1-rc.1: they were tried only with 0.5.0-rc.1. No firewall
+rule was added or changed on the router for these tries.
 
 CI (GitHub Actions) tries the deploy files on every push, with a dummy config
 only: the router and the NVR are addresses that nothing answers, the secrets

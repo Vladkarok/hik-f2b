@@ -49,6 +49,7 @@ pub mod nvr;
 pub mod outbox;
 pub mod own;
 pub mod reader;
+pub mod round;
 pub mod state;
 pub mod telegram;
 pub mod util;

@@ -419,12 +419,9 @@ fn run() -> Result<(), String> {
             .collect::<Result<Vec<_>, _>>()?;
         return one_shot(&args, &cfg, &mut nvrs, mikrotik.as_ref(), telegram.as_ref());
     }
-    // MikroTik-specific, so it needs a client of its own: the engine only
-    // knows a plain firewall.
-    let counter = match &cfg.mikrotik {
-        Some(m) => Some(Mikrotik::new(m)?),
-        None => None,
-    };
+    // For the line with the size of the address-list, after the config
+    // went to the engine.
+    let list = cfg.mikrotik.as_ref().map(|m| m.address_list.clone());
     let firewall = mikrotik.map(|m| Box::new(m) as Box<dyn Firewall>);
     let notifier = telegram.map(|t| Box::new(t) as Box<dyn Notifier>);
     let own = OwnAddresses::new(&cfg, Box::new(System));
@@ -446,10 +443,12 @@ fn run() -> Result<(), String> {
     // of the address-list is asked only of a router that answered it, so an
     // unreachable one costs one timeout at startup, not two.
     let answered = engine.startup_check(util::unix_now());
-    if let (true, Some(m)) = (answered, &counter) {
-        match m.count() {
-            Ok(n) => info!("MikroTik address-list {} has {} entries", m.list, n),
-            Err(e) => warn!("cannot count the entries of address-list {}: {}", m.list, e),
+    if answered {
+        if let (Some(list), Some(count)) = (&list, engine.count_listed()) {
+            match count {
+                Ok(n) => info!("MikroTik address-list {} has {} entries", list, n),
+                Err(e) => warn!("cannot count the entries of address-list {}: {}", list, e),
+            }
         }
     }
 

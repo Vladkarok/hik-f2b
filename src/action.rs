@@ -1,7 +1,10 @@
 //! What the engine does with an address that reached the threshold: an
 //! optional firewall that bans it and an optional notifier that reports it.
-//! The engine only knows these two interfaces, so another firewall or
-//! messenger can be added without touching the decision logic.
+//! The engine, and the firewall check round (`round.rs`), only know these
+//! two interfaces, so another firewall or messenger can be added without
+//! touching the decision logic. The `Firewall` interface speaks in intents
+//! (ban, check, keep an own address safe, remove an own address): the ids
+//! of the router's entries never cross it.
 
 use crate::util;
 use std::net::Ipv4Addr;
@@ -115,12 +118,25 @@ pub enum Kept {
 /// An entry of the safe list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SafeEntry {
-    /// The firewall's id of the entry.
-    pub id: String,
     /// Whether it has a timeout (otherwise it stays until removed by hand).
     pub timed: bool,
 }
 
+/// What `Firewall::remove_own` found and did.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Removal {
+    /// The own address is not in the address-list.
+    NotListed,
+    /// It was, and each of its entries is removed.
+    Removed,
+    /// The look-up failed: whether it is listed is not known.
+    LookUpFailed(BanError),
+    /// It is listed, and an entry could not be removed.
+    Failed(BanError),
+}
+
+/// What the engine asks of a firewall, as intents: the firewall's own ids
+/// stay inside its adapter.
 pub trait Firewall {
     /// Blocks `ip` for `bantime`. Returns `Ok(false)` when the firewall
     /// already lists the address; an existing entry is left as it is.
@@ -129,12 +145,7 @@ pub trait Firewall {
     /// actually blocked, and, with a safe list, that a rule keeps the
     /// addresses of the safe list from being blocked. Must change nothing
     /// on the firewall.
-    fn check_with_safe_list(&self) -> Result<Checked, HealthError>;
-    /// `check_with_safe_list` without the safe list's rule. `Ok` carries a
-    /// short description of what was found.
-    fn check(&self) -> Result<String, HealthError> {
-        self.check_with_safe_list().map(|checked| checked.found)
-    }
+    fn check(&self) -> Result<Checked, HealthError>;
     /// The name of the safe list, if one is configured. Without one, no
     /// other method sends anything about it.
     fn safe_list(&self) -> Option<String>;
@@ -144,13 +155,17 @@ pub trait Firewall {
     /// from now: adds it, or starts the timeout of its entry again. Only
     /// own addresses are ever given to it.
     fn keep_safe(&self, ip: Ipv4Addr, timeout: u64) -> Result<Kept, BanError>;
-    /// The ids of the address-list entries for `ip`; empty when it is not
-    /// listed. For own addresses only (see `remove`).
-    fn entries(&self, ip: Ipv4Addr) -> Result<Vec<String>, BanError>;
-    /// Removes the address-list entry `id`, one of those `entries` gave for
-    /// `ip`. An entry that is gone counts as removed. hik-f2b removes an
-    /// entry only for an own address (ADR 0005).
-    fn remove(&self, ip: Ipv4Addr, id: &str) -> Result<(), BanError>;
+    /// Whether `ip`, an own address, is in the address-list. Changes
+    /// nothing (a dry run asks this instead of `remove_own`).
+    fn own_listed(&self, ip: Ipv4Addr) -> Result<bool, BanError>;
+    /// Looks up `ip`, an own address, in the address-list and removes each
+    /// of its entries, stopping at the first that cannot be removed. An
+    /// entry that is gone counts as removed. This is the one case in which
+    /// hik-f2b removes a ban: only own addresses are ever given to it
+    /// (ADR 0005).
+    fn remove_own(&self, ip: Ipv4Addr) -> Removal;
+    /// The number of entries in the address-list. Changes nothing.
+    fn count(&self) -> Result<usize, String>;
     /// A short human-readable name for log lines, e.g. the address-list.
     fn describe(&self) -> String;
 }

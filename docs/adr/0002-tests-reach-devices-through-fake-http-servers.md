@@ -7,10 +7,20 @@ in-memory fakes of them instead. We keep the HTTP fakes as the main way to
 test, because the defects that came from the devices were in parsing, paging
 and authentication, which a trait fake would skip.
 
-In-memory adapters exist in two places only, where a module is pure enough
-for unit tests without a network: the log source of the NVR log reader, and
-a `Notifier` that records what it was given. The `Firewall` trait has no
-in-memory adapter: the ban ledger has no I/O and needs none.
+In-memory adapters exist in three places only, where a module is pure
+enough for unit tests without a network: the log source of the NVR log
+reader, a `Notifier` that records what it was given, and a `Firewall` in
+the unit tests of the firewall check round (`src/round.rs`). Up to 0.5.0
+the `Firewall` trait had none: the ban ledger has no I/O and needs none.
+The rules that drive the firewall (the write of the safe list, the removal
+of an own address, what ends a round) now live outside the ledger, in the
+round, which calls the firewall itself
+([ADR 0008](0008-the-firewall-check-round-is-a-module-of-its-own.md)); an
+in-memory adapter lets its unit tests set each answer of the router and
+see each request. It answers in intents and holds no RouterOS reply. The
+HTTP fakes stay the main way to test: they still cover the parsing, the
+paging and the authentication, and the end-to-end tests and the simulation
+drive the round through them.
 
 ## Consequences
 

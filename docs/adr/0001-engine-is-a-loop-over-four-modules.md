@@ -43,3 +43,12 @@ still renders the notification texts, looks up the country of an address
 and writes the health notices to the hik-f2b log. The engine's fields are
 private, and four read-only methods remain for tests: `alerted_problems`,
 `queued_notifications`, `state` and `readers`.
+
+## A fifth module (after 0.5.0)
+
+The firewall check round, with the write of the safe list and the look-up
+of own addresses that follow a check the router answers, is a module of its
+own, `src/round.rs`: it calls the `Firewall` interface itself and gives the
+engine one outcome, which the engine passes on to health and the outbox.
+[ADR 0008](0008-the-firewall-check-round-is-a-module-of-its-own.md) records
+why, and the option that was not taken.

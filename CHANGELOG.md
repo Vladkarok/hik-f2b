@@ -8,6 +8,13 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 
 ## [Unreleased]
 
+### Changed
+
+- The code was restructured, with no change in behaviour: the firewall
+  check, with the write of the safe list and the look-up of own addresses
+  that follow it, is a module of its own with unit tests, and the service
+  uses one router client instead of two.
+
 ## [0.5.0] - 2026-11-25
 
 ### Added

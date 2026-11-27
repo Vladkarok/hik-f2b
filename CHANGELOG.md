@@ -25,6 +25,9 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 - `stop requested: the rest of this poll is skipped` was logged also when
   the stop came while the last notification was sent, or after it, when
   nothing was skipped. It is no longer logged then.
+- The warning about a readable config that holds a password or token
+  also counted a `bot_token` in a `[telegram]` section with
+  `enabled = no`, which is not used. Only the secrets that are used count.
 
 ## [0.5.2] - 2026-11-27
 

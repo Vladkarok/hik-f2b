@@ -212,8 +212,9 @@ pub struct Config {
     /// An offline MaxMind DB file for the country of banned addresses
     /// (display only). `None` = off.
     pub country_db: Option<PathBuf>,
-    /// True when a password or token is written in the config itself
-    /// rather than read from a separate secret file.
+    /// True when a password or token that is used is written in the config
+    /// itself rather than read from a separate secret file (the token of a
+    /// `[telegram]` section with `enabled = no` is not used).
     pub inline_secrets: bool,
     /// The secret files the config names (`password_file`,
     /// `bot_token_file`) and that were read.
@@ -675,23 +676,27 @@ impl Config {
             );
         }
 
+        // The secret of each section that is used (a `[telegram]` section
+        // with `enabled = no` is not), written in the config or in a file.
         let mut secret_files: Vec<PathBuf> = Vec::new();
+        let mut inline_secrets = false;
         let used = ini
             .get("mikrotik")
-            .map(|m| (m, "password_file"))
+            .map(|m| (m, "password"))
             .into_iter()
             .chain(
                 ini.iter()
                     .filter(|(name, _)| name.starts_with("nvr:"))
-                    .map(|(_, sec)| (sec, "password_file")),
+                    .map(|(_, sec)| (sec, "password")),
             )
             .chain(
                 ini.get("telegram")
                     .filter(|_| telegram.is_some())
-                    .map(|t| (t, "bot_token_file")),
+                    .map(|t| (t, "bot_token")),
             );
         for (sec, key) in used {
-            if let Some(path) = sec.get(key) {
+            inline_secrets |= sec.values.contains_key(key);
+            if let Some(path) = sec.get(&format!("{}_file", key)) {
                 let path = PathBuf::from(path);
                 if !secret_files.contains(&path) {
                     secret_files.push(path);
@@ -722,9 +727,7 @@ impl Config {
                 .get("country_db")
                 .filter(|s| !s.is_empty())
                 .map(PathBuf::from),
-            inline_secrets: ini.values().any(|sec| {
-                sec.values.contains_key("password") || sec.values.contains_key("bot_token")
-            }),
+            inline_secrets,
             secret_files,
             mikrotik,
             nvrs,
@@ -1437,6 +1440,16 @@ mod tests {
             );
         let cfg = Config::parse(&from_files).unwrap();
         assert!(!cfg.inline_secrets);
+        // a token in a [telegram] section that is not used is not counted
+        let unused = from_files.replace(
+            &format!("bot_token_file = {}", secret.display()),
+            "bot_token = 1:a",
+        );
+        let cfg = Config::parse(&unused).unwrap();
+        assert!(cfg.inline_secrets, "the token is used");
+        let cfg = Config::parse(&unused.replace("enabled = true", "enabled = false")).unwrap();
+        assert!(cfg.telegram.is_none());
+        assert!(!cfg.inline_secrets, "the token is not used");
         std::fs::remove_dir_all(&dir).unwrap();
         // every listed setting is accepted where it belongs
         for (section, keys) in SECTIONS {

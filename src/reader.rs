@@ -48,7 +48,7 @@ const MAX_WINDOW: usize = MAX_SEARCHES * 5000;
 pub const MAX_SEEN: usize = 50_000;
 /// Upper bound on remembered log entries of all NVRs together: each NVR of
 /// the config gets an equal share (`seen_share`).
-pub const SEEN_BUDGET: usize = 100_000;
+pub const SEEN_BUDGET: usize = 160_000;
 /// The most NVRs a config may have: each share must hold the entries of a
 /// whole window (`MAX_WINDOW`), or the next poll could count some of them
 /// again. With this many the state at its bounds fits `MAX_FILE`.
@@ -56,7 +56,7 @@ pub const MAX_NVRS: usize = SEEN_BUDGET / MAX_WINDOW;
 
 /// Upper bound on remembered log entries of one NVR, with `nvrs` NVRs in
 /// the config: an equal share of `SEEN_BUDGET`, at most `MAX_SEEN`. With one
-/// or two NVRs it is `MAX_SEEN`.
+/// to three NVRs it is `MAX_SEEN`.
 ///
 /// `seen` holds the last window read, which is at most `MAX_WINDOW`
 /// entries, so at most the share; entries read before are kept only while
@@ -1062,11 +1062,7 @@ mod tests {
         (1..=nvrs)
             .map(|i| {
                 format!(
-                    "[nvr:nvr{}]
-url = http://192.0.2.{}
-user = f2b
-password = p
-",
+                    "[nvr:nvr{}]\nurl = http://192.0.2.{}\nuser = f2b\npassword = p\n",
                     i,
                     9 + i
                 )
@@ -2099,9 +2095,10 @@ password = p
     fn each_nvr_gets_an_equal_share_of_the_seen_budget() {
         assert_eq!(seen_share(1), MAX_SEEN);
         assert_eq!(seen_share(2), MAX_SEEN, "as before there was a share");
-        assert_eq!(seen_share(3), 33_333);
-        assert_eq!(seen_share(4), 25_000);
-        assert_eq!(MAX_NVRS, 5);
+        assert_eq!(seen_share(3), MAX_SEEN);
+        assert_eq!(seen_share(4), 40_000);
+        assert_eq!(seen_share(5), 32_000);
+        assert_eq!(MAX_NVRS, 8);
         assert_eq!(seen_share(MAX_NVRS), MAX_WINDOW, "a whole window");
         for nvrs in 1..=MAX_NVRS {
             assert!(nvrs * seen_share(nvrs) <= SEEN_BUDGET);
@@ -2110,7 +2107,7 @@ password = p
         assert_eq!(config(MAX_NVRS).unwrap().nvrs.len(), MAX_NVRS);
         assert_eq!(
             config(MAX_NVRS + 1).err().unwrap(),
-            "6 [nvr:<name>] sections: at most 5 are supported (the state holds at most 100000 \
+            "9 [nvr:<name>] sections: at most 8 are supported (the state holds at most 160000 \
              log entries of all NVRs as seen)"
         );
     }
@@ -2126,7 +2123,7 @@ password = p
 
     #[test]
     fn with_four_nvrs_a_cursor_keeps_at_most_its_share() {
-        let share = 25_000;
+        let share = 40_000;
         // a cut read of two entries, after a state file with `seen` entries
         let cut_read = |seen: usize| {
             let mut r = Run::with(FINDTIME, 4);

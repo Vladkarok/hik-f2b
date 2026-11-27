@@ -15,7 +15,7 @@ can run in [notify-only mode](#notify-only-mode-no-router): it reports such
 addresses and bans nothing.
 
 The container image holds one static binary of about 2 MB. While running it
-uses about 2 MB of memory, and up to about 16 MiB more with its state at
+uses about 2 MB of memory, and up to about 21 MiB more with its state at
 every bound (see [Limitations](#limitations)). It listens on no port.
 
 > **Status: beta.** Verified on real devices (see
@@ -1262,18 +1262,19 @@ vulnerability, see [SECURITY.md](SECURITY.md).
   log entry that the NVR logs late, with a time before that second, is not
   read meanwhile. A restart of hik-f2b in that time costs one poll: it reads
   that second once more, then moves on again.
-- At most 5 NVRs. hik-f2b remembers at most 100,000 log entries of all NVRs
-  together as already seen, in equal shares: 50,000 for each NVR with one or
-  two NVRs, 25,000 each with four and 20,000 each with five. With more
-  `[nvr:<name>]` sections hik-f2b does not start, and `--check` names the
-  limit. A state file of an earlier version may hold more entries for an
-  NVR: it is used, and the next read of that NVR keeps only its share. With
-  every bound of the state reached (these shares, the bounds under
-  [Security design](#security-design), and the longest names and addresses),
-  the state file takes 17.5 MiB. In that state one poll of 5 NVRs, each of
-  which reads a full search, needed at most 15.5 MiB of heap, as measured by
-  `tests/memory.rs` (its header says what that counts). The memory limit of
-  32 MiB in the deploy files leaves room for this.
+- At most 8 NVRs. hik-f2b remembers at most 160,000 log entries of all NVRs
+  together as already seen, in equal shares: 50,000 for each NVR with one to
+  three NVRs, 40,000 each with four, 32,000 each with five and 20,000 each
+  with eight. With more `[nvr:<name>]` sections hik-f2b does not start, and
+  `--check` names the limit. A state file of an earlier version may hold
+  more entries for an NVR: it is used, and the next read of that NVR keeps
+  only its share. With every bound of the state reached (these shares, the
+  bounds under [Security design](#security-design), and the longest names
+  and addresses), the state file takes at most 22.0 MiB. In that state one
+  poll of 8 NVRs, each of which reads a full search, needed at most
+  20.5 MiB of heap, as measured by `tests/memory.rs` (its header says what
+  that counts). The memory limit of 32 MiB in the deploy files leaves room
+  for this.
 - A clock change on an NVR together with a flood of log entries: while the
   log from `lookback` before the NVR's time on holds more entries than one
   poll can read, hik-f2b counts no failed login of that NVR (see

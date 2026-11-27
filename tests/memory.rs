@@ -5,9 +5,10 @@
 //! cargo test --release --test memory -- --ignored --nocapture
 //! ```
 //!
-//! For 1, 2, 4 and 5 NVRs (the most a config may have) it writes a state file at the bounds (every `seen`
-//! at the share of its NVR, every bound of the ledger reached, with the
-//! longest lines), then loads it as the service does, polls each NVR once
+//! For 2, 4 and 8 NVRs (the most a config may have) it writes a state file
+//! at the bounds (every `seen` at the share of its NVR, every bound of the
+//! ledger reached, with the longest lines), then loads it as the service
+//! does, polls each NVR once
 //! with a full window (one search of 3200 entries from the fake NVR), and
 //! saves it. It reports the most heap in use meanwhile, above what was in
 //! use before the load.
@@ -156,7 +157,7 @@ fn peak_heap_at_the_bounds() {
     }
     println!("| NVRs | seen per NVR | state file | heap after the load | peak heap |");
     println!("| --- | --- | --- | --- | --- |");
-    for nvrs in [1, 2, 4, 5] {
+    for nvrs in [2, 4, 8] {
         let names: Vec<String> = (1..=nvrs).map(long_name).collect();
         let mut ini = format!(
             "[general]\nstate_file = {}\n",

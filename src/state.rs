@@ -22,9 +22,9 @@ use std::path::{Path, PathBuf};
 /// device time); files of other versions are not used.
 const HEADER: &str = "hik-f2b-state 2";
 /// A larger file is not used. The state at its bounds stays below it: with
-/// `MAX_NVRS` NVRs, the longest names and the longest lines it takes 17.5
-/// MiB (`a_full_state_fits_the_file_limit`), of which the ledger takes about
-/// 10 MiB.
+/// four to `MAX_NVRS` NVRs, the longest names and the longest lines it
+/// takes 22.0 MiB (`a_full_state_fits_the_file_limit`), of which the ledger
+/// takes about 10 MiB.
 pub const MAX_FILE: u64 = 24 * 1024 * 1024;
 
 /// 9999-12-31T23:59:59Z: anything later is not a time.
@@ -520,66 +520,36 @@ mod tests {
         let mut cursors = String::new();
         let names: Vec<String> = (1..=nvrs).map(long_name).collect();
         for name in &names {
-            cursors.push_str(&format!(
-                "nvr {} {} {}
-",
-                name, MAX_TIME, -MAX_TIME
-            ));
+            cursors.push_str(&format!("nvr {} {} {}\n", name, MAX_TIME, -MAX_TIME));
             let mut keys: Vec<String> = (0..seen_share(nvrs))
                 .map(|i| format!("{:032x}", u128::MAX - i as u128))
                 .collect();
             keys.sort();
             for key in keys {
-                cursors.push_str(&format!(
-                    "seen {} {} 1000000
-",
-                    name, key
-                ));
+                cursors.push_str(&format!("seen {} {} 1000000\n", name, key));
             }
         }
-        let mut st = State::parse(&format!(
-            "{}
-{}",
-            HEADER, cursors
-        ));
+        let mut st = State::parse(&format!("{}\n{}", HEADER, cursors));
         for name in &names {
             let cursor = &st.cursors[name];
             assert_eq!(cursor.since(), MAX_TIME);
             assert_eq!(cursor.offset(), Some(-MAX_TIME));
             assert_eq!(cursor.seen(), seen_share(nvrs));
         }
-        assert_eq!(
-            st.serialize(),
-            format!(
-                "{}
-{}",
-                HEADER, cursors
-            )
-        );
+        assert_eq!(st.serialize(), format!("{}\n{}", HEADER, cursors));
         let per_address = MAX_FAIL_TIMES / MAX_TRACKED;
         let mut lines = String::new();
         for i in 0..MAX_TRACKED {
             for _ in 0..per_address {
-                lines.push_str(&format!(
-                    "fail {} {}
-",
-                    long_address(i),
-                    MAX_TIME
-                ));
+                lines.push_str(&format!("fail {} {}\n", long_address(i), MAX_TIME));
             }
         }
         for i in 0..MAX_BANNED {
-            lines.push_str(&format!(
-                "ban {} {}
-",
-                long_address(i),
-                MAX_TIME
-            ));
+            lines.push_str(&format!("ban {} {}\n", long_address(i), MAX_TIME));
         }
         for i in 0..MAX_PENDING {
             lines.push_str(&format!(
-                "pending {} {} 1000000 {} {}
-",
+                "pending {} {} 1000000 {} {}\n",
                 long_address(i),
                 MAX_TIME,
                 names[0],
@@ -587,18 +557,9 @@ mod tests {
             ));
         }
         for _ in 0..MAX_RATE {
-            lines.push_str(&format!(
-                "rate {}
-",
-                MAX_TIME
-            ));
+            lines.push_str(&format!("rate {}\n", MAX_TIME));
         }
-        st.ledger = State::parse(&format!(
-            "{}
-{}",
-            HEADER, lines
-        ))
-        .ledger;
+        st.ledger = State::parse(&format!("{}\n{}", HEADER, lines)).ledger;
         assert_eq!(
             st.ledger.sizes(),
             Sizes {
@@ -639,7 +600,7 @@ mod tests {
     #[test]
     #[ignore]
     fn full_state_sizes() {
-        for nvrs in [1, 2, 4, 5, 8] {
+        for nvrs in [1, 2, 3, 4, 5, 8] {
             let size = full_state(nvrs).serialize().len();
             println!(
                 "{} NVRs, {} seen each: {} bytes ({:.2} MiB)",

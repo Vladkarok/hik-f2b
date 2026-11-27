@@ -32,6 +32,11 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   was bounded only by the size of the file. It is bounded at 256; the
   lines of further NVRs are not used and are counted in the WARNING about
   lines that could not be used.
+- A log entry without a known time field (`StartDateTime`, `startTime`,
+  `dateTime`, `time`) took its time from any field with something
+  time-shaped in it, also free text such as `description`. Now only a
+  field whose name holds `time` or `date` is used. The tested firmware
+  writes `StartDateTime` and is not affected.
 
 ## [0.5.2] - 2026-11-27
 

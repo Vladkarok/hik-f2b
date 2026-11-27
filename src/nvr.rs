@@ -947,12 +947,20 @@ pub fn parse_item(nvr: &str, item: roxmltree::Node) -> Item {
 
     let meta: String = get("metaid").unwrap_or("").chars().take(MAX_META).collect();
 
-    // user-name fields never reach `fields`, so this fallback cannot read
-    // a time the attacker typed
+    // Without a field of TIME_KEYS, the first other field whose name says
+    // time or date (`logTime`, `occurDate`): free text such as
+    // <description> or <additionInformation> can mention another time (a
+    // clock that was set, a last login). User-name fields never reach
+    // `fields`, so no time the attacker typed is read either.
     let ts = TIME_KEYS
         .iter()
         .find_map(|k| get(k).and_then(util::parse_ts))
-        .or_else(|| fields.iter().find_map(|(_, v)| util::parse_ts(v)));
+        .or_else(|| {
+            fields
+                .iter()
+                .filter(|(k, _)| k.contains("time") || k.contains("date"))
+                .find_map(|(_, v)| util::parse_ts(v))
+        });
 
     // Real devices put the remote address in <ipAddress> ("::" when there
     // is none). The address is taken from such a field only: free text can
@@ -1261,6 +1269,37 @@ mod tests {
         let ev =
             item("<searchMatchItem><ipAddress>999.1.1.1; rm -rf</ipAddress></searchMatchItem>");
         assert_eq!(ev.ip, None);
+    }
+
+    #[test]
+    fn a_time_is_taken_only_from_a_time_field() {
+        // no field of TIME_KEYS: another field whose name says time or date
+        let ev = item(
+            "<searchMatchItem><metaId>log.x/illegalLogin</metaId>\
+             <logTime>2026-01-10T10:00:00Z</logTime>\
+             <ipAddress>198.51.100.7</ipAddress></searchMatchItem>",
+        );
+        assert_eq!(ev.ts.map(util::fmt_ts).unwrap(), "2026-01-10T10:00:00Z");
+        let ev = item(
+            "<searchMatchItem><metaId>log.x/illegalLogin</metaId>\
+             <occurDate>2026-01-10 10:00:00</occurDate>\
+             <ipAddress>198.51.100.7</ipAddress></searchMatchItem>",
+        );
+        assert_eq!(ev.ts.map(util::fmt_ts).unwrap(), "2026-01-10T10:00:00Z");
+        // a time in free text, or in a field that is not about the entry's
+        // time, is not the time of the entry
+        let ev = item(
+            "<searchMatchItem><metaId>log.x/illegalLogin</metaId>\
+             <description>clock set to 2020-01-01T00:00:00 by admin</description>\
+             <ipAddress>198.51.100.7</ipAddress></searchMatchItem>",
+        );
+        assert_eq!(ev.ts, None);
+        let ev = item(
+            "<searchMatchItem><metaId>log.x/illegalLogin</metaId>\
+             <additionInformation>last login 2026-01-09T08:00:00</additionInformation>\
+             <ipAddress>198.51.100.7</ipAddress></searchMatchItem>",
+        );
+        assert_eq!(ev.ts, None);
     }
 
     #[test]

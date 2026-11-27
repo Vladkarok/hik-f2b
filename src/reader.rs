@@ -42,10 +42,11 @@ pub const CLOCK_JUMP: i64 = 900;
 const MAX_SEARCHES: usize = 4;
 /// Upper bound on remembered log entries per NVR.
 pub const MAX_SEEN: usize = 50_000;
-/// Upper bound on the NVRs whose cursors are read from a state file. The
-/// lines of further names are not used (the WARNING of `State::load`
-/// counts them). Without it only the file size would bound them.
-pub const MAX_NVRS: usize = 256;
+/// Upper bound on the cursors (NVR names) read from a state file, which may
+/// hold names of NVRs no longer in the config. The lines of further names
+/// are not used (the WARNING of `State::load` counts them). Without it only
+/// the file size would bound them.
+pub const MAX_CURSORS: usize = 256;
 
 /// What the reader needs from an NVR: its clock and a search of its log.
 pub trait LogSource {
@@ -171,7 +172,7 @@ impl CursorLines {
     pub(crate) fn line(&mut self, cursors: &mut Cursors, f: &[&str]) -> Option<bool> {
         let positioned = &mut self.positioned;
         if let ["nvr" | "seen", name, ..] = f {
-            if !cursors.by_name.contains_key(*name) && cursors.by_name.len() >= MAX_NVRS {
+            if !cursors.by_name.contains_key(*name) && cursors.by_name.len() >= MAX_CURSORS {
                 return Some(false);
             }
         }
@@ -1801,16 +1802,16 @@ mod tests {
     }
 
     #[test]
-    fn the_nvrs_of_a_state_file_are_bounded() {
+    fn the_cursors_of_a_state_file_are_bounded() {
         let mut text = String::from("hik-f2b-state 2\n");
-        for i in 0..=MAX_NVRS {
+        for i in 0..=MAX_CURSORS {
             text.push_str(&format!("nvr n{} 1000 0\nseen n{} {:032x} 1\n", i, i, i));
         }
         let st = State::parse(&text);
-        assert_eq!(st.cursors.iter().count(), MAX_NVRS);
-        assert!(st.cursors.get(&format!("n{}", MAX_NVRS - 1)).is_some());
-        assert!(st.cursors.get(&format!("n{}", MAX_NVRS)).is_none());
-        assert_eq!(st.cursors[&format!("n{}", MAX_NVRS - 1)].seen(), 1);
+        assert_eq!(st.cursors.iter().count(), MAX_CURSORS);
+        assert!(st.cursors.get(&format!("n{}", MAX_CURSORS - 1)).is_some());
+        assert!(st.cursors.get(&format!("n{}", MAX_CURSORS)).is_none());
+        assert_eq!(st.cursors[&format!("n{}", MAX_CURSORS - 1)].seen(), 1);
     }
 
     #[test]

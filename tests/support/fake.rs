@@ -1310,7 +1310,8 @@ impl Drop for Servers {
 }
 
 impl Harness {
-    /// A harness whose engine has not polled yet.
+    /// A harness whose engine has not been started (`build_engine`) and
+    /// has not polled yet.
     pub fn build(opts: Opts) -> Harness {
         let (fake, server) = spawn_fake();
         let port = server.port;
@@ -1373,7 +1374,7 @@ impl Harness {
                 Ok(addresses.iter().map(|a| a.parse().unwrap()).collect()),
             );
         }
-        let engine = start(&ini, State::default(), &own);
+        let engine = build_engine(&ini, State::default(), &own);
         let mut h = Harness {
             fake,
             fake2,
@@ -1493,18 +1494,20 @@ impl Harness {
         device(self.engine.state().cursors[nvr].since())
     }
 
-    /// Saves the state, loads it again and starts a new engine with it and
-    /// with `ini` as it is now, as a restart of the service does.
+    /// Saves the state, loads it again and builds a new engine with it and
+    /// with `ini` as it is now, as a restart of the service does; like the
+    /// first, it is not started (`build_engine`).
     pub fn restart(&mut self) {
         let restored = self.round_trip(self.engine.state());
-        self.engine = start(&self.ini, restored, &self.own);
+        self.engine = build_engine(&self.ini, restored, &self.own);
     }
 
-    /// Starts a new engine with `state` instead of the engine's own, saved
-    /// and loaded again, as a restart with that state file does.
+    /// Builds a new engine (not started) with `state` instead of the
+    /// engine's own, saved and loaded again, as a restart with that state
+    /// file does.
     pub fn restart_with(&mut self, state: State) {
         let restored = self.round_trip(&state);
-        self.engine = start(&self.ini, restored, &self.own);
+        self.engine = build_engine(&self.ini, restored, &self.own);
     }
 
     fn round_trip(&self, state: &State) -> State {
@@ -1552,8 +1555,11 @@ impl Harness {
 
 /// An engine with the router and Telegram clients `ini` asks for, set up
 /// as `main.rs` sets them up, and own addresses and the answers for the
-/// host names of `ignoreip` from `own`.
-fn start(ini: &str, state: State, own: &Fixed) -> Engine {
+/// host names of `ignoreip` from `own`. It is built, not started: a test
+/// calls `Engine::start` to start it as `main.rs` does. Without that its
+/// first firewall check is the periodic one, in its first cycle, which
+/// several tests look at on purpose.
+fn build_engine(ini: &str, state: State, own: &Fixed) -> Engine {
     let cfg = Config::parse(ini).unwrap();
     let firewall = cfg
         .mikrotik

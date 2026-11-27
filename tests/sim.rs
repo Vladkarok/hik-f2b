@@ -183,6 +183,11 @@
 //!   router keeps a waiting ban from being applied for `alert_after`
 //!   (unreachable, or refusing), the alert has been sent by the first cycle
 //!   after that.
+//! - `start/count` (all): an engine start whose firewall check the router
+//!   answered ends with one request for the entries of the address-list
+//!   (the last request of the start) and one INFO line with their number,
+//!   as many as the fake router holds; a start whose check it did not
+//!   answer (or without a router), and a cycle, have neither.
 //!
 //! `liveness` is not checked in `Clock`: a resync after a clock change
 //! leaves out what was logged around it, by design.
@@ -269,6 +274,9 @@ const OWN_TEXT: &str = "192.0.2.200";
 const OWN_USER: &str = "f2b";
 /// The safe list of the scenarios that have one.
 const SAFE: &str = "cctv_safe";
+/// The request with which an engine start counts the entries of the
+/// address-list (`start/count`).
+const COUNT_REQUEST: &str = "GET /rest/ip/firewall/address-list?list=cctv_ban&.proplist=address";
 /// The host name in `ignoreip` of the scenarios that have one, and the
 /// addresses its answers give, which no other part of a scenario uses.
 const NAME: &str = "home.example.net";
@@ -669,6 +677,10 @@ enum Line {
     NameDropped(Ipv4Addr, String),
     /// Any other line about an `ignoreip` name.
     NameLog(String),
+    /// The number of entries in an address-list, said at an engine start,
+    /// and a count that failed.
+    ListSize(String, usize),
+    ListSizeFailed,
     Other,
 }
 
@@ -732,6 +744,16 @@ fn classify(line: &str) -> Line {
     }
     if text.starts_with("ignoreip") {
         return Line::NameLog(line.to_string());
+    }
+    if let Some(rest) = text.strip_prefix("MikroTik address-list ") {
+        if let Some((list, n)) = rest.split_once(" has ") {
+            if let Some(Ok(n)) = n.strip_suffix(" entries").map(str::parse) {
+                return Line::ListSize(list.to_string(), n);
+            }
+        }
+    }
+    if text.starts_with("cannot count the entries of address-list ") {
+        return Line::ListSizeFailed;
     }
     if let Some((n, ip, ts)) = counted(text) {
         return Line::Counted(n, ip, ts);
@@ -1414,15 +1436,17 @@ impl Sim {
         for (t, n, address) in backlog {
             self.write(n, t, address, FAIL, address.parse().ok());
         }
-        // as `main.rs` starts the service
         let expected = self.name_lookups(true)?;
-        self.h.engine.startup_own();
-        self.h.engine.startup_names();
+        // What the fakes hold before the start. Its first steps (the own
+        // addresses, the `ignoreip` names, the country database, which the
+        // harness does not configure) only log, so this is also what its
+        // firewall check finds.
         let listed = self.listed(OWN_TEXT);
         let named = self.named_listed();
         self.expire_safe();
         let safe_before = self.safe_listed();
-        self.h.engine.startup_check(self.host as u64);
+        // as `main.rs` starts the service
+        self.h.engine.start(self.host as u64);
         self.named_kept(&named, "at the engine start")?;
         self.startup_lines(listed, safe_before, &expected)?;
         self.note("first poll".to_string());
@@ -1431,7 +1455,8 @@ impl Sim {
 
     /// The log of an engine start: what the name resolves to (`expected`,
     /// see `name_lookups`), the firewall check, and the look-up of the own
-    /// address that follows it when the router answers.
+    /// address and the count of the address-list that follow it when the
+    /// router answers.
     fn startup_lines(
         &mut self,
         listed_before: bool,
@@ -1442,11 +1467,14 @@ impl Sim {
         let mut own = OwnSeen::default();
         let mut safe = SafeSeen::default();
         let mut about_name = Vec::new();
+        let mut sizes = Vec::new();
         own.deletes(&self.h.fake)?;
         for line in &lines {
             let line = classify(line);
             safe.see(&line)?;
             match line {
+                Line::ListSize(list, n) => sizes.push(Some((list, n))),
+                Line::ListSizeFailed => sizes.push(None),
                 Line::NameExempt(ip, name) => {
                     self.named_line(ip, &name, "a failed login said to be exempt")?
                 }
@@ -1467,8 +1495,52 @@ impl Sim {
         }
         self.name_logged(&about_name, expected)?;
         let answered = self.p.class != Class::NotifyOnly && self.router != Router::Unreachable;
+        self.count_checked(answered, &sizes)?;
         self.safe_checked(answered, safe_before, &safe)?;
         self.own_swept(answered, listed_before, &own)
+    }
+
+    /// See `start/count` in the module comment: the counts of the
+    /// address-list said since the last call (`said`: list and number, or
+    /// `None` for a count that failed) and the requests the fake router
+    /// recorded since then (before `safe_checked` takes them). `answered`:
+    /// at an engine start whose firewall check the router answered; false
+    /// in a cycle.
+    fn count_checked(
+        &self,
+        answered: bool,
+        said: &[Option<(String, usize)>],
+    ) -> Result<(), String> {
+        let f = self.h.fake.lock().unwrap();
+        let asked: Vec<usize> = (0..f.rest_log.len())
+            .filter(|&i| f.rest_log[i] == COUNT_REQUEST)
+            .collect();
+        if !answered {
+            if !said.is_empty() || !asked.is_empty() {
+                return Err(format!(
+                    "[start/count] {:?} said and {} count request(s) outside an engine start \
+                     whose firewall check the router answered",
+                    said,
+                    asked.len()
+                ));
+            }
+            return Ok(());
+        }
+        if asked != [f.rest_log.len() - 1] {
+            return Err(format!(
+                "[start/count] the count request is not once and last at an engine start: {:?}",
+                f.rest_log
+            ));
+        }
+        let wanted = [Some(("cctv_ban".to_string(), f.bans.len()))];
+        if said != wanted.as_slice() {
+            return Err(format!(
+                "[start/count] an engine start said {:?}, the address-list holds {} entries",
+                said,
+                f.bans.len()
+            ));
+        }
+        Ok(())
     }
 
     /// Whether the safe list has an entry for `OWN`.
@@ -1952,13 +2024,12 @@ impl Sim {
             s.dry_said = false;
         }
         let expected = self.name_lookups(true)?;
-        self.h.engine.startup_own();
-        self.h.engine.startup_names();
+        // what the fakes hold before the start, as at the first start
         let listed = self.listed(OWN_TEXT);
         let named = self.named_listed();
         self.expire_safe();
         let safe_before = self.safe_listed();
-        self.h.engine.startup_check(self.host as u64);
+        self.h.engine.start(self.host as u64);
         self.named_kept(&named, "at the engine start")?;
         self.startup_lines(listed, safe_before, &expected)
     }
@@ -2196,6 +2267,7 @@ impl Sim {
         let mut events = Vec::new();
         let mut own = OwnSeen::default();
         let mut safe = SafeSeen::default();
+        let mut sizes = Vec::new();
         own.deletes(&router)?;
         for line in &lines {
             let line = classify(line);
@@ -2306,6 +2378,8 @@ impl Sim {
                 | Line::SafeRuleFailed
                 | Line::SafeOther
                 | Line::Other => {}
+                Line::ListSize(list, n) => sizes.push(Some((list, n))),
+                Line::ListSizeFailed => sizes.push(None),
             }
         }
         for (address, outcome) in puts {
@@ -2343,6 +2417,8 @@ impl Sim {
             self.health.pass("firewall");
             self.health.pass("firewall-rule");
         }
+        // no count of the address-list in a cycle
+        self.count_checked(false, &sizes)?;
         // the write of the safe list and the look-up of the own address
         // follow a check that the router answered
         self.safe_checked(checked, safe_before, &safe)?;

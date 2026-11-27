@@ -221,23 +221,52 @@ impl Engine {
         }
     }
 
+    /// The start of the service, at host time `host_now`, before the first
+    /// cycle. In this order: logs the own addresses (`startup_own`), what
+    /// the host names of `ignoreip` resolve to (`startup_names`) and the
+    /// country database (`startup_country`), runs the first firewall check
+    /// round (`startup_check`) and, only when the router answered it, logs
+    /// the number of entries in the address-list. An engine that was built
+    /// but not started works all the same, except that its first firewall
+    /// check is the periodic one, in its first cycle.
+    pub fn start(&mut self, host_now: u64) {
+        self.startup_own();
+        self.startup_names();
+        self.startup_country();
+        // Also in a dry run: that is when the setup is being checked. The size
+        // of the address-list is asked only of a router that answered it, so an
+        // unreachable one costs one timeout at startup, not two.
+        let answered = self.startup_check(host_now);
+        if answered {
+            let list = self.cfg.mikrotik.as_ref().map(|m| &m.address_list);
+            if let (Some(list), Some(count)) = (list, self.count_listed()) {
+                match count {
+                    Ok(n) => crate::info!("MikroTik address-list {} has {} entries", list, n),
+                    Err(e) => {
+                        crate::warn!("cannot count the entries of address-list {}: {}", list, e)
+                    }
+                }
+            }
+        }
+    }
+
     /// Runs the firewall check round once at startup (`round.rs`); the
     /// first periodic check follows `health::HEALTH_CHECK_INTERVAL` later.
     /// Returns whether the firewall answered (so that more can be asked of
     /// it without waiting for a second timeout).
-    pub fn startup_check(&mut self, host_now: u64) -> bool {
+    fn startup_check(&mut self, host_now: u64) -> bool {
         self.firewall_round(When::Start, host_now).unwrap_or(false)
     }
 
     /// The number of entries in the address-list, shown at startup;
     /// `None` without a firewall.
-    pub fn count_listed(&self) -> Option<Result<usize, String>> {
+    fn count_listed(&self) -> Option<Result<usize, String>> {
         self.firewall.as_ref().map(|fw| fw.count())
     }
 
     /// Logs the own addresses found at the start, and the look-ups that
     /// failed.
-    pub fn startup_own(&self) {
+    fn startup_own(&self) {
         crate::info!("own addresses, never banned: {}", self.own.describe());
         let failures = self.own.failures();
         if !failures.is_empty() {
@@ -252,14 +281,14 @@ impl Engine {
 
     /// Logs what the host names of `ignoreip` resolve to at the start, and
     /// the names that do not resolve; nothing without a name.
-    pub fn startup_names(&self) {
+    fn startup_names(&self) {
         self.ignored.log_start();
     }
 
     /// Logs which country database is configured, or why it cannot be
     /// read. Either way the service runs; without the file bans simply
     /// carry no country.
-    pub fn startup_country(&mut self) {
+    fn startup_country(&mut self) {
         let Some(path) = self.cfg.country_db.clone() else {
             return;
         };

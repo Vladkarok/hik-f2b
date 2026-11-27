@@ -3091,6 +3091,48 @@ fn with_own(opts: Opts) -> Harness {
     })
 }
 
+/// The first line of a start with `with_own`: the own address toward each
+/// device.
+const OWN_LINE: &str = "INFO own addresses, never banned: router 127.0.0.1 from 192.0.2.200, \
+                        nvr1 127.0.0.1 from 192.0.2.200";
+
+/// The line of a firewall check at the start that finds the drop rule of
+/// the fake router.
+const FIREWALL_OK: &str =
+    "INFO firewall check ok: 1 enabled rule(s) in /ip/firewall/raw with src-address-list=cctv_ban";
+
+/// The request with which the start of the service counts the entries of
+/// the address-list.
+const COUNT_REQUEST: &str = "GET /rest/ip/firewall/address-list?list=cctv_ban&.proplist=address";
+
+/// The line of the start that says how many entries the address-list has.
+fn count_line(n: usize) -> String {
+    format!("INFO MikroTik address-list cctv_ban has {} entries", n)
+}
+
+/// Starts the engine of `h` at its host time, as `main.rs` starts the
+/// service, and asserts that the router answered the first firewall check:
+/// only then does the start count the entries of the address-list, with
+/// one request, the last of the start.
+fn start_answered(h: &mut Harness) {
+    let before = h.fake.lock().unwrap().rest_log.len();
+    h.engine.start(h.host as u64);
+    let f = h.fake.lock().unwrap();
+    let sent = &f.rest_log[before..];
+    assert_eq!(
+        sent.iter().filter(|r| *r == COUNT_REQUEST).count(),
+        1,
+        "{:?}",
+        sent
+    );
+    assert_eq!(
+        sent.last().map(String::as_str),
+        Some(COUNT_REQUEST),
+        "{:?}",
+        sent
+    );
+}
+
 /// The NVR rejects hik-f2b's login for ten minutes (its password was
 /// changed on the NVR), and logs each refused login as a failed login from
 /// the host's address with hik-f2b's user name. Then the password is right
@@ -3252,12 +3294,15 @@ fn an_address_that_becomes_an_own_address_has_its_waiting_ban_dropped() {
 fn the_own_addresses_are_logged_at_the_start_and_when_a_look_up_fails() {
     let mut h = with_own(Opts::default());
     util::capture_log();
-    h.engine.startup_own();
+    h.engine.start(h.host as u64);
     assert_eq!(
         util::captured_log(),
         vec![
             "INFO own addresses, never banned: router 127.0.0.1 from 192.0.2.200, nvr1 \
              127.0.0.1 from 192.0.2.200"
+                .to_string(),
+            FIREWALL_OK.to_string(),
+            count_line(0),
         ]
     );
     h.own.set_local(Err("no route to 127.0.0.1".to_string()));
@@ -3287,13 +3332,16 @@ fn the_own_addresses_are_logged_at_the_start_and_when_a_look_up_fails() {
     h.own.set_local(Err("no route".to_string()));
     h.restart();
     util::capture_log();
-    h.engine.startup_own();
+    h.engine.start(h.host as u64);
     assert_eq!(
         util::captured_log(),
         vec![
-            "INFO own addresses, never banned: router 127.0.0.1, nvr1 127.0.0.1",
+            "INFO own addresses, never banned: router 127.0.0.1, nvr1 127.0.0.1".to_string(),
             "WARNING own addresses: a look-up failed, it is tried again in every poll (a host \
-             name every 5 min): router: no route; nvr1: no route",
+             name every 5 min): router: no route; nvr1: no route"
+                .to_string(),
+            FIREWALL_OK.to_string(),
+            count_line(0),
         ]
     );
 }
@@ -3377,7 +3425,7 @@ fn an_own_address_in_the_address_list_is_removed_and_reported_at_once() {
     // the check at the start of the service does it too
     h.fake.lock().unwrap().bans.push(OWN.to_string());
     h.restart();
-    assert!(h.engine.startup_check(h.host as u64));
+    start_answered(&mut h);
     assert!(h.banned().is_empty());
     h.advance(30);
     assert_eq!(telegram_texts(&h).len(), 2);
@@ -3562,10 +3610,15 @@ fn with_home(opts: Opts) -> Harness {
 fn an_administrator_behind_an_ignoreip_name_is_never_banned() {
     let mut h = with_home(Opts::default());
     util::capture_log();
-    h.engine.startup_names();
+    h.engine.start(h.host as u64);
     assert_eq!(
         util::captured_log(),
-        vec!["INFO ignoreip names, never banned: home.example.net 203.0.113.7"]
+        vec![
+            OWN_LINE.to_string(),
+            "INFO ignoreip names, never banned: home.example.net 203.0.113.7".to_string(),
+            FIREWALL_OK.to_string(),
+            count_line(0),
+        ]
     );
     // eight wrong passwords from home, and an attacker
     h.burst("10:01", HOME_IP, 8);
@@ -3666,14 +3719,18 @@ fn an_ignoreip_name_that_does_not_resolve_at_the_start_exempts_nothing_until_it_
         ..Default::default()
     });
     util::capture_log();
-    h.engine.startup_names();
+    h.engine.start(h.host as u64);
     assert_eq!(
         util::captured_log(),
         vec![
-            "INFO ignoreip names, never banned: home.example.net not resolved",
+            OWN_LINE.to_string(),
+            "INFO ignoreip names, never banned: home.example.net not resolved".to_string(),
             "WARNING ignoreip: home.example.net does not resolve, so it exempts no address until \
              it does; it is tried again every 5 min: cannot resolve home.example.net: no such \
-             name",
+             name"
+                .to_string(),
+            FIREWALL_OK.to_string(),
+            count_line(0),
         ]
     );
     h.tick(); // the first poll, at 10:00:00
@@ -3835,8 +3892,11 @@ fn without_a_safe_list_no_request_is_added() {
         own: ip(OWN),
         ..Default::default()
     });
-    assert!(h.engine.startup_check(h.host as u64));
-    assert_eq!(requests(&h), CHECK_REQUESTS);
+    start_answered(&mut h);
+    assert_eq!(
+        requests(&h),
+        [&CHECK_REQUESTS[..], &[COUNT_REQUEST]].concat()
+    );
     // the first poll: the next check is due 300 s after the first
     run(&mut h, 10, 30);
     assert_eq!(requests(&h), CHECK_REQUESTS);
@@ -3856,15 +3916,19 @@ fn without_a_safe_list_no_request_is_added() {
 fn the_safe_list_is_written_at_startup_and_renewed_at_each_check() {
     let mut h = with_safe_list("");
     util::capture_log();
-    assert!(h.engine.startup_check(h.host as u64));
+    start_answered(&mut h);
     assert_eq!(
         util::captured_log(),
         vec![
+            OWN_LINE.to_string(),
             "INFO firewall check ok: 1 enabled rule(s) in /ip/firewall/raw with \
-             src-address-list=cctv_ban",
+             src-address-list=cctv_ban"
+                .to_string(),
             "INFO safe list check ok: 1 enabled accept rule(s) in /ip/firewall/raw with \
-             src-address-list=cctv_safe before the drop rule for cctv_ban",
-            "INFO 192.0.2.200 added to the safe list cctv_safe for 00:30:00",
+             src-address-list=cctv_safe before the drop rule for cctv_ban"
+                .to_string(),
+            "INFO 192.0.2.200 added to the safe list cctv_safe for 00:30:00".to_string(),
+            count_line(0),
         ]
     );
     let check = [
@@ -3878,7 +3942,7 @@ fn the_safe_list_is_written_at_startup_and_renewed_at_each_check() {
         &["PUT /rest/ip/firewall/address-list?", CHECK_REQUESTS[1]],
     ]
     .concat();
-    assert_eq!(requests(&h), added);
+    assert_eq!(requests(&h), [&added[..], &[COUNT_REQUEST]].concat());
     assert_eq!(safe_writes(&h), vec![safe("added")]);
     {
         let f = h.fake.lock().unwrap();
@@ -3925,7 +3989,7 @@ fn an_existing_entry_is_renewed_not_duplicated() {
         address: OWN.to_string(),
         timeout: Some("00:01:00".to_string()),
     });
-    assert!(h.engine.startup_check(h.host as u64));
+    start_answered(&mut h);
     run(&mut h, 20, 30);
     assert_eq!(safe_writes(&h), vec![safe("renewed"); 3]);
     assert_eq!(h.fake.lock().unwrap().listed.len(), 1);
@@ -3948,7 +4012,7 @@ fn an_existing_entry_is_renewed_not_duplicated() {
 #[test]
 fn a_new_own_address_is_written_and_the_old_one_left_to_expire() {
     let mut h = with_safe_list("");
-    assert!(h.engine.startup_check(h.host as u64));
+    start_answered(&mut h);
     h.tick();
     h.own.set_local(Ok(ip("192.0.2.201")));
     run(&mut h, 9, 30);
@@ -3993,7 +4057,7 @@ fn a_refused_write_is_its_own_health_problem() {
     let mut h = with_safe_list("alert_after = 60");
     h.fake.lock().unwrap().refuse_writes = true;
     util::capture_log();
-    assert!(h.engine.startup_check(h.host as u64));
+    start_answered(&mut h);
     let refused = "ERROR cannot write own address 192.0.2.200 to the safe list cctv_safe, will \
                    retry at the next firewall check: refused: HTTP 400: {\"detail\":\"not enough \
                    permissions (9)\",\"error\":400,\"message\":\"Bad Request\"}";
@@ -4048,7 +4112,7 @@ fn a_missing_safe_list_rule_is_a_problem_until_it_is_added() {
     let reason = "no rule in /ip/firewall/raw has src-address-list=cctv_safe: add one with \
                   action=accept above the drop rule for cctv_ban, in the same table";
     util::capture_log();
-    assert!(h.engine.startup_check(h.host as u64));
+    start_answered(&mut h);
     let log = util::captured_log();
     assert_eq!(
         exactly(&log, &format!("ERROR safe list check failed: {}", reason)),
@@ -4241,10 +4305,10 @@ fn the_safe_list_rule_check_in_every_case() {
 fn a_dry_run_writes_nothing_to_the_safe_list() {
     let mut h = with_safe_list("dry_run = true");
     util::capture_log();
-    assert!(h.engine.startup_check(h.host as u64));
+    start_answered(&mut h);
     run(&mut h, 40, 30);
     h.restart();
-    assert!(h.engine.startup_check(h.host as u64));
+    start_answered(&mut h);
     let log = util::captured_log();
     assert_eq!(
         exactly(
@@ -4304,7 +4368,7 @@ fn check_prints_the_safe_list() {
         )
     );
     assert!(safe_writes(&h).is_empty());
-    assert!(h.engine.startup_check(h.host as u64));
+    start_answered(&mut h);
     // what the service wrote; --check writes nothing from here on
     assert_eq!(safe_writes(&h), vec![safe("added")]);
     requests(&h);
@@ -4654,7 +4718,7 @@ fn country_shows_in_comment_log_and_telegram() {
     let mut h = Harness::new(true);
     with_country_db(&mut h);
     util::capture_log();
-    h.engine.startup_country();
+    h.engine.start(h.host as u64);
     h.burst("10:01", ATTACKER, 5);
     h.cycle("10:02:00");
     assert_eq!(h.banned(), vec![ATTACKER]);
@@ -4676,11 +4740,10 @@ fn country_shows_in_comment_log_and_telegram() {
     );
     let log = util::captured_log();
     assert_eq!(
-        logged(
-            &log,
-            "INFO country database: Test-Country, built 2026-11-01"
-        ),
-        1,
+        log.iter()
+            .filter(|l| l.contains("country database"))
+            .collect::<Vec<_>>(),
+        vec!["INFO country database: Test-Country, built 2026-11-01"],
         "{:?}",
         log
     );
@@ -4762,7 +4825,7 @@ fn missing_country_db_never_holds_up_a_ban() {
     let path = h.dir.join("missing.mmdb");
     with_setting(&mut h, &format!("country_db = {}", path.display()));
     util::capture_log();
-    h.engine.startup_country();
+    h.engine.start(h.host as u64);
     let log = util::captured_log();
     assert_eq!(
         logged(
@@ -4773,6 +4836,7 @@ fn missing_country_db_never_holds_up_a_ban() {
         "{:?}",
         log
     );
+    assert_eq!(logged(&log, "country"), 1, "{:?}", log);
 
     // The router is down for three cycles: the same lookup failure is not
     // logged again on every retry.
@@ -4842,7 +4906,7 @@ fn without_country_db_nothing_changes() {
     let mut h = Harness::new(true);
     assert!(h.config().country_db.is_none());
     util::capture_log();
-    h.engine.startup_country();
+    h.engine.start(h.host as u64);
     h.burst("10:01", ATTACKER, 5);
     h.cycle("10:02:00");
     let body = h.fake.lock().unwrap().ban_bodies[0].clone();
@@ -4894,6 +4958,75 @@ fn check_reports_the_country_database() {
     assert_eq!(failed.status, Status::Failed);
     assert!(failed.detail.starts_with("cannot read "), "{}", failed);
     assert_eq!(h.fake.lock().unwrap().tg_attempts, 0);
+}
+
+// ------------------------------------------------- the start of the service
+
+/// The start of the service, as `main.rs` runs it (`Engine::start`): the
+/// own addresses, the `ignoreip` names, the country database, the first
+/// firewall check and, only when the router answered that check, the
+/// number of entries in the address-list, in this order. A router that
+/// answers with an error or cannot be reached is not asked for the number.
+#[test]
+fn the_start_logs_its_steps_in_order_and_counts_only_after_an_answer() {
+    let mut h = Harness::build(Opts {
+        general: WITH_HOME,
+        own: ip(OWN),
+        names: &[(HOME, &[HOME_IP])],
+        ..Default::default()
+    });
+    with_country_db(&mut h);
+    h.fake.lock().unwrap().bans.push(ATTACKER.to_string());
+    let steps = [
+        OWN_LINE,
+        "INFO ignoreip names, never banned: home.example.net 203.0.113.7",
+        "INFO country database: Test-Country, built 2026-11-01",
+    ];
+    util::capture_log();
+    start_answered(&mut h);
+    assert_eq!(
+        util::captured_log(),
+        [&steps[..], &[FIREWALL_OK, &count_line(1)]].concat()
+    );
+    assert_eq!(
+        requests(&h),
+        [&CHECK_REQUESTS[..], &[COUNT_REQUEST]].concat()
+    );
+
+    // the router answers every request with an error: the check fails
+    h.fake.lock().unwrap().rest_status = Some(503);
+    h.restart();
+    h.engine.start(h.host as u64);
+    let log = util::captured_log();
+    assert_eq!(log.len(), 4, "{:?}", log);
+    assert_eq!(log[..3], steps, "{:?}", log);
+    assert_eq!(
+        log[3],
+        "ERROR firewall check failed: the firewall answers with an error: HTTP 503: \
+         {\"error\":503,\"message\":\"Service Unavailable\"} (bans will keep being retried)"
+    );
+    assert_eq!(requests(&h), [CHECK_REQUESTS[0]]);
+
+    // the router cannot be reached: nothing gets to it
+    let reached = h.fake.lock().unwrap().rest_requests;
+    {
+        let mut f = h.fake.lock().unwrap();
+        f.rest_status = None;
+        f.router_unreachable = true;
+    }
+    h.restart();
+    h.engine.start(h.host as u64);
+    let log = util::captured_log();
+    assert_eq!(log.len(), 4, "{:?}", log);
+    assert_eq!(log[..3], steps, "{:?}", log);
+    assert!(
+        log[3].starts_with("ERROR firewall check failed: cannot reach the firewall: ")
+            && log[3].ends_with(" (bans will keep being retried)"),
+        "{:?}",
+        log
+    );
+    assert!(requests(&h).is_empty());
+    assert_eq!(h.fake.lock().unwrap().rest_requests, reached);
 }
 
 // ------------------------------------------------------ one-shot commands

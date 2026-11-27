@@ -419,9 +419,6 @@ fn run() -> Result<(), String> {
             .collect::<Result<Vec<_>, _>>()?;
         return one_shot(&args, &cfg, &mut nvrs, mikrotik.as_ref(), telegram.as_ref());
     }
-    // For the line with the size of the address-list, after the config
-    // went to the engine.
-    let list = cfg.mikrotik.as_ref().map(|m| m.address_list.clone());
     let firewall = mikrotik.map(|m| Box::new(m) as Box<dyn Firewall>);
     let notifier = telegram.map(|t| Box::new(t) as Box<dyn Notifier>);
     let own = OwnAddresses::new(&cfg, Box::new(System));
@@ -436,22 +433,7 @@ fn run() -> Result<(), String> {
             .map_err(|e| format!("cannot install signal handler: {}", e))?;
     }
 
-    engine.startup_own();
-    engine.startup_names();
-    engine.startup_country();
-    // Also in a dry run: that is when the setup is being checked. The size
-    // of the address-list is asked only of a router that answered it, so an
-    // unreachable one costs one timeout at startup, not two.
-    let answered = engine.startup_check(util::unix_now());
-    if answered {
-        if let (Some(list), Some(count)) = (&list, engine.count_listed()) {
-            match count {
-                Ok(n) => info!("MikroTik address-list {} has {} entries", list, n),
-                Err(e) => warn!("cannot count the entries of address-list {}: {}", list, e),
-            }
-        }
-    }
-
+    engine.start(util::unix_now());
     engine.run(&state_file, args.once);
     info!("stopped");
     Ok(())

@@ -12,7 +12,9 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 
 - The code was restructured, with no change in behaviour: what the router
   answers to a request is sorted in one place instead of four, and that
-  sorting has unit tests.
+  sorting has unit tests. The start of the service is one step, and the
+  tests and the simulation start hik-f2b with that step, as the service
+  does.
 
 ## [0.5.1] - 2026-11-26
 

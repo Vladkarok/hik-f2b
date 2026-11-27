@@ -1389,6 +1389,14 @@ real ban) untouched. The safe list writes (`PUT`, then `PATCH`) were not
 repeated with 0.5.1-rc.1: they were tried only with 0.5.0-rc.1. No firewall
 rule was added or changed on the router for these tries.
 
+Release candidate 0.5.2-rc.1 (the published `linux/amd64` image) was run on
+27 November 2026 on the same host and against the same router and both NVRs.
+`--check` passed, `--dump` for 72 hours printed the same lines as 0.5.1, and
+a 200-second dry run on a copy of the state file had no warnings. Nothing was
+written to the router. The two cases that 0.5.2 fixes were not made to happen
+on these devices: the router did not answer a ban with an error, and no NVR
+clock changed. Only the tests and the simulation make them happen.
+
 CI (GitHub Actions) tries the deploy files on every push, with a dummy config
 only: the router and the NVR are addresses that nothing answers, the secrets
 are dummy values.

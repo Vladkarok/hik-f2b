@@ -656,6 +656,15 @@ impl Config {
         if nvrs.is_empty() {
             return Err("at least one [nvr:<name>] section is required".to_string());
         }
+        if nvrs.len() > crate::reader::MAX_NVRS {
+            return Err(format!(
+                "{} [nvr:<name>] sections: at most {} are supported (the state holds at most {} \
+                 log entries of all NVRs as seen)",
+                nvrs.len(),
+                crate::reader::MAX_NVRS,
+                crate::reader::SEEN_BUDGET
+            ));
+        }
 
         let telegram = match ini.get("telegram") {
             Some(t) if boolean(t, "enabled", true)? => Some(Self::telegram(t)?),

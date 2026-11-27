@@ -42,6 +42,31 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   200 pages (about 80 minutes), far beyond the 60 s stop timeout of the
   files in `deploy/`. A stop now ends the search after the result page
   under way; the read position of that NVR stays where it was.
+- An NVR that lists oldest first, with more entries in one second than one
+  search returns: after the poll that moved on past that second, the next
+  polls read it again, and filled the search again, for up to `lookback`
+  polls (120 with the default) before they reached newer entries. Failed
+  logins logged meanwhile were counted that much later, or not at all once
+  they were older than `findtime`. Now the next polls read from the second
+  after it, without the `lookback` overlap, until the log has been read to
+  `lookback` after that second; an INFO line says so once. A log entry
+  logged late with a time before that second is not read meanwhile. A
+  restart in that time costs one poll more (issue 10).
+- With several busy NVRs the state could grow past the limit of the state
+  file, 16 MiB: each NVR kept up to 50,000 seen log entries. At the next
+  start the file was moved aside with a WARNING, and hik-f2b started with an
+  empty state. Now all NVRs together keep at most 160,000, in equal shares
+  (50,000 each with one to three NVRs, as before). A config may have at
+  most 8 NVRs: with more, hik-f2b does not start, and `--check` says so.
+  The limit of the state file is now 24 MiB, since with the longest NVR
+  names the state of two NVRs at every bound takes 17.4 MiB, and that of
+  four to eight NVRs 22.0 MiB; an earlier version does not use a file
+  larger than 16 MiB. A state file with more entries for an NVR than its
+  share is used, and the next read of that NVR keeps only its share. What
+  the state file holds of an NVR that is no longer in the config is dropped
+  at the start, with an INFO line. Measured at every bound, one poll of up to 8 NVRs needs at most 20.5 MiB
+  of heap (`tests/memory.rs`), within the memory limit of 32 MiB of the
+  deploy files (issue 9).
 
 ## [0.5.2] - 2026-11-27
 

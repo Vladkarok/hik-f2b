@@ -192,6 +192,23 @@ impl Engine {
             engine.own.set(),
             engine.ignored.addresses(),
         ));
+        // An NVR that is no longer in the config is not read: what the state
+        // holds of it would only take room (see `reader::seen_share`). If it
+        // comes back, its first poll starts anew.
+        let nvrs = &engine.cfg.nvrs;
+        let gone = engine
+            .state
+            .cursors
+            .keep(|name| nvrs.iter().any(|nvr| nvr.name == name));
+        for (name, seen) in gone {
+            crate::info!(
+                "{}: not in the config any more; its read position and {} seen log entr{} are \
+                 dropped from the state",
+                name,
+                seen,
+                if seen == 1 { "y" } else { "ies" }
+            );
+        }
         Ok(engine)
     }
 

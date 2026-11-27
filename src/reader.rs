@@ -40,8 +40,32 @@ pub const CLOCK_JUMP: i64 = 900;
 /// the caps in `nvr.rs` one poll reads at most this many times 50 pages or
 /// 5000 entries.
 const MAX_SEARCHES: usize = 4;
-/// Upper bound on remembered log entries per NVR.
+/// The most log entries one poll reads from one NVR: `MAX_SEARCHES` times
+/// the cap of one search (`MAX_EVENTS` in `nvr.rs`).
+const MAX_WINDOW: usize = MAX_SEARCHES * 5000;
+/// Upper bound on remembered log entries per NVR, and on the `seen` lines
+/// of one NVR read from a state file.
 pub const MAX_SEEN: usize = 50_000;
+/// Upper bound on remembered log entries of all NVRs together: each NVR of
+/// the config gets an equal share (`seen_share`).
+pub const SEEN_BUDGET: usize = 100_000;
+/// The most NVRs a config may have: each share must hold the entries of a
+/// whole window (`MAX_WINDOW`), or the next poll could count some of them
+/// again. With this many the state at its bounds fits `MAX_FILE`.
+pub const MAX_NVRS: usize = SEEN_BUDGET / MAX_WINDOW;
+
+/// Upper bound on remembered log entries of one NVR, with `nvrs` NVRs in
+/// the config: an equal share of `SEEN_BUDGET`, at most `MAX_SEEN`. With one
+/// or two NVRs it is `MAX_SEEN`.
+///
+/// `seen` holds the last window read, which is at most `MAX_WINDOW`
+/// entries, so at most the share; entries read before are kept only while
+/// they fit the share. A cursor of a state file may hold more (up to
+/// `MAX_SEEN`, as before there was a share): they are kept until the next
+/// read of that NVR, which keeps at most its share.
+pub fn seen_share(nvrs: usize) -> usize {
+    MAX_SEEN.min(SEEN_BUDGET / nvrs.max(1))
+}
 
 /// What the reader needs from an NVR: its clock and a search of its log.
 pub trait LogSource {
@@ -446,9 +470,9 @@ impl<L: LogSource> LogReader<L> {
     /// - A baseline ends the floor: it records what its window holds as seen.
     ///   A failed read keeps it; a skipped window moves `since` on, past it
     ///   unless the skip came within `lookback` of it.
-    /// - If `seen` would grow past `MAX_SEEN`, it keeps the last window only,
-    ///   as after a cut: a restart in that stretch could count entries from
-    ///   before the floor again.
+    /// - If `seen` would grow past the NVR's share (`seen_share`), it keeps
+    ///   the last window only, as after a cut: a restart in that stretch
+    ///   could count entries from before the floor again.
     ///
     /// `since` is never ahead of the device clock, so that the clock going back
     /// is noticed at the next poll.
@@ -592,6 +616,8 @@ impl<L: LogSource> LogReader<L> {
                 fresh.push(ev);
             }
         }
+        // the share holds a whole window (see `MAX_NVRS`)
+        debug_assert!(counter.len() <= MAX_WINDOW);
         let entries = if counter.len() == 1 { "y" } else { "ies" };
         if baseline && !window.whole {
             if !self.cut_said {
@@ -637,7 +663,7 @@ impl<L: LogSource> LogReader<L> {
             // Only the start of the window was read, or a floor holds (see
             // above): entries seen before that were not re-read this time must
             // stay known, or a later poll would count them again.
-            if st.seen.len() + counter.len() <= MAX_SEEN {
+            if st.seen.len() + counter.len() <= seen_share(cfg.nvrs.len()) {
                 for (key, count) in counter {
                     let n = st.seen.entry(key).or_insert(0);
                     *n = (*n).max(count);
@@ -922,13 +948,20 @@ mod tests {
         }
 
         fn with_findtime(findtime: i64) -> Run {
+            Run::with(findtime, 1)
+        }
+
+        /// `nvrs` NVRs in the config; the reader reads the first.
+        fn with(findtime: i64, nvrs: usize) -> Run {
             // the DEBUG lines are checked too; the outbox's tests turn them
             // on as well, and no test needs them off
             util::set_verbose(true);
             let cfg = Config::parse(&format!(
-                "[general]\nfindtime = {}\nlookback = {}\nauth_backoff = {}\n\
-                 [nvr:nvr1]\nurl = http://192.0.2.10\nuser = f2b\npassword = p\n",
-                findtime, LOOKBACK, AUTH_BACKOFF
+                "[general]\nfindtime = {}\nlookback = {}\nauth_backoff = {}\n{}",
+                findtime,
+                LOOKBACK,
+                AUTH_BACKOFF,
+                nvr_sections(nvrs)
             ))
             .unwrap();
             Run {
@@ -1022,6 +1055,23 @@ mod tests {
         fn searches(&mut self) -> Vec<(i64, i64)> {
             std::mem::take(&mut self.log().searches)
         }
+    }
+
+    /// The sections of `nvrs` NVRs, `nvr1` first.
+    fn nvr_sections(nvrs: usize) -> String {
+        (1..=nvrs)
+            .map(|i| {
+                format!(
+                    "[nvr:nvr{}]
+url = http://192.0.2.{}
+user = f2b
+password = p
+",
+                    i,
+                    9 + i
+                )
+            })
+            .collect()
     }
 
     fn failed_with_other(poll: Poll) -> bool {
@@ -2043,6 +2093,60 @@ mod tests {
         r.advance(30);
         assert_eq!(r.read().len(), 2);
         assert_eq!(r.cursor().seen(), 2);
+    }
+
+    #[test]
+    fn each_nvr_gets_an_equal_share_of_the_seen_budget() {
+        assert_eq!(seen_share(1), MAX_SEEN);
+        assert_eq!(seen_share(2), MAX_SEEN, "as before there was a share");
+        assert_eq!(seen_share(3), 33_333);
+        assert_eq!(seen_share(4), 25_000);
+        assert_eq!(MAX_NVRS, 5);
+        assert_eq!(seen_share(MAX_NVRS), MAX_WINDOW, "a whole window");
+        for nvrs in 1..=MAX_NVRS {
+            assert!(nvrs * seen_share(nvrs) <= SEEN_BUDGET);
+        }
+        let config = |nvrs: usize| Config::parse(&format!("[general]\n{}", nvr_sections(nvrs)));
+        assert_eq!(config(MAX_NVRS).unwrap().nvrs.len(), MAX_NVRS);
+        assert_eq!(
+            config(MAX_NVRS + 1).err().unwrap(),
+            "6 [nvr:<name>] sections: at most 5 are supported (the state holds at most 100000 \
+             log entries of all NVRs as seen)"
+        );
+    }
+
+    /// `count` seen entries of `nvr1` in a state file, at `since`.
+    fn seen_lines(since: i64, count: usize) -> Cursors {
+        let mut text = format!("hik-f2b-state 2\nnvr nvr1 {} {}\n", since, SKEW);
+        for i in 0..count {
+            text.push_str(&format!("seen nvr1 {:032x} 1\n", u128::MAX - i as u128));
+        }
+        State::parse(&text).cursors
+    }
+
+    #[test]
+    fn with_four_nvrs_a_cursor_keeps_at_most_its_share() {
+        let share = 25_000;
+        // a cut read of two entries, after a state file with `seen` entries
+        let cut_read = |seen: usize| {
+            let mut r = Run::with(FINDTIME, 4);
+            let d = r.device();
+            r.cursors = seen_lines(d - 30, seen);
+            assert_eq!(r.cursor().seen(), seen, "all of it is used");
+            r.log().per_search = 2;
+            for t in [d - 10, d - 9, d - 8] {
+                r.add(t, B);
+            }
+            r.advance(30);
+            assert_eq!(r.read().len(), 2);
+            r.cursor().seen()
+        };
+        // what was seen before stays known while it fits the share
+        assert_eq!(cut_read(share - 2), share);
+        assert_eq!(cut_read(share - 1), 2, "would not fit: the window only");
+        // a state file from before the share: the surplus is gone with the
+        // first read
+        assert_eq!(cut_read(MAX_SEEN), 2);
     }
 
     #[test]

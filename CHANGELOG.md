@@ -20,6 +20,19 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   `lookback` after that second; an INFO line says so once. A log entry
   logged late with a time before that second is not read meanwhile. A
   restart in that time costs one poll more (issue 10).
+- With several busy NVRs the state could grow past the limit of the state
+  file, 16 MiB: each NVR kept up to 50,000 seen log entries. At the next
+  start the file was moved aside with a WARNING, and hik-f2b started with an
+  empty state. Now all NVRs together keep at most 100,000, in equal shares
+  (50,000 each with one or two NVRs, as before). A config may have at most
+  5 NVRs: with more, hik-f2b does not start, and `--check` says so. The
+  limit of the state file is now 24 MiB, since with the longest NVR names
+  the state of two NVRs at every bound takes 17.5 MiB; an earlier version
+  does not use a file larger than 16 MiB. A state file with more entries
+  for an NVR than its share is used, and the next read of that NVR keeps
+  only its share. Measured at every bound, one poll of up to 5 NVRs needs
+  at most 15.5 MiB of heap (`tests/memory.rs`), well within the memory
+  limit of 32 MiB of the deploy files (issue 9).
 
 ## [0.5.2] - 2026-11-27
 

@@ -21,7 +21,11 @@ use std::path::{Path, PathBuf};
 /// Version 2 changed the meaning of the failure times (host time instead of
 /// device time); files of other versions are not used.
 const HEADER: &str = "hik-f2b-state 2";
-pub const MAX_FILE: u64 = 16 * 1024 * 1024;
+/// A larger file is not used. The state at its bounds stays below it: with
+/// `MAX_NVRS` NVRs, the longest names and the longest lines it takes 17.5
+/// MiB (`a_full_state_fits_the_file_limit`), of which the ledger takes about
+/// 10 MiB.
+pub const MAX_FILE: u64 = 24 * 1024 * 1024;
 
 /// 9999-12-31T23:59:59Z: anything later is not a time.
 pub const MAX_TIME: i64 = 253_402_300_799;
@@ -274,7 +278,7 @@ impl State {
 mod tests {
     use super::*;
     use crate::ledger::{Sizes, MAX_BANNED, MAX_FAIL_TIMES, MAX_PENDING, MAX_RATE, MAX_TRACKED};
-    use crate::reader::MAX_SEEN;
+    use crate::reader::{seen_share, MAX_NVRS};
     use std::net::Ipv4Addr;
 
     const KEY: &str = "0123456789abcdef0123456789abcdef";
@@ -459,7 +463,7 @@ mod tests {
         drop(file);
         assert_eq!(State::load_at(&path, NOW), Ok(State::default()));
         assert_eq!(std::fs::metadata(&aside).unwrap().len(), MAX_FILE + 1);
-        assert!(crate::util::captured_log()[0].contains("is larger than 16 MiB"));
+        assert!(crate::util::captured_log()[0].contains("is larger than 24 MiB"));
         std::fs::remove_file(&aside).unwrap();
 
         // when it cannot be moved aside, hik-f2b does not start
@@ -494,53 +498,107 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Every collection at its bound, as two busy NVRs and a long attack can
-    /// leave it: the file stays below `MAX_FILE`, so it is read back.
-    #[test]
-    fn a_full_state_fits_the_file_limit() {
+    /// The longest NVR name the config allows (32 characters).
+    fn long_name(i: usize) -> String {
+        format!("{:-<32}", format!("nvr{}", i))
+    }
+
+    /// An address of 15 characters, the longest, for `i` below 1,000,000.
+    fn long_address(i: usize) -> Ipv4Addr {
+        Ipv4Addr::new(
+            200,
+            (100 + i / 10_000 % 100) as u8,
+            (100 + i / 100 % 100) as u8,
+            (100 + i % 100) as u8,
+        )
+    }
+
+    /// Every collection at its bound, with the longest lines, as `nvrs`
+    /// busy NVRs and a long attack can leave it: each NVR with its share of
+    /// seen entries.
+    fn full_state(nvrs: usize) -> State {
         let mut cursors = String::new();
-        for name in ["nvr1", "nvr2"] {
-            cursors.push_str(&format!("nvr {} {} {}\n", name, MAX_TIME, -MAX_TIME));
-            let mut keys: Vec<String> = (0..MAX_SEEN)
+        let names: Vec<String> = (1..=nvrs).map(long_name).collect();
+        for name in &names {
+            cursors.push_str(&format!(
+                "nvr {} {} {}
+",
+                name, MAX_TIME, -MAX_TIME
+            ));
+            let mut keys: Vec<String> = (0..seen_share(nvrs))
                 .map(|i| format!("{:032x}", u128::MAX - i as u128))
                 .collect();
             keys.sort();
             for key in keys {
-                cursors.push_str(&format!("seen {} {} 1000000\n", name, key));
+                cursors.push_str(&format!(
+                    "seen {} {} 1000000
+",
+                    name, key
+                ));
             }
         }
-        let mut st = State::parse(&format!("{}\n{}", HEADER, cursors));
-        for name in ["nvr1", "nvr2"] {
+        let mut st = State::parse(&format!(
+            "{}
+{}",
+            HEADER, cursors
+        ));
+        for name in &names {
             let cursor = &st.cursors[name];
             assert_eq!(cursor.since(), MAX_TIME);
             assert_eq!(cursor.offset(), Some(-MAX_TIME));
-            assert_eq!(cursor.seen(), MAX_SEEN);
+            assert_eq!(cursor.seen(), seen_share(nvrs));
         }
-        assert_eq!(st.serialize(), format!("{}\n{}", HEADER, cursors));
-        let address = |i: usize| Ipv4Addr::from(0xC000_0000u32 + i as u32);
+        assert_eq!(
+            st.serialize(),
+            format!(
+                "{}
+{}",
+                HEADER, cursors
+            )
+        );
         let per_address = MAX_FAIL_TIMES / MAX_TRACKED;
         let mut lines = String::new();
         for i in 0..MAX_TRACKED {
             for _ in 0..per_address {
-                lines.push_str(&format!("fail {} {}\n", address(i), MAX_TIME));
+                lines.push_str(&format!(
+                    "fail {} {}
+",
+                    long_address(i),
+                    MAX_TIME
+                ));
             }
         }
         for i in 0..MAX_BANNED {
-            lines.push_str(&format!("ban {} {}\n", address(i), MAX_TIME));
+            lines.push_str(&format!(
+                "ban {} {}
+",
+                long_address(i),
+                MAX_TIME
+            ));
         }
         for i in 0..MAX_PENDING {
             lines.push_str(&format!(
-                "pending {} {} 1000000 {} {}\n",
-                address(i),
+                "pending {} {} 1000000 {} {}
+",
+                long_address(i),
                 MAX_TIME,
-                "x".repeat(32),
+                names[0],
                 "u".repeat(32)
             ));
         }
         for _ in 0..MAX_RATE {
-            lines.push_str(&format!("rate {}\n", MAX_TIME));
+            lines.push_str(&format!(
+                "rate {}
+",
+                MAX_TIME
+            ));
         }
-        st.ledger = State::parse(&format!("{}\n{}", HEADER, lines)).ledger;
+        st.ledger = State::parse(&format!(
+            "{}
+{}",
+            HEADER, lines
+        ))
+        .ledger;
         assert_eq!(
             st.ledger.sizes(),
             Sizes {
@@ -553,15 +611,44 @@ mod tests {
             }
         );
         assert!(st.serialize().ends_with(&lines));
-        let size = st.serialize().len() as u64;
-        println!("a full state with two NVRs: {} bytes", size);
-        assert!(size <= MAX_FILE, "{} bytes", size);
-        let dir = temp_dir("full");
-        let path = dir.join("state");
-        st.save(&path).unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
-        assert_eq!(State::load_at(&path, 5).unwrap(), st);
-        std::fs::remove_dir_all(&dir).unwrap();
+        st
+    }
+
+    /// The state at its bounds with as many NVRs as the config allows, and
+    /// with two (whose share is the whole `MAX_SEEN`): the file stays below
+    /// `MAX_FILE`, so it is read back.
+    #[test]
+    fn a_full_state_fits_the_file_limit() {
+        for nvrs in [2, MAX_NVRS] {
+            let st = full_state(nvrs);
+            let size = st.serialize().len() as u64;
+            println!("a full state with {} NVRs: {} bytes", nvrs, size);
+            assert!(size <= MAX_FILE, "{} NVRs: {} bytes", nvrs, size);
+            let dir = temp_dir("full");
+            let path = dir.join("state");
+            st.save(&path).unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
+            assert_eq!(State::load_at(&path, 5).unwrap(), st);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// The sizes of the state file at its bounds (issue 9), for the table in
+    /// the report: `cargo test --release --lib full_state_sizes -- --ignored
+    /// --nocapture`.
+    #[test]
+    #[ignore]
+    fn full_state_sizes() {
+        for nvrs in [1, 2, 4, 5, 8] {
+            let size = full_state(nvrs).serialize().len();
+            println!(
+                "{} NVRs, {} seen each: {} bytes ({:.2} MiB)",
+                nvrs,
+                seen_share(nvrs),
+                size,
+                size as f64 / (1 << 20) as f64
+            );
+        }
     }
 
     #[test]

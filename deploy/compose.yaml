@@ -29,7 +29,7 @@
 
 services:
   hik-f2b:
-    image: ghcr.io/vladkarok/hik-f2b:0.5.1
+    image: ghcr.io/vladkarok/hik-f2b:0.5.2
     # image: hik-f2b:latest
     restart: unless-stopped
     read_only: true

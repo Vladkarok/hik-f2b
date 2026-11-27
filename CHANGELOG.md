@@ -8,6 +8,8 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-27
+
 ### Changed
 
 - The code was restructured, with no change in behaviour: what the router
@@ -542,7 +544,8 @@ be built from source.
   a sandboxed systemd unit, unit and end-to-end tests, CI, and documentation
   in English and Ukrainian.
 
-[Unreleased]: https://github.com/Vladkarok/hik-f2b/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/Vladkarok/hik-f2b/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/Vladkarok/hik-f2b/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/Vladkarok/hik-f2b/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Vladkarok/hik-f2b/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/Vladkarok/hik-f2b/compare/v0.4.0...v0.4.1

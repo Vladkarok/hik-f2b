@@ -19,6 +19,9 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   so a ban that the router always refuses does not hold back the others.
   The order is kept in memory only; the state file does not change. The
   `ban-refused` alert and the periodic firewall check work as before.
+- With an NVR that ignores the search position and lists newest first,
+  the WARNING `the NVR returned the same result page twice` was logged
+  once per search, up to four times per poll. It is logged once per poll.
 
 ## [0.5.2] - 2026-11-27
 

@@ -55,6 +55,10 @@ pub struct Search {
     /// entry cap, or the NVR answered the same page twice (it ignores the
     /// search position). The window may hold more than was read.
     pub truncated: bool,
+    /// The NVR answered the same page twice: it seems to ignore the search
+    /// position. The caller says so, once per poll (a poll may make several
+    /// searches).
+    pub stuck: bool,
     /// Items that could not be parsed or were ambiguous, and were left out.
     pub skipped: usize,
     /// The ambiguous ones (up to `MAX_AMBIGUOUS`), for `--dump` only.
@@ -731,8 +735,6 @@ impl Nvr {
         let mut position = 0usize;
         let mut previous: Option<String> = None;
         let mut ambiguous = 0usize;
-        // the NVR answered the same page twice
-        let mut stuck = false;
         // a page with entries had no paging status hik-f2b knows
         let mut unknown_status = false;
         let id = util::random_hex();
@@ -758,12 +760,7 @@ impl Nvr {
                 // entries again on each page. The search was not read to
                 // its end, so it stays truncated: the caller reads the rest
                 // as it does after a search that reached the cap.
-                crate::warn!(
-                    "{}: the NVR returned the same result page twice; it seems to ignore the \
-                     search position, so this search stops after that page",
-                    self.name
-                );
-                stuck = true;
+                out.stuck = true;
                 break;
             }
             let page = parse_page(&self.name, &raw)?;
@@ -807,7 +804,7 @@ impl Nvr {
                 self.name
             );
         }
-        if out.truncated && !stuck && max_pages == MAX_PAGES {
+        if out.truncated && !out.stuck && max_pages == MAX_PAGES {
             crate::warn!(
                 "{}: more than {} log entries in the search window, this search stops there",
                 self.name,

@@ -1157,6 +1157,8 @@ fn ignored_position_newest_first_reads_the_older_part() {
     util::capture_log();
     h.cycle("10:04:00");
     let log = util::captured_log();
+    // several searches of one poll get the same page twice: said once
+    assert_eq!(logged(&log, "the same result page twice"), 1, "{:?}", log);
     assert_eq!(
         exactly(
             &log,

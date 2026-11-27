@@ -204,6 +204,12 @@ fn dump(cfg: &Config, nvrs: &mut [Nvr], hours: i64, raw: bool) -> usize {
             meta_id,
             hours
         );
+        if search.stuck {
+            println!(
+                "the NVR returned the same result page twice; it seems to ignore the search \
+                 position, so the search stopped after that page"
+            );
+        }
         if search.skipped > 0 {
             println!(
                 "{} more could not be parsed; AMBIG = a user, address, time or type field \

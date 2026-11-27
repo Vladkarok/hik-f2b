@@ -679,8 +679,18 @@ fn read_window<L: LogSource>(
     let mut skipped = false;
     // Entries after this came from an earlier search of this poll.
     let mut keep_to: Option<i64> = None;
+    // A search got the same page twice (said once per poll).
+    let mut stuck = false;
     for n in 0..MAX_SEARCHES {
         let search = log.search(start, end, meta_id)?;
+        if search.stuck && !stuck {
+            crate::warn!(
+                "{}: the NVR returned the same result page twice; it seems to ignore the \
+                 search position, so this search stops after that page",
+                name
+            );
+            stuck = true;
+        }
         let first = search.events.iter().find_map(|ev| ev.ts);
         let last = search.events.iter().rev().find_map(|ev| ev.ts);
         let newest_first = matches!((first, last), (Some(f), Some(l)) if f > l);

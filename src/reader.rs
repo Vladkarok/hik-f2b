@@ -70,8 +70,8 @@ pub struct Cursor {
     since: i64,
     /// Device clock minus host clock at the last successful read, used to
     /// notice the device clock jumping. `None` (`-` in the file): not known,
-    /// because a log window was skipped while a resync was due; the next read
-    /// resyncs.
+    /// because a log window was skipped while a resync was due, or a resync
+    /// could not read its whole window; the next read resyncs.
     offset: Option<i64>,
     /// Entries seen in the last (overlapping) query window, by key hash.
     seen: HashMap<String, u32>,
@@ -225,6 +225,9 @@ pub struct LogReader<L: LogSource = Nvr> {
     /// Host time before which this NVR is not contacted (after a rejected
     /// login).
     retry_after: u64,
+    /// A resync whose read was cut is due, and that was said (kept in memory
+    /// only: after a restart it is said once more).
+    cut_said: bool,
 }
 
 /// What one poll of an NVR gave.
@@ -299,6 +302,7 @@ impl<L: LogSource> LogReader<L> {
             log,
             failed_polls: 0,
             retry_after: 0,
+            cut_said: false,
         }
     }
 
@@ -357,8 +361,8 @@ impl<L: LogSource> LogReader<L> {
     /// The first poll of an NVR reads from its current time. It records what
     /// the `lookback` overlap before that holds as already seen, without
     /// counting it, so failed logins from before the start are never counted.
-    /// Until that read succeeds the NVR stays unknown, and the next poll tries
-    /// again.
+    /// Until that read succeeds, and reads its whole window, the NVR stays
+    /// unknown, and the next poll tries again.
     fn poll_nvr(
         &mut self,
         cfg: &Config,
@@ -376,7 +380,8 @@ impl<L: LogSource> LogReader<L> {
             ..Default::default()
         });
         let result = self.read_log(cfg, st, now, offset, first);
-        if first && result.is_err() {
+        // a first read that was cut left the resync due (`offset` unknown)
+        if first && (result.is_err() || st.offset.is_none()) {
             cursors.remove(&self.name);
         }
         result
@@ -402,6 +407,13 @@ impl<L: LogSource> LogReader<L> {
     /// - A skipped window (`MAX_FAILED_POLLS`) moves `since` without a read.
     ///   If a baseline was due, the offset is cleared (`None`), so the next read
     ///   that works is a baseline.
+    /// - A baseline is complete only if it read its whole window. One that was
+    ///   cut (the window holds more than the searches of one poll return)
+    ///   records what it read as seen, moves `since` to the device time and
+    ///   clears the offset too: the next poll resyncs again from its own time,
+    ///   and nothing of the NVR is counted until a baseline reads its whole
+    ///   window. Otherwise the part it did not read, which can hold entries
+    ///   from before the change, would be counted later.
     ///
     /// `since` is never ahead of the device clock, so that the clock going back
     /// is noticed at the next poll.
@@ -445,14 +457,19 @@ impl<L: LogSource> LogReader<L> {
                 })
         };
         let baseline = first || jump.is_some();
+        // A resync that goes on from a cut one of this run: the cut was said.
+        let continued = self.cut_said && st.offset.is_none();
         let previous = st.since;
         let mut since = st.since;
         if let Some(jump) = &jump {
-            crate::warn!(
-                "{}: {}; reading on from the new time, entries already in the log are not counted",
-                self.name,
-                jump
-            );
+            if !continued {
+                crate::warn!(
+                    "{}: {}; reading on from the new time, entries already in the log are not \
+                     counted",
+                    self.name,
+                    jump
+                );
+            }
             since = now;
         }
         // Entries older than findtime cannot contribute to a ban; skipping them
@@ -500,8 +517,9 @@ impl<L: LogSource> LogReader<L> {
                     );
                     st.since = now;
                     // The cursor moved without a read: if a resync was due, it
-                    // stays due (see above).
+                    // stays due (see above), now for this reason.
                     st.offset = if baseline { None } else { Some(offset) };
+                    self.cut_said = false;
                     self.failed_polls = 0;
                 }
                 return Err(NvrError::Other(e));
@@ -530,6 +548,25 @@ impl<L: LogSource> LogReader<L> {
             }
         }
         let entries = if counter.len() == 1 { "y" } else { "ies" };
+        if baseline && !window.whole {
+            if !self.cut_said {
+                crate::warn!(
+                    "{}: {}the log holds more entries from {} (device time) on than one read \
+                     returns, so not all of them can be recorded as already seen; failed logins \
+                     of this NVR are not counted until the log can be read whole",
+                    self.name,
+                    if first { "first run: " } else { "" },
+                    util::fmt_ts(since.saturating_sub(lookback))
+                );
+                self.cut_said = true;
+            }
+            // The resync stays due (see above); `fresh` is empty.
+            st.seen = counter;
+            st.since = now;
+            st.offset = None;
+            return Ok(Polled { fresh, offset });
+        }
+        self.cut_said = false;
         if first {
             crate::info!(
                 "{}: first run, watching log entries from {} (device time); {} log entr{} from \
@@ -601,6 +638,8 @@ struct Window {
     /// oldest first, or the order could not be told): the cursor must not
     /// move past `newest`.
     cut_after: bool,
+    /// Every entry of the window was read.
+    whole: bool,
 }
 
 /// Reads the log window `start ..= end` (device time) of one NVR.
@@ -620,6 +659,8 @@ struct Window {
 /// - All entries in one second: the order cannot be told. What was read is
 ///   kept, the older part is read as for newest first, and `cut_after` is
 ///   set as for oldest first.
+///
+/// `whole` is set only if none of this left an entry of the window unread.
 fn read_window<L: LogSource>(
     log: &mut L,
     name: &str,
@@ -631,8 +672,11 @@ fn read_window<L: LogSource>(
         events: Vec::new(),
         newest: None,
         cut_after: false,
+        whole: false,
     };
     let mut end = end;
+    // Entries of one second were left out (the WARNING below).
+    let mut skipped = false;
     // Entries after this came from an earlier search of this poll.
     let mut keep_to: Option<i64> = None;
     for n in 0..MAX_SEARCHES {
@@ -650,6 +694,7 @@ fn read_window<L: LogSource>(
         window.newest = window.newest.max(newest);
         if !search.truncated {
             window.events.extend(kept);
+            window.whole = !window.cut_after && !skipped;
             return Ok(window);
         }
         let Some(oldest) = oldest else {
@@ -669,6 +714,7 @@ fn read_window<L: LogSource>(
                     name,
                     util::fmt_ts(oldest)
                 );
+                skipped = true;
             }
             window.cut_after |= n == 0;
             window.events.extend(kept);
@@ -694,6 +740,7 @@ fn read_window<L: LogSource>(
         };
         keep_to = Some(unread_to);
         if unread_to < start {
+            window.whole = !window.cut_after && !skipped;
             return Ok(window);
         }
     }
@@ -744,6 +791,23 @@ mod tests {
         time_requests: usize,
         /// The window of each search, in order.
         searches: Vec<(i64, i64)>,
+    }
+
+    impl MemoryLog {
+        fn new() -> MemoryLog {
+            MemoryLog {
+                host: 0,
+                skew: SKEW,
+                entries: Vec::new(),
+                newest_first: false,
+                per_search: 100,
+                down: false,
+                refuse: false,
+                broken: false,
+                time_requests: 0,
+                searches: Vec::new(),
+            }
+        }
     }
 
     impl LogSource for MemoryLog {
@@ -806,20 +870,8 @@ mod tests {
                 findtime, LOOKBACK, AUTH_BACKOFF
             ))
             .unwrap();
-            let log = MemoryLog {
-                host: 0,
-                skew: SKEW,
-                entries: Vec::new(),
-                newest_first: false,
-                per_search: 100,
-                down: false,
-                refuse: false,
-                broken: false,
-                time_requests: 0,
-                searches: Vec::new(),
-            };
             Run {
-                reader: LogReader::new("nvr1", log),
+                reader: LogReader::new("nvr1", MemoryLog::new()),
                 cursors: Cursors::default(),
                 cfg,
                 host: H0,
@@ -878,6 +930,31 @@ mod tests {
 
         fn cursor(&self) -> &Cursor {
             &self.cursors["nvr1"]
+        }
+
+        /// `polls` polls 30 s apart: the failed logins they count, and the
+        /// device time of the first poll after which no resync is due.
+        fn read_on(&mut self, polls: usize) -> (Vec<(String, i64)>, Option<i64>) {
+            let mut counted = Vec::new();
+            let mut done = None;
+            for _ in 0..polls {
+                self.advance(30);
+                counted.extend(self.read());
+                let due = self
+                    .cursors
+                    .get("nvr1")
+                    .is_none_or(|st| st.offset().is_none());
+                if !due && done.is_none() {
+                    done = Some(self.device());
+                }
+            }
+            (counted, done)
+        }
+
+        /// A new reader of the same log, as after a restart of hik-f2b.
+        fn restart(&mut self) {
+            let old = std::mem::replace(&mut self.reader, LogReader::new("nvr1", MemoryLog::new()));
+            self.reader = LogReader::new("nvr1", old.log);
         }
 
         /// The searches since the last call.
@@ -1738,6 +1815,416 @@ mod tests {
             }
             .serialize(),
             text
+        );
+    }
+
+    /// The WARNING of a resync whose read was cut, for a window from
+    /// `start` (device time); `first`: on the first poll.
+    fn cut(first: bool, start: i64) -> String {
+        format!(
+            "WARNING nvr1: {}the log holds more entries from {} (device time) on than one \
+             read returns, so not all of them can be recorded as already seen; failed logins \
+             of this NVR are not counted until the log can be read whole",
+            if first { "first run: " } else { "" },
+            fmt_ts(start)
+        )
+    }
+
+    #[test]
+    fn a_resync_after_a_step_back_stays_due_while_its_read_is_cut() {
+        let mut r = Run::new();
+        let d0 = r.device();
+        assert_eq!(r.read(), vec![]);
+        // 20 s apart: an overlap holds fewer than one search returns
+        let old: Vec<i64> = (1..=25).map(|i| d0 + 20 * i).collect();
+        for &t in &old {
+            r.add(t, A);
+        }
+        r.advance(520);
+        assert_eq!(r.read().len(), 25, "counted before the change");
+        // from now on one search returns 10 entries; the clock goes back an
+        // hour, so the 25 lie ahead of the new time
+        r.log().per_search = 10;
+        r.advance(30);
+        r.log().skew = SKEW - 3600;
+        let back = r.device();
+        capture_log();
+        assert_eq!(r.read(), vec![]);
+        let log = captured_log();
+        let (mut counted, _) = r.read_on(20);
+        // a failed login logged during the resync is not counted either
+        let d = r.device();
+        r.add(d - 5, B);
+        let (more, done) = r.read_on(130);
+        counted.extend(more);
+        assert_eq!(
+            counted,
+            vec![],
+            "nothing from before the change, or during the resync"
+        );
+        // complete at the first poll whose window holds 10 entries at most
+        let in_window = |t: i64| old.iter().filter(|&&e| e >= t - LOOKBACK).count();
+        let first_whole = (1..)
+            .map(|k| back + 30 * k)
+            .find(|&t| in_window(t) <= 10)
+            .unwrap();
+        assert_eq!(done, Some(first_whole));
+        assert_eq!(
+            problems(&log),
+            vec![
+                &format!(
+                    "WARNING nvr1: device clock went back from {} to {}; reading on from the new \
+                     time, entries already in the log are not counted",
+                    fmt_ts(d0 + 500),
+                    fmt_ts(back)
+                ),
+                &cut(false, back - LOOKBACK)
+            ]
+        );
+        let log = captured_log();
+        assert!(problems(&log).is_empty(), "said once: {:?}", problems(&log));
+        assert_eq!(
+            log.iter()
+                .filter(|l| l.starts_with("INFO") && l.contains("recorded as already seen"))
+                .collect::<Vec<_>>(),
+            vec![&format!(
+                "INFO nvr1: {} existing log entries recorded as already seen",
+                in_window(first_whole)
+            )]
+        );
+        assert_eq!(r.cursor().offset(), Some(SKEW - 3600));
+        // after the resync failed logins count again
+        r.advance(30);
+        let d = r.device();
+        r.add(d - 5, B);
+        assert_eq!(r.read(), vec![(B.to_string(), d - 5 - SKEW + 3600)]);
+        let (counted, _) = r.read_on(10);
+        assert_eq!(counted, vec![]);
+    }
+
+    #[test]
+    fn a_cut_resync_keeps_the_offset_unknown_in_the_cursor() {
+        let mut r = Run::new();
+        let d0 = r.device();
+        assert_eq!(r.read(), vec![]);
+        for i in 1..=25 {
+            r.add(d0 + i, A);
+        }
+        r.advance(30);
+        assert_eq!(r.read().len(), 25);
+        r.log().per_search = 10;
+        r.advance(30);
+        r.log().skew = SKEW - 3600;
+        let back = r.device();
+        assert_eq!(r.read(), vec![]);
+        assert_eq!(r.cursor().offset(), None, "the resync is still due");
+        assert_eq!(r.cursor().since(), back);
+        assert_eq!(r.cursor().seen(), 10, "what was read");
+        r.searches();
+        r.advance(30);
+        assert_eq!(r.read(), vec![]);
+        assert_eq!(
+            r.searches(),
+            vec![(back + 30 - LOOKBACK, back + 30 + 86400)],
+            "from its own time"
+        );
+        assert_eq!(r.cursor().offset(), None);
+        assert_eq!(r.cursor().since(), back + 30);
+    }
+
+    #[test]
+    fn a_resync_after_a_jump_forward_stays_due_while_its_read_is_cut() {
+        let mut r = Run::with_findtime(3600);
+        assert_eq!(r.read(), vec![]);
+        r.log().per_search = 10;
+        r.advance(30);
+        r.log().skew = SKEW + 3600;
+        let d = r.device();
+        // logged after the jump, before the poll that sees it: 15 in the
+        // lookback before it
+        for j in 0..15 {
+            r.add(d - 118 + 8 * j, A);
+        }
+        capture_log();
+        assert_eq!(r.read(), vec![]);
+        let (counted, done) = r.read_on(100);
+        assert_eq!(counted, vec![], "entries already in the log at the change");
+        // 11 entries from d - 90 on, 7 from d - 60 on
+        assert_eq!(done, Some(d + 60));
+        let log = captured_log();
+        assert_eq!(
+            problems(&log),
+            vec![
+                &format!(
+                    "WARNING nvr1: device clock jumped forward by 3600 s (to {}); reading on \
+                     from the new time, entries already in the log are not counted",
+                    fmt_ts(d)
+                ),
+                &cut(false, d - LOOKBACK)
+            ]
+        );
+        assert_eq!(
+            logged(
+                &log,
+                "INFO nvr1: 7 existing log entries recorded as already seen"
+            ),
+            1
+        );
+        r.advance(30);
+        let d = r.device();
+        r.add(d - 5, B);
+        assert_eq!(r.read(), vec![(B.to_string(), d - 5 - SKEW - 3600)]);
+    }
+
+    #[test]
+    fn a_first_poll_whose_read_is_cut_leaves_the_nvr_unknown() {
+        let mut r = Run::with_findtime(3600);
+        r.log().per_search = 10;
+        let d0 = r.device();
+        for j in 0..15 {
+            r.add(d0 - 118 + 8 * j, A);
+        }
+        capture_log();
+        assert_eq!(r.read(), vec![]);
+        let unknown = r.cursors.get("nvr1").is_none();
+        let (counted, done) = r.read_on(100);
+        assert_eq!(counted, vec![], "entries from before the start");
+        assert!(unknown, "the next poll is a first poll again");
+        assert_eq!(done, Some(d0 + 60));
+        let log = captured_log();
+        assert_eq!(problems(&log), vec![&cut(true, d0 - LOOKBACK)]);
+        assert_eq!(
+            log.iter()
+                .filter(|l| l.starts_with("INFO") && l.contains("recorded as already seen"))
+                .collect::<Vec<_>>(),
+            vec![&format!(
+                "INFO nvr1: first run, watching log entries from {} (device time); 7 log \
+                 entries from before the start recorded as already seen, not counted",
+                fmt_ts(d0 + 60)
+            )]
+        );
+        r.advance(30);
+        let d = r.device();
+        r.add(d - 5, B);
+        assert_eq!(r.read(), vec![(B.to_string(), d - 5 - SKEW)]);
+    }
+
+    #[test]
+    fn a_resync_cut_within_one_second_stays_due() {
+        // the cursor stays at that second for two minutes before the entries
+        // after it are read
+        let mut r = Run::with_findtime(7200);
+        let d0 = r.device();
+        assert_eq!(r.read(), vec![]);
+        for _ in 0..7 {
+            r.add(d0 + 5, A);
+        }
+        for i in 4..=7 {
+            r.add(d0 + 10 * i, A);
+        }
+        r.advance(90);
+        assert_eq!(r.read().len(), 11, "counted before the change");
+        // the first search of the resync returns 5 entries of one second
+        r.log().per_search = 5;
+        r.advance(30);
+        r.log().skew = SKEW - 3600;
+        let back = r.device();
+        capture_log();
+        assert_eq!(r.read(), vec![]);
+        let (counted, done) = r.read_on(260);
+        assert_eq!(counted, vec![], "nothing from before the change");
+        // complete once that second has left the window
+        let first_whole = back + (d0 + 6 + LOOKBACK - back + 29) / 30 * 30;
+        assert_eq!(done, Some(first_whole));
+        let log = captured_log();
+        assert_eq!(problems(&log)[1..], [&cut(false, back - LOOKBACK)]);
+        assert_eq!(
+            logged(
+                &log,
+                "INFO nvr1: 4 existing log entries recorded as already seen"
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn a_resync_of_an_nvr_that_lists_newest_first_stays_due_while_its_read_is_cut() {
+        let mut r = Run::new();
+        r.log().newest_first = true;
+        let d0 = r.device();
+        assert_eq!(r.read(), vec![]);
+        let old: Vec<i64> = (1..=30).map(|i| d0 + 4 * i).collect();
+        for &t in &old {
+            r.add(t, A);
+        }
+        r.advance(150);
+        assert_eq!(r.read().len(), 30, "counted before the change");
+        // four searches of 5 read the newest 17 entries, d0 + 60 ..= 120
+        r.log().per_search = 5;
+        r.advance(30);
+        r.log().skew = SKEW - 3600;
+        let back = r.device();
+        capture_log();
+        assert_eq!(r.read(), vec![]);
+        let log = captured_log();
+        let (counted, done) = r.read_on(130);
+        assert_eq!(counted, vec![], "nothing from before the change");
+        assert_eq!(
+            problems(&log)[1..],
+            [
+                &format!(
+                    "ERROR nvr1: not every log entry in {} .. {} (device time) could be read \
+                     with 4 searches in one poll; SKIPPING the rest of it, failed logins in it \
+                     are not counted",
+                    fmt_ts(back - LOOKBACK),
+                    fmt_ts(d0 + 56)
+                ),
+                &cut(false, back - LOOKBACK)
+            ]
+        );
+        // complete once the fourth search reads to the start of the window:
+        // at most 5 entries up to d0 + 56 in it
+        let first_whole = (1..)
+            .map(|k| back + 30 * k)
+            .find(|&t| t - LOOKBACK > d0 + 36)
+            .unwrap();
+        assert_eq!(done, Some(first_whole));
+        let log = captured_log();
+        assert!(
+            !log.iter().any(|l| l.contains("can be read whole")),
+            "said once"
+        );
+        let left = old.iter().filter(|&&e| e >= first_whole - LOOKBACK).count();
+        assert_eq!(
+            logged(
+                &log,
+                &format!(
+                    "INFO nvr1: {} existing log entries recorded as already seen",
+                    left
+                )
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn a_cut_resync_of_an_nvr_that_turns_to_oldest_first_counts_nothing_from_before_it() {
+        // newest first, the older part of the window is not read; an NVR
+        // that lists oldest first from then on reads it first
+        let mut r = Run::with_findtime(3600);
+        r.log().newest_first = true;
+        let d0 = r.device();
+        assert_eq!(r.read(), vec![]);
+        // 40 s apart: an overlap holds fewer than one search returns
+        for i in 1..=30 {
+            r.add(d0 + 40 * i, A);
+        }
+        r.advance(1230);
+        assert_eq!(r.read().len(), 30, "counted before the change");
+        r.log().per_search = 5;
+        r.advance(30);
+        r.log().skew = SKEW - 3600;
+        assert_eq!(r.read(), vec![]);
+        r.log().newest_first = false;
+        let (counted, done) = r.read_on(130);
+        assert_eq!(counted, vec![], "nothing from before the change");
+        assert!(done.is_some());
+    }
+
+    #[test]
+    fn a_cut_resync_survives_a_save_and_a_load_and_a_restart() {
+        let mut r = Run::new();
+        let d0 = r.device();
+        assert_eq!(r.read(), vec![]);
+        for i in 1..=25 {
+            r.add(d0 + i, A);
+        }
+        r.advance(30);
+        assert_eq!(r.read().len(), 25);
+        r.log().per_search = 10;
+        r.advance(30);
+        r.log().skew = SKEW - 3600;
+        let back = r.device();
+        assert_eq!(r.read(), vec![]);
+        // the state file holds it in the format of 0.5.1: an unknown offset
+        let text = State {
+            cursors: r.cursors.clone(),
+            ..Default::default()
+        }
+        .serialize();
+        assert!(
+            text.starts_with(&format!("hik-f2b-state 2\nnvr nvr1 {} -\nseen nvr1 ", back)),
+            "{}",
+            text
+        );
+        assert_eq!(text.lines().count(), 2 + 10);
+        let loaded = State::parse(&text).cursors;
+        assert_eq!(loaded, r.cursors);
+        assert_eq!(State::parse(&text).serialize(), text);
+        r.cursors = loaded;
+        r.restart();
+        capture_log();
+        r.advance(30);
+        assert_eq!(r.read(), vec![]);
+        assert_eq!(r.cursor().offset(), None, "still due after the restart");
+        // after a restart hik-f2b cannot tell why the resync is due: it says
+        // the reason the state file gives, and the cut once more
+        assert_eq!(
+            problems(&captured_log()),
+            vec![
+                &format!(
+                    "WARNING nvr1: no device clock offset is known (the read position was moved \
+                     to {} without a read); reading on from the new time, entries already in \
+                     the log are not counted",
+                    fmt_ts(back)
+                ),
+                &cut(false, back + 30 - LOOKBACK)
+            ]
+        );
+        let (counted, done) = r.read_on(130);
+        assert_eq!(counted, vec![]);
+        assert!(done.is_some());
+        assert!(problems(&captured_log()).is_empty());
+    }
+
+    #[test]
+    fn a_skipped_window_during_a_cut_resync_says_why_the_next_one_is_due() {
+        let mut r = Run::new();
+        let d0 = r.device();
+        assert_eq!(r.read(), vec![]);
+        for i in 1..=25 {
+            r.add(d0 + i, A);
+        }
+        r.advance(30);
+        assert_eq!(r.read().len(), 25);
+        r.log().per_search = 10;
+        r.advance(30);
+        r.log().skew = SKEW - 3600;
+        assert_eq!(r.read(), vec![]);
+        r.log().broken = true;
+        capture_log();
+        for _ in 0..MAX_FAILED_POLLS {
+            r.advance(30);
+            assert!(failed_with_other(r.poll()));
+        }
+        let moved = r.device();
+        assert_eq!(r.cursor().since(), moved);
+        assert_eq!(r.cursor().offset(), None);
+        r.log().broken = false;
+        r.advance(30);
+        assert_eq!(r.read(), vec![]);
+        let log = captured_log();
+        assert_eq!(
+            problems(&log)[1..],
+            [
+                &format!(
+                    "WARNING nvr1: no device clock offset is known (the read position was moved \
+                     to {} without a read); reading on from the new time, entries already in \
+                     the log are not counted",
+                    fmt_ts(moved)
+                ),
+                &cut(false, moved + 30 - LOOKBACK)
+            ]
         );
     }
 }

@@ -991,6 +991,28 @@ so none is counted again. Entries logged before such a change and read after
 it are converted with the new difference, so their times can be off by up to
 15 minutes.
 
+Such a read after a clock change, and the first poll, reads the log from
+`lookback` before the NVR's time on. If the log holds more entries there
+than one poll can read (more than one search returns, 3200 entries on the
+tested NVRs, or more than 4 searches return on an NVR that lists the newest
+entries first), hik-f2b logs a warning once. It records the entries it read
+as already seen, and the next poll does the same again from its own time.
+No failed login of that NVR is counted until such a read gets the whole log.
+So entries from before the change, or from before the start, are never
+counted, and no address is banned with fewer than `maxretry` real failed
+logins. The cost: failed logins of that NVR that are logged meanwhile are
+not counted either. A restart in the middle does not end this.
+
+How long this lasts depends on the entries the log holds from `lookback`
+before the NVR's time on. After a jump forward, and on the first poll, they
+are the entries of the last `lookback`, so it ends one `lookback` and one
+poll after a flood of entries ends; while a flood of more than one search per
+`lookback` goes on, it does not end. After a step back, the entries logged
+before the step lie ahead of the new time and stay in that part of the log
+until the clock passes them: after the end of DST up to an hour and one
+`lookback`. After a step back of more than a day it can last as long as the
+step, if the log before the step was that full throughout.
+
 If the clock changes while the NVR's log cannot be read, and hik-f2b skips
 the unreadable stretch after 10 polls (see [Limitations](#limitations)), the
 next read that works does the same: it records the entries the log holds as
@@ -1072,7 +1094,10 @@ whatever they typed). It is built accordingly:
   most 50 pages or 5000 entries. If a search stops at that cap, hik-f2b looks
   at the times of the entries it got. If the NVR lists the oldest entries
   first (both tested NVRs do), the next poll reads on from the newest entry
-  read. If the NVR lists the newest first, the same poll reads the older part
+  read; after a clock change and on the first poll it reads again from its
+  own time instead (see
+  [Time and clock changes](#time-and-clock-changes)). If the NVR lists the
+  newest first, the same poll reads the older part
   with further searches, at most 4 searches per NVR and poll. Each entry is
   counted once, also when a search stops in the middle of a second. Entries
   that 4 searches cannot reach are skipped with an ERROR line that gives
@@ -1223,11 +1248,13 @@ vulnerability, see [SECURITY.md](SECURITY.md).
   the oldest entries first.
 - More entries in one second than one search returns (3200 on the tested
   NVRs) cannot all be read. hik-f2b logs a warning and moves on.
-- A clock change on an NVR together with a flood of log entries: after the
-  change hik-f2b records what the log holds as already seen, with one search.
-  If the `lookback` overlap alone holds more entries than one search returns,
-  the rest is counted on the next poll, also entries from before the change.
-  This is known and not fixed yet.
+- A clock change on an NVR together with a flood of log entries: while the
+  log from `lookback` before the NVR's time on holds more entries than one
+  poll can read, hik-f2b counts no failed login of that NVR (see
+  [Time and clock changes](#time-and-clock-changes)). After the end of DST
+  this can last an hour, and as long as the flood goes on. The same holds
+  for the first poll of an NVR. An attacker who keeps up such a flood is not
+  banned meanwhile.
 - Only MD5 Digest authentication is supported towards the NVR.
 - Only MikroTik RouterOS is supported as the firewall.
 - The drop-rule check only looks for an enabled, valid `raw` or `filter` rule
@@ -1393,6 +1420,9 @@ Not yet tried:
 - The handling of clock changes from 0.3.2 (a small correction backward, a
   change while the log cannot be read) on real NVRs: only the tests and the
   simulation make these happen.
+- A clock change or a first poll while the log holds more entries than one
+  search returns, on real NVRs: only the tests and the simulation make this
+  happen.
 - The changes of 0.4.0 on real devices: a drop rule that RouterOS marks
   invalid (the replies of a real router showed only `"invalid":"false"`),
   the answers of a real router to a wrong password, with HTTP 5xx and

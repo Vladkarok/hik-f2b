@@ -28,6 +28,15 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   and no more reminders. A router that could not be reached at all, so
   that a check failed too, is still reported as usable again by the next
   check that works.
+- After a clock change on an NVR, or on its first poll, hik-f2b records the
+  log entries already there as seen without counting them. If the log there
+  held more entries than one search returns, the rest was counted on the
+  next polls, also entries from before the change that had been counted
+  already, so an address could be banned with fewer than `maxretry` real
+  failed logins (issue 6). Now such a read records what it got, and the next
+  poll reads again from its own time, until one read gets the whole log.
+  Meanwhile no failed login of that NVR is counted, and one warning says so.
+  After the end of DST this can last an hour.
 
 ## [0.5.1] - 2026-11-26
 

@@ -617,6 +617,69 @@ fn dst_fall_back() {
     assert_eq!(h.banned(), vec![ATTACKER]);
 }
 
+/// DST ends while the hour before the change holds more log entries than
+/// one search returns (3200 on the fake). The resync reads only the start
+/// of that hour, so it stays due until the log can be read whole; until
+/// then nothing is counted. Three failed logins counted before the change
+/// are not counted again: no ban with fewer than `maxretry` (5) real ones.
+#[test]
+fn dst_fall_back_with_more_entries_than_one_search_returns() {
+    let mut h = Harness::new(false);
+    h.cycle("10:49:00");
+    {
+        // 3500 entries that are not failed logins, ten a second
+        let start = util::parse_ts(&format!("{}10:50:00", DAY)).unwrap();
+        let mut f = h.fake.lock().unwrap();
+        for n in 0..3500 {
+            f.entries.push(Entry {
+                ts: device(start + n / 10),
+                minor: "videoLost/30".to_string(),
+                ip: "192.0.2.40".to_string(),
+                user: Vec::new(),
+            });
+        }
+        f.entries.sort();
+    }
+    for second in 0..3 {
+        h.add(&format!("10:56:0{}", second), ATTACKER);
+    }
+    h.cycle("10:59:00");
+    h.cycle("10:59:30");
+    assert_eq!(h.fails(ATTACKER), 3);
+
+    // 11:05 local becomes 10:05 again; the hour before lies ahead
+    h.fake.lock().unwrap().skew = SKEW - 3600;
+    h.set_host(host_of("11:05:00"));
+    util::capture_log();
+    h.tick();
+    let mut log = util::captured_log();
+    for _ in 0..30 {
+        h.advance(120);
+        log.extend(util::captured_log());
+    }
+    assert!(h.banned().is_empty(), "banned with 3 real failed logins");
+    assert!(h.fails(ATTACKER) <= 3, "{}", h.fails(ATTACKER));
+    let cut = format!(
+        "WARNING nvr1: the log holds more entries from {}10:03:00Z (device time) on than one \
+         read returns, so not all of them can be recorded as already seen; failed logins of \
+         this NVR are not counted until the log can be read whole",
+        DAY
+    );
+    assert_eq!(exactly(&log, &cut), 1, "said once");
+    let done: Vec<&String> = log
+        .iter()
+        .filter(|l| l.ends_with("existing log entries recorded as already seen"))
+        .collect();
+    assert_eq!(done.len(), 1, "{:?}", done);
+    assert_eq!(h.engine.state().cursors["nvr1"].offset(), Some(SKEW - 3600));
+
+    // after the resync failed logins count again
+    assert_eq!(h.fake.lock().unwrap().now, format!("{}11:05:00", DAY));
+    h.burst("11:05", ATTACKER, 5);
+    h.advance(30);
+    assert_eq!(h.banned(), vec![ATTACKER]);
+}
+
 /// DST ends on a quiet NVR while it cannot be reached. Its read position
 /// trails its clock by `findtime + lookback`, so after the step the clock is
 /// still ahead of it, and only the offset (one hour less) shows the step.

@@ -39,12 +39,17 @@ pub enum NvrError {
     /// illegal-login lock, so the caller backs off.
     Auth(String),
     Other(String),
+    /// The service is stopping (`Nvr::stop_on`): the search ended before
+    /// its next page. Not a failure of the NVR: the reader neither counts
+    /// it nor moves its cursor, and the engine takes the NVR as not tried.
+    Stopped,
 }
 
 impl std::fmt::Display for NvrError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             NvrError::Auth(m) | NvrError::Other(m) => f.write_str(m),
+            NvrError::Stopped => f.write_str("stop requested"),
         }
     }
 }
@@ -606,9 +611,9 @@ impl Nvr {
         })
     }
 
-    /// Ends a search with an error when `flag` is set before one of its
-    /// pages is asked for, so that a stop does not wait for the rest of a
-    /// search of many pages: only for the page under way.
+    /// Ends a search with `NvrError::Stopped` when `flag` is set before one
+    /// of its pages is asked for, so that a stop does not wait for the rest
+    /// of a search of many pages: only for the page under way.
     pub fn stop_on(&mut self, flag: Arc<AtomicBool>) {
         self.stop = Some(flag);
     }
@@ -758,7 +763,7 @@ impl Nvr {
                 .as_ref()
                 .is_some_and(|s| s.load(Ordering::Relaxed))
             {
-                return Err(NvrError::Other("stop requested".to_string()));
+                return Err(NvrError::Stopped);
             }
             let body = format!(
                 "<?xml version=\"1.0\" encoding=\"utf-8\"?><CMSearchDescription>\

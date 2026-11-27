@@ -184,6 +184,8 @@ pub fn check_all(
             ),
             Err(NvrError::Auth(e)) => (Status::Failed, format!("login rejected ({})", e), None),
             Err(NvrError::Other(e)) => (Status::Failed, e, None),
+            // `--check` has no stop flag
+            Err(e @ NvrError::Stopped) => (Status::Failed, e.to_string(), None),
         };
         out.push(CheckLine {
             item: format!("nvr {}", nvr.name),

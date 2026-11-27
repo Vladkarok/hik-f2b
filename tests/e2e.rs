@@ -1521,6 +1521,43 @@ fn a_stop_ends_the_paging_of_a_search() {
     assert_eq!(h.banned(), vec![ATTACKER]);
 }
 
+/// A stop during a read is not a failed read: after nine reads that
+/// failed, a stop that ends the tenth read does not skip the log window,
+/// and the cursor stays where it was. The next read gets the window.
+#[test]
+fn a_stop_after_nine_failed_reads_skips_no_window() {
+    let mut h = Harness::new(false);
+    h.cycle("10:00:00");
+    let since = h.since("nvr1");
+    h.fake.lock().unwrap().garbage = true;
+    for _ in 0..9 {
+        h.advance(30);
+    }
+    assert_eq!(h.engine.readers()[0].failed_polls(), 9);
+    h.fake.lock().unwrap().garbage = false;
+    let start = util::parse_ts(&format!("{}10:00:30", DAY)).unwrap();
+    for n in 0..350 {
+        Harness::add_at(&h.fake, &device(start + n / 4), "192.168.1.50");
+    }
+    h.burst("10:03", ATTACKER, 5);
+    let stop = h.engine.stop_flag();
+    h.fake.lock().unwrap().stop_on_search = Some(stop.clone());
+    util::capture_log();
+    h.advance(30); // 10:05:00, the tenth read
+    let log = util::captured_log();
+    assert_eq!(logged(&log, "SKIPPING"), 0, "{:?}", log);
+    assert_eq!(logged(&log, "poll failed"), 0, "{:?}", log);
+    assert_eq!(h.since("nvr1"), since);
+    assert_eq!(h.engine.readers()[0].failed_polls(), 9, "not counted");
+    // the saved state keeps the cursor, and the next read gets the window
+    h.fake.lock().unwrap().stop_on_search = None;
+    stop.store(false, Ordering::SeqCst);
+    h.restart();
+    assert_eq!(h.since("nvr1"), since);
+    h.advance(30);
+    assert_eq!(h.banned(), vec![ATTACKER]);
+}
+
 /// `Engine::run` saves the state of a cycle that a stop cut short, and does
 /// not start another.
 #[test]

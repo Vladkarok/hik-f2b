@@ -505,6 +505,8 @@ impl<L: LogSource> LogReader<L> {
             // On the first run there is no cursor to move on: the next poll
             // starts from its own time anyway.
             Err(NvrError::Other(e)) if first => return Err(NvrError::Other(e)),
+            // A stop (`NvrError::Stopped`) and a rejected login pass through
+            // below: neither counts, and the cursor stays where it was.
             Err(NvrError::Other(e)) => {
                 self.failed_polls = self.failed_polls.saturating_add(1);
                 if self.failed_polls >= MAX_FAILED_POLLS {

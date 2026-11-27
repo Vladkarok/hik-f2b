@@ -423,7 +423,7 @@ impl Engine {
                 }
                 // A stop ended the read between two result pages: the
                 // NVR was not read, its cursor stays where it was.
-                Poll::Failed(NvrError::Other(_)) if self.stopping() => {
+                Poll::Failed(NvrError::Stopped) => {
                     self.health
                         .nvr_polled(self.readers[i].name(), NvrRead::NotTried, host_now);
                     break;

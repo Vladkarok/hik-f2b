@@ -228,6 +228,10 @@ pub struct LogReader<L: LogSource = Nvr> {
     /// A resync whose read was cut is due, and that was said (kept in memory
     /// only: after a restart it is said once more).
     cut_said: bool,
+    /// Device time at which the windows start after a poll that moved on by
+    /// one second, just after that second, until `since - lookback` has
+    /// passed it (kept in memory only, see `read_log`).
+    floor: Option<i64>,
 }
 
 /// What one poll of an NVR gave.
@@ -303,6 +307,7 @@ impl<L: LogSource> LogReader<L> {
             failed_polls: 0,
             retry_after: 0,
             cut_said: false,
+            floor: None,
         }
     }
 
@@ -415,6 +420,36 @@ impl<L: LogSource> LogReader<L> {
     ///   window. Otherwise the part it did not read, which can hold entries
     ///   from before the change, would be counted later.
     ///
+    /// One exception lets a window start later than `since - lookback`: after
+    /// a poll that moved on by one second (that second holds more entries
+    /// than one poll reads), the windows start at a floor just after that
+    /// second, until `since - lookback` passes it by itself. Otherwise the
+    /// overlap would read that second again, and fill the search again, for
+    /// up to `lookback` polls before newer entries are reached. The floor is
+    /// kept in memory only. What `seen` must hold then:
+    ///
+    /// - While the floor holds, every window starts at it, and `seen` keeps
+    ///   what it held when the floor was set, with each window read added,
+    ///   instead of the last window only. When the floor ends, the window
+    ///   starts at `since - lookback`, at or after the floor: it never starts
+    ///   before the previous window, so `seen` is again the last window.
+    /// - A restart forgets the floor, and its first window starts at
+    ///   `since - lookback`, before the floor. What lies there before the
+    ///   floor was read before the floor was set and is still in `seen`; what
+    ///   lies after it was read by the windows since. Nothing is counted
+    ///   twice. That window reaches the full second again and moves on: the
+    ///   floor is set again, one poll later.
+    /// - An entry logged late with a time before the floor is never read:
+    ///   while the floor holds it lies before the window, and after that
+    ///   before `since - lookback`. The WARNING says that entries may have
+    ///   been skipped.
+    /// - A baseline ends the floor: it records what its window holds as seen.
+    ///   A failed read keeps it; a skipped window moves `since` on, past it
+    ///   unless the skip came within `lookback` of it.
+    /// - If `seen` would grow past `MAX_SEEN`, it keeps the last window only,
+    ///   as after a cut: a restart in that stretch could count entries from
+    ///   before the floor again.
+    ///
     /// `since` is never ahead of the device clock, so that the clock going back
     /// is noticed at the next poll.
     fn read_log(
@@ -483,11 +518,21 @@ impl<L: LogSource> LogReader<L> {
             );
             since = horizon;
         }
+        // The floor after moving on by one second (see above). One above the
+        // read position is not of this cursor (the state was replaced).
+        let mut start = since.saturating_sub(lookback);
+        self.floor = self
+            .floor
+            .filter(|&floor| !baseline && floor <= st.since && start < floor);
+        let floor = self.floor;
+        if let Some(floor) = floor {
+            start = floor;
+        }
 
         let result = read_window(
             &mut self.log,
             &self.name,
-            since.saturating_sub(lookback),
+            start,
             now.saturating_add(86400),
             &cfg.meta_id,
         );
@@ -506,7 +551,7 @@ impl<L: LogSource> LogReader<L> {
                          {} .. {} (device time), failed logins in it are not counted{}",
                         self.name,
                         self.failed_polls,
-                        util::fmt_ts(since.saturating_sub(lookback)),
+                        util::fmt_ts(start),
                         util::fmt_ts(now),
                         if baseline {
                             "; the device clock changed, so the next read records the log as \
@@ -556,7 +601,7 @@ impl<L: LogSource> LogReader<L> {
                      of this NVR are not counted until the log can be read whole",
                     self.name,
                     if first { "first run: " } else { "" },
-                    util::fmt_ts(since.saturating_sub(lookback))
+                    util::fmt_ts(start)
                 );
                 self.cut_said = true;
             }
@@ -587,10 +632,11 @@ impl<L: LogSource> LogReader<L> {
         fresh.sort_by_key(|ev| ev.ts);
 
         let mut next = newest.min(now);
-        if window.cut_after && !baseline {
-            // Only the start of the window was read: entries seen before that
-            // were not re-read this time must stay known, or the next poll would
-            // count them again.
+        let cut = window.cut_after && !baseline;
+        if cut || floor.is_some() {
+            // Only the start of the window was read, or a floor holds (see
+            // above): entries seen before that were not re-read this time must
+            // stay known, or a later poll would count them again.
             if st.seen.len() + counter.len() <= MAX_SEEN {
                 for (key, count) in counter {
                     let n = st.seen.entry(key).or_insert(0);
@@ -599,16 +645,31 @@ impl<L: LogSource> LogReader<L> {
             } else {
                 st.seen = counter;
             }
-            if next <= since {
-                next = since.saturating_add(1).min(now);
-                crate::warn!(
-                    "{}: more log entries within one second than can be read in one poll; \
-                     moving on by one second, some entries may have been skipped",
-                    self.name
-                );
-            }
         } else {
             st.seen = counter;
+        }
+        if cut && next <= since {
+            next = since.saturating_add(1).min(now);
+            crate::warn!(
+                "{}: more log entries within one second than can be read in one poll; \
+                 moving on by one second, some entries may have been skipped",
+                self.name
+            );
+            // The next windows start just after the second the read stopped
+            // in, not at that second again (see above).
+            let after = window.newest.map(|ts| ts.saturating_add(1).min(next));
+            if let Some(after) = after.filter(|&f| f > next.saturating_sub(lookback)) {
+                if floor.is_none() {
+                    crate::info!(
+                        "{}: the next reads start at {} (device time), without the lookback \
+                         overlap, until the read position is lookback past it; log entries \
+                         logged late with an earlier time are not read meanwhile",
+                        self.name,
+                        util::fmt_ts(after)
+                    );
+                }
+                self.floor = Some(after);
+            }
         }
         // Never ahead of the device clock, or a step back to before the newest
         // entry read, however small, would go unseen.
@@ -1666,6 +1727,283 @@ mod tests {
         );
         assert_eq!(r.cursor().since(), d0 + 6);
         assert_eq!(r.cursor().seen(), 5);
+    }
+
+    /// The WARNING of a poll that moves on by one second.
+    const MOVED_ON: &str = "WARNING nvr1: more log entries within one second than can be read in \
+                            one poll; moving on by one second, some entries may have been skipped";
+
+    /// The INFO line of the first poll that moves on by one second: the
+    /// windows start at `floor` (device time) for a while.
+    fn floor_said(floor: i64) -> String {
+        format!(
+            "INFO nvr1: the next reads start at {} (device time), without the lookback \
+             overlap, until the read position is lookback past it; log entries logged late \
+             with an earlier time are not read meanwhile",
+            fmt_ts(floor)
+        )
+    }
+
+    /// Four failed logins of `A` at `d0 + 1 ..= 4` and ten of `B` in the
+    /// second `d0 + 5`, with eight entries per search; then one of `A` 5 s
+    /// before each of `polls` polls 30 s apart (an overlap holds six). With `restart_at` the state
+    /// is saved and loaded and the reader made anew before that poll. The
+    /// failed logins counted, and for each poll those it counted.
+    fn full_second(polls: usize, restart_at: Option<usize>) -> (Run, Vec<Vec<(String, i64)>>) {
+        let mut r = Run::new();
+        r.log().per_search = 8;
+        let d0 = r.device();
+        assert_eq!(r.read(), vec![]);
+        for i in 1..=4 {
+            r.add(d0 + i, A);
+        }
+        for _ in 0..10 {
+            r.add(d0 + 5, B);
+        }
+        let mut each = Vec::new();
+        for poll in 0..polls {
+            r.advance(30);
+            let d = r.device();
+            r.add(d - 5, A);
+            if restart_at == Some(poll) {
+                let text = State {
+                    cursors: r.cursors.clone(),
+                    ..Default::default()
+                }
+                .serialize();
+                r.cursors = State::parse(&text).cursors;
+                r.restart();
+            }
+            each.push(r.read());
+        }
+        (r, each)
+    }
+
+    /// What `full_second` must count: each entry once, but only four of the
+    /// ten in the full second.
+    fn full_second_counted(d0: i64, polls: usize) -> Vec<(String, i64)> {
+        let mut want: Vec<(String, i64)> =
+            (1..=4).map(|i| (A.to_string(), d0 + i - SKEW)).collect();
+        want.extend(vec![(B.to_string(), d0 + 5 - SKEW); 4]);
+        want.extend((1..=polls as i64).map(|k| (A.to_string(), d0 + 30 * k - 5 - SKEW)));
+        want.sort();
+        want
+    }
+
+    #[test]
+    fn after_moving_on_by_one_second_the_next_poll_reads_what_follows() {
+        let d0 = Run::new().device();
+        capture_log();
+        let (mut r, each) = full_second(40, None);
+        // the first poll reads up to the full second, the second moves on,
+        // the third reads what was logged after it
+        assert_eq!(each[0].len(), 8);
+        assert_eq!(each[1], vec![]);
+        assert_eq!(
+            each[2],
+            [25, 55, 85]
+                .map(|t| (A.to_string(), d0 + t - SKEW))
+                .to_vec()
+        );
+        let mut counted: Vec<_> = each.concat();
+        counted.sort();
+        assert_eq!(counted, full_second_counted(d0, 40), "each once");
+        let log = captured_log();
+        assert_eq!(problems(&log), vec![MOVED_ON]);
+        assert_eq!(logged(&log, &floor_said(d0 + 6)), 1);
+        // the windows start at the floor until the read position is lookback
+        // past it, then lookback before it again
+        r.searches();
+        r.advance(30);
+        r.read();
+        let d = r.device();
+        assert_eq!(r.searches(), vec![(d - 35 - LOOKBACK, d + 86400)]);
+    }
+
+    #[test]
+    fn the_windows_after_moving_on_start_at_the_floor_until_it_is_passed() {
+        let d0 = Run::new().device();
+        let (mut r, _) = full_second(2, None);
+        assert_eq!(r.cursor().since(), d0 + 6);
+        r.searches();
+        // since: d0 + 85, + 115, + 145 (lookback past the floor, d0 + 6)
+        let mut starts = Vec::new();
+        for _ in 0..3 {
+            r.advance(30);
+            let d = r.device();
+            r.add(d - 5, A);
+            assert_eq!(r.read().len(), 1 + (starts.is_empty() as usize) * 2);
+            starts.push(r.searches()[0].0);
+        }
+        assert_eq!(starts, vec![d0 + 6, d0 + 6, d0 + 6]);
+        r.advance(30);
+        r.read();
+        assert_eq!(r.searches()[0].0, d0 + 145 - LOOKBACK);
+    }
+
+    #[test]
+    fn a_restart_while_the_windows_start_at_the_floor_counts_nothing_twice() {
+        let d0 = Run::new().device();
+        for restart_at in 0..7 {
+            let (_, each) = full_second(20, Some(restart_at));
+            let mut counted: Vec<_> = each.concat();
+            counted.sort();
+            assert_eq!(
+                counted,
+                full_second_counted(d0, 20),
+                "restart before poll {}",
+                restart_at
+            );
+            // a restart forgets the floor: at most one poll later
+            let late = d0 + 25 - SKEW;
+            let at = each
+                .iter()
+                .position(|c| c.contains(&(A.to_string(), late)))
+                .unwrap();
+            assert!(
+                at <= 3,
+                "restart before poll {}: counted at {}",
+                restart_at,
+                at
+            );
+        }
+    }
+
+    #[test]
+    fn several_full_seconds_in_a_row_take_one_poll_each_then_a_quiet_log() {
+        let mut r = Run::new();
+        r.log().per_search = 5;
+        let d0 = r.device();
+        assert_eq!(r.read(), vec![]);
+        for second in 5..=7 {
+            for _ in 0..7 {
+                r.add(d0 + second, B);
+            }
+        }
+        r.add(d0 + 8, A);
+        capture_log();
+        let mut each = Vec::new();
+        for _ in 0..5 {
+            r.advance(30);
+            each.push(r.read());
+        }
+        let b = |second: i64| vec![(B.to_string(), d0 + second - SKEW); 5];
+        assert_eq!(
+            each,
+            vec![
+                b(5),
+                vec![],
+                b(6),
+                b(7),
+                vec![(A.to_string(), d0 + 8 - SKEW)]
+            ]
+        );
+        let log = captured_log();
+        assert_eq!(problems(&log), vec![MOVED_ON; 3]);
+        assert_eq!(logged(&log, &floor_said(d0 + 6)), 1, "said once");
+        assert!(!log.iter().any(|l| l.contains(&fmt_ts(d0 + 7))));
+        assert_eq!(r.cursor().since(), d0 + 8);
+        // a quiet log: the floor holds until the read position, kept at
+        // findtime + lookback before the clock, is lookback past it
+        let (counted, _) = r.read_on(40);
+        assert_eq!(counted, vec![]);
+        let d = r.device();
+        let since = d - FINDTIME - LOOKBACK;
+        assert_eq!(r.cursor().since(), since);
+        r.searches();
+        r.advance(30);
+        let d = r.device();
+        r.add(d - 5, A);
+        assert_eq!(r.read(), vec![(A.to_string(), d - 5 - SKEW)]);
+        assert_eq!(r.searches()[0].0, since + 30 - LOOKBACK);
+        let (counted, _) = r.read_on(10);
+        assert_eq!(counted, vec![]);
+        assert!(problems(&captured_log()).is_empty());
+    }
+
+    #[test]
+    fn a_clock_change_while_the_windows_start_at_the_floor_resyncs_from_its_own_time() {
+        let (mut r, _) = full_second(2, None);
+        r.searches();
+        r.advance(30);
+        r.log().skew = SKEW + 3600;
+        let d = r.device();
+        assert_eq!(r.read(), vec![]);
+        assert_eq!(r.searches(), vec![(d - LOOKBACK, d + 86400)]);
+        r.advance(30);
+        let d = r.device();
+        r.add(d - 5, A);
+        assert_eq!(r.read(), vec![(A.to_string(), d - 5 - SKEW - 3600)]);
+        assert_eq!(r.searches()[0].0, d - 30 - LOOKBACK);
+    }
+
+    #[test]
+    fn failed_reads_while_the_windows_start_at_the_floor() {
+        let d0 = Run::new().device();
+        let (mut r, _) = full_second(2, None);
+        r.log().broken = true;
+        r.searches();
+        for _ in 0..2 {
+            r.advance(30);
+            assert!(failed_with_other(r.poll()));
+        }
+        r.log().broken = false;
+        r.advance(30);
+        let d = r.device();
+        r.add(d - 5, A);
+        assert_eq!(r.read().len(), 3, "the two logged before, and this one");
+        let searches = r.searches();
+        assert_eq!(searches.len(), 3);
+        assert!(searches.iter().all(|s| s.0 == d0 + 6), "{:?}", searches);
+        // a skipped window moves the read position on: it passes the floor
+        let (mut r, _) = full_second(2, None);
+        r.log().broken = true;
+        capture_log();
+        for _ in 0..MAX_FAILED_POLLS {
+            r.advance(30);
+            assert!(failed_with_other(r.poll()));
+        }
+        let d = r.device();
+        assert_eq!(
+            problems(&captured_log()),
+            vec![&format!(
+                "ERROR nvr1: the log could not be read 10 times in a row; SKIPPING the log \
+                 window {} .. {} (device time), failed logins in it are not counted",
+                fmt_ts(d0 + 6),
+                fmt_ts(d)
+            )]
+        );
+        r.log().broken = false;
+        r.searches();
+        r.advance(30);
+        let d = r.device();
+        r.add(d - 5, A);
+        assert_eq!(r.read(), vec![(A.to_string(), d - 5 - SKEW)]);
+        assert_eq!(r.searches()[0].0, d - 30 - LOOKBACK);
+    }
+
+    #[test]
+    fn an_nvr_that_lists_newest_first_reads_what_follows_a_full_second_at_once() {
+        let mut r = Run::new();
+        r.log().per_search = 5;
+        r.log().newest_first = true;
+        let d0 = r.device();
+        assert_eq!(r.read(), vec![]);
+        for _ in 0..7 {
+            r.add(d0 + 5, B);
+        }
+        r.advance(30);
+        assert_eq!(r.read().len(), 5);
+        r.add(d0 + 45, A);
+        r.advance(30);
+        capture_log();
+        assert_eq!(r.read(), vec![(A.to_string(), d0 + 45 - SKEW)]);
+        let log = captured_log();
+        assert!(!log.iter().any(|l| l.contains("moving on")), "{:?}", log);
+        assert!(!log.iter().any(|l| l.contains("the next reads start")));
+        assert_eq!(r.cursor().since(), d0 + 45);
+        let (counted, _) = r.read_on(10);
+        assert_eq!(counted, vec![]);
     }
 
     #[test]

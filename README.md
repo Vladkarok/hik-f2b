@@ -1255,7 +1255,12 @@ vulnerability, see [SECURITY.md](SECURITY.md).
   ERROR line, and failed logins in it are not counted. Both tested NVRs list
   the oldest entries first.
 - More entries in one second than one search returns (3200 on the tested
-  NVRs) cannot all be read. hik-f2b logs a warning and moves on.
+  NVRs) cannot all be read. hik-f2b logs a warning and moves on. The next
+  polls read the log from the second after it, without the `lookback`
+  overlap, until the log has been read to `lookback` after that second. A
+  log entry that the NVR logs late, with a time before that second, is not
+  read meanwhile. A restart of hik-f2b in that time costs one poll: it reads
+  that second once more, then moves on again.
 - A clock change on an NVR together with a flood of log entries: while the
   log from `lookback` before the NVR's time on holds more entries than one
   poll can read, hik-f2b counts no failed login of that NVR (see

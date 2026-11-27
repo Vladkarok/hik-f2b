@@ -1747,10 +1747,70 @@ fn capped_poll_still_makes_progress() {
         h.cycle("10:02:30");
         assert_eq!(h.since("nvr1"), format!("{}10:01:11", DAY));
         assert_eq!(logged(&util::captured_log(), warning), 1);
+        // the next window starts after that second, and holds nothing
         h.cycle("10:03:00");
-        assert_eq!(h.since("nvr1"), format!("{}10:01:12", DAY));
+        assert_eq!(h.since("nvr1"), format!("{}10:01:11", DAY));
         assert!(h.engine.state().cursors["nvr1"].seen() >= 3200);
     }
+}
+
+/// An NVR that lists oldest first, with more entries in one second than one
+/// search returns: after the poll that moves on by one second, the next poll
+/// reads what follows that second, instead of reading the second again for
+/// `lookback` polls (issue 10).
+#[test]
+fn after_a_full_second_the_next_poll_reads_on() {
+    let mut h = Harness::new(false);
+    {
+        // an address in ignoreip, so that only the attacker is banned
+        let mut f = h.fake.lock().unwrap();
+        for n in 0..3300 {
+            f.entries.push(Entry {
+                ts: format!("{}10:01:10", DAY),
+                minor: "illlegealAccess".to_string(),
+                ip: "192.168.1.50".to_string(),
+                user: format!("u{:04}", n).into_bytes(),
+            });
+        }
+        f.entries.sort();
+    }
+    for second in 30..35 {
+        h.add(&format!("10:01:{}", second), ATTACKER);
+    }
+    util::capture_log();
+    h.cycle("10:02:00");
+    let mut polls = 1;
+    while h.banned().is_empty() {
+        assert!(polls < 300, "not banned after {} polls", polls);
+        h.advance(30);
+        polls += 1;
+    }
+    // the first poll stops in the full second, the second moves on, the
+    // third reads the failed logins after it
+    assert_eq!(polls, 3);
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    for _ in 0..10 {
+        h.advance(30);
+    }
+    let log = util::captured_log();
+    assert_eq!(
+        logged(
+            &log,
+            "more log entries within one second than can be read in one poll; moving on by \
+             one second"
+        ),
+        1
+    );
+    assert_eq!(
+        logged(
+            &log,
+            &format!(
+                "the next reads start at {}10:01:11Z (device time), without the lookback overlap",
+                DAY
+            )
+        ),
+        1
+    );
 }
 
 /// `count` failed logins from each address, `per_second` a second from

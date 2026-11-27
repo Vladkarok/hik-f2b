@@ -8,6 +8,19 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 
 ## [Unreleased]
 
+### Fixed
+
+- An NVR that lists oldest first, with more entries in one second than one
+  search returns: after the poll that moved on past that second, the next
+  polls read it again, and filled the search again, for up to `lookback`
+  polls (120 with the default) before they reached newer entries. Failed
+  logins logged meanwhile were counted that much later, or not at all once
+  they were older than `findtime`. Now the next polls read from the second
+  after it, without the `lookback` overlap, until the log has been read to
+  `lookback` after that second; an INFO line says so once. A log entry
+  logged late with a time before that second is not read meanwhile. A
+  restart in that time costs one poll more (issue 10).
+
 ## [0.5.2] - 2026-11-27
 
 ### Changed

@@ -864,7 +864,13 @@ and always in its log. It watches:
   hik-f2b asked for, such as a page from a proxy, counts as an error too.
   This is seen when a ban fails and by a check at startup and every 5
   minutes. After such an error hik-f2b tries the other waiting bans at the
-  next poll, not in the same one.
+  next poll, not in the same one. The checks only read. So if only failed
+  bans showed the problem, a check that works does not end it: a ban that
+  the router accepts does. If a check fails as well, the next check that
+  works ends the problem. If no ban is waiting any more when a check works,
+  nothing is left to show whether the router accepts bans. Then hik-f2b
+  sends one message that says so, as for refused bans below, and does not
+  claim a recovery.
 - **The drop rule:** no enabled rule in `/ip/firewall/raw` or
   `/ip/firewall/filter` has `src-address-list` set to `address_list`. Without
   such a rule the address-list fills up and nothing is blocked. hik-f2b asks
@@ -943,9 +949,10 @@ connection error, stays: it names your own device. Health messages go
 through the same queue as ban messages, so a Telegram outage costs no more
 than before and never holds up polling or banning. In the log each report is
 one ERROR line (`health alert [nvr:nvr2]: ...`, `health reminder [...]`) and
-each recovery one INFO line (`health recovered [...]`). The message about
-refused bans that no longer wait is an INFO line too
-(`health unknown [ban-refused]: ...`); in the chat it starts with ℹ️. What
+each recovery one INFO line (`health recovered [...]`). The messages about
+refused or failed bans that no longer wait are INFO lines too
+(`health unknown [ban-refused]: ...`, `health unknown [firewall]: ...`); in
+the chat they start with ℹ️. What
 hik-f2b remembers
 about problems is kept in memory only: after a restart a problem that is still
 there is reported again once it has lasted `alert_after`.

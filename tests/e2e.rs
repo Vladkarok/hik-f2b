@@ -2735,6 +2735,146 @@ fn refused_bans_that_expire_end_the_alert_without_a_recovery() {
     assert_eq!(telegram_texts(&h).len(), 2);
 }
 
+/// Runs cycles 30 s apart until no ban waits (at most `limit`).
+fn until_no_ban_waits(h: &mut Harness, limit: usize) {
+    for _ in 0..limit {
+        if h.engine.state().ledger.waiting() == 0 {
+            return;
+        }
+        h.advance(30);
+    }
+    panic!("a ban still waits after {} cycles", limit);
+}
+
+/// Issue 8: the router answers reads, but every ban gets HTTP 5xx. The
+/// failed bans raise the `firewall` alert. Once the waiting ban has
+/// expired, a read check that works does not show that bans work: one
+/// notice says that this is not known, without claiming a recovery. A later
+/// ban that the router accepts is not news.
+#[test]
+fn bans_that_get_a_server_error_and_expire_end_the_alert_without_a_recovery() {
+    let mut h = Harness::with(Opts {
+        telegram: true,
+        general: "bantime = 1h",
+        ..Default::default()
+    });
+    h.fake.lock().unwrap().router_down = true; // every write gets HTTP 500
+    h.burst("10:01", ATTACKER, 5);
+    util::capture_log();
+    h.cycle("10:02:00"); // the ban fails: the problem starts now
+    run(&mut h, 20, 30); // 10:12:00
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 1, "{:?}", texts);
+    assert!(
+        texts[0].starts_with(&format!(
+            "{}the firewall is not usable for 10 min: the firewall answers with an error: \
+             HTTP 500: ",
+            WARN
+        )),
+        "{}",
+        texts[0]
+    );
+    // the router answers every read
+    assert!(h.router().check().is_ok());
+
+    // the waiting ban is dropped after bantime; the read check of that
+    // cycle works
+    let checks = h.fake.lock().unwrap().rule_queries.len();
+    until_no_ban_waits(&mut h, 150);
+    assert!(
+        h.fake.lock().unwrap().rule_queries.len() > checks,
+        "no read check"
+    );
+    let unknown = "hik-f2b: the firewall answers the check, but the last ban failed and no \
+                   ban is waiting any more; whether the firewall accepts bans is not known \
+                   until the next ban (after 59 min)";
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 2, "{:?}", texts);
+    assert_eq!(texts[1], format!("\u{2139}\u{fe0f} {}", unknown));
+    assert!(h.engine.alerted_problems().is_empty());
+    let log = util::captured_log();
+    assert_eq!(
+        exactly(
+            &log,
+            &format!("INFO health unknown [firewall]: {}", unknown)
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    assert_eq!(logged(&log, "health recovered"), 0, "{:?}", log);
+    assert_eq!(logged(&log, "usable again"), 0, "{:?}", log);
+    // read checks go on working: nothing more, no reminder
+    run(&mut h, 20, 30);
+    assert_eq!(telegram_texts(&h).len(), 2);
+
+    // writes work again: the next ban is applied and announced, and that
+    // is all
+    h.fake.lock().unwrap().router_down = false;
+    let at = h.host;
+    for i in 0..5 {
+        Harness::add_at(&h.fake, &device(at + SKEW + i), ATTACKER);
+    }
+    h.advance(30);
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    run(&mut h, 30, 30);
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 3, "{:?}", texts);
+    assert!(
+        texts[2].starts_with("\u{26d4} hik-f2b: 198.51.100.7 banned for "),
+        "{}",
+        texts[2]
+    );
+    assert!(h.engine.alerted_problems().is_empty());
+    // no health notice since the one that withdrew the problem
+    let log = util::captured_log();
+    assert_eq!(logged(&log, "health "), 0, "{:?}", log);
+}
+
+/// The router cannot be reached at all: the bans fail and expire, and the
+/// read check fails too. When the router is back, the next read check ends
+/// the problem with a recovery, as before.
+#[test]
+fn bans_and_reads_that_fail_end_with_a_recovery_when_the_router_is_back() {
+    let mut h = Harness::with(Opts {
+        telegram: true,
+        general: "bantime = 1h",
+        ..Default::default()
+    });
+    h.fake.lock().unwrap().router_unreachable = true;
+    h.burst("10:01", ATTACKER, 5);
+    util::capture_log();
+    h.cycle("10:02:00");
+    run(&mut h, 20, 30); // 10:12:00
+    assert_eq!(telegram_texts(&h).len(), 1);
+    until_no_ban_waits(&mut h, 150);
+    // the read check of that cycle failed: the problem stays, no notice
+    let log = util::captured_log();
+    assert_eq!(
+        logged(
+            &log,
+            "WARNING firewall check failed: cannot reach the firewall: "
+        ),
+        1,
+        "{:?}",
+        log
+    );
+    assert_eq!(telegram_texts(&h).len(), 1);
+    assert_eq!(h.engine.alerted_problems(), vec!["firewall"]);
+    // back: the next read check works
+    h.fake.lock().unwrap().router_unreachable = false;
+    run(&mut h, 10, 30);
+    let texts = telegram_texts(&h);
+    assert_eq!(texts.len(), 2, "{:?}", texts);
+    assert!(
+        texts[1].starts_with(&format!("{}the firewall is usable again (after ", OK)),
+        "{}",
+        texts[1]
+    );
+    assert!(h.engine.alerted_problems().is_empty());
+    assert_eq!(logged(&util::captured_log(), "health unknown"), 0);
+}
+
 /// Without [telegram] the same events only reach the log.
 #[test]
 fn health_problems_without_telegram() {

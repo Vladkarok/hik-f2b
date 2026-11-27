@@ -35,6 +35,12 @@ const MAX_REASON: usize = 150;
 /// problem was alerted: nothing is left to show whether it is over.
 const BAN_REFUSED_UNKNOWN: &str = "no refused ban is waiting any more; whether the firewall \
                                    accepts bans is not known until the next ban";
+/// Said when the firewall problem was shown only by bans that failed, and
+/// a firewall check works after every waiting ban expired or was dropped:
+/// nothing is left to show whether bans work.
+const FIREWALL_UNKNOWN: &str = "the firewall answers the check, but the last ban failed and no \
+                                ban is waiting any more; whether the firewall accepts bans is \
+                                not known until the next ban";
 
 /// What is being watched. Each value is one problem with a stable key.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -43,7 +49,8 @@ pub enum Check {
     /// rejected.
     Nvr(String),
     /// The firewall cannot be reached, refuses our login or answers with an
-    /// error.
+    /// error. When only a ban showed it, only a ban that the firewall
+    /// answers ends it (see `Health::write_failed`).
     Firewall,
     /// The firewall answers, but nothing blocks the addresses it lists.
     Rule,
@@ -128,6 +135,7 @@ impl Check {
     fn unknown(&self) -> String {
         match self {
             Check::BanRefused => BAN_REFUSED_UNKNOWN.to_string(),
+            Check::Firewall => FIREWALL_UNKNOWN.to_string(),
             other => format!("{} can no longer be checked", other.key()),
         }
     }
@@ -380,6 +388,13 @@ pub struct Health {
     next_check: u64,
     /// Whether the last ban loop was cut short by an unreachable firewall.
     cut_short: bool,
+    /// Whether the open `Check::Firewall` problem is one that only writes
+    /// show: a ban attempt found the firewall unusable, and neither a ban
+    /// that the firewall answered nor a firewall check that failed came
+    /// since. A firewall check that works does not end such a problem.
+    write_failed: bool,
+    /// Whether bans still waited at the end of the last ban loop.
+    bans_wait: bool,
     /// Whether every NVR reported in this poll was read.
     all_read: bool,
     /// Host time a banned address was last seen reaching an NVR well after
@@ -395,6 +410,8 @@ impl Health {
             max_bans_per_hour,
             next_check: 0,
             cut_short: false,
+            write_failed: false,
+            bans_wait: false,
             all_read: true,
             last_bypass: None,
         }
@@ -456,19 +473,37 @@ impl Health {
     }
 
     /// The result of a firewall check at `now`, at startup or periodic. The
-    /// next periodic check is due `HEALTH_CHECK_INTERVAL` later.
+    /// next periodic check is due `HEALTH_CHECK_INTERVAL` later. A check
+    /// that fails makes the firewall problem one that reads show too, so a
+    /// later check that works may end it.
     fn firewall_checked(&mut self, result: &Result<String, HealthError>, now: u64) {
         self.next_check = now.saturating_add(HEALTH_CHECK_INTERVAL);
         match result {
             Ok(_) => {
-                self.alerts.pass(&Check::Firewall, now);
+                self.firewall_answered(now);
                 self.alerts.pass(&Check::Rule, now);
             }
-            Err(HealthError::Unusable(e)) => self.alerts.fail(Check::Firewall, e, now),
+            Err(HealthError::Unusable(e)) => {
+                self.write_failed = false;
+                self.alerts.fail(Check::Firewall, e, now);
+            }
             Err(HealthError::NotEnforced(e)) => {
-                self.alerts.pass(&Check::Firewall, now);
+                self.firewall_answered(now);
                 self.alerts.fail(Check::Rule, e, now);
             }
+        }
+    }
+
+    /// The firewall answered a check at `now`. That ends the firewall
+    /// problem, unless only bans showed it: then a ban that waits will show
+    /// whether bans work, and with none waiting that is not known, so the
+    /// problem is withdrawn.
+    fn firewall_answered(&mut self, now: u64) {
+        if !self.write_failed {
+            self.alerts.pass(&Check::Firewall, now);
+        } else if !self.bans_wait {
+            self.alerts.withdraw(&Check::Firewall, now);
+            self.write_failed = false;
         }
     }
 
@@ -483,8 +518,10 @@ impl Health {
         due && !self.cut_short
     }
 
-    /// How one ban attempt ended at `now`.
+    /// How one ban attempt ended at `now`. Every attempt but an unusable
+    /// firewall shows that the firewall answers writes.
     pub fn ban_tried(&mut self, attempt: BanAttempt, now: u64) {
+        self.write_failed = matches!(attempt, BanAttempt::Unreachable(_));
         match attempt {
             BanAttempt::Accepted | BanAttempt::Listed => {
                 self.alerts.pass(&Check::Firewall, now);
@@ -511,13 +548,15 @@ impl Health {
                 self.last_bypass = Some(now);
             }
             // A successful read does not clear this: only a ban the
-            // firewall accepts does.
+            // firewall accepts does. The firewall problem is left as it is:
+            // the next check ends it, as the firewall answered this write.
             BanAttempt::Refused { ip, error } => {
                 let reason = format!("{}: {}", ip, error);
                 self.alerts.fail(Check::BanRefused, &reason, now);
             }
             // One problem, one alert: the periodic check would report the
-            // same login or router trouble.
+            // same login or router trouble. A check that works does not
+            // end it (see `firewall_answered`).
             BanAttempt::Unreachable(e) => self.alerts.fail(Check::Firewall, e, now),
         }
     }
@@ -541,6 +580,7 @@ impl Health {
             self.alerts.withdraw(&Check::BanRefused, now);
         }
         self.cut_short = end == BansEnded::CutShort;
+        self.bans_wait = waiting > 0;
     }
 
     /// Every own address that is worth asking was looked up in the
@@ -1265,6 +1305,183 @@ mod tests {
         );
         assert_eq!(due[0].lasted, AFTER);
         assert!(h.due(T0 + 2 * AFTER).is_empty());
+    }
+
+    /// Bans got HTTP 5xx while reads work: the problem is one that only
+    /// writes show. A ban loop that found the firewall unusable, alerted.
+    fn writes_failed(h: &mut Health, now: u64) {
+        h.ban_tried(
+            BanAttempt::Unreachable("the firewall answers with an error: HTTP 500"),
+            now,
+        );
+        h.bans_ended(BansEnded::CutShort, 2, now);
+        assert_eq!(
+            kinds(&h.due(now + AFTER)),
+            vec![(Check::Firewall, Kind::Alert)]
+        );
+    }
+
+    #[test]
+    fn a_read_check_that_works_withdraws_a_write_problem_once_no_ban_waits() {
+        let mut h = health();
+        writes_failed(&mut h, T0);
+        // every waiting ban expired: the loop ends complete, the read check
+        // runs and works
+        let now = T0 + 2 * AFTER;
+        h.bans_ended(BansEnded::Complete, 0, now);
+        assert!(h.check_due(now));
+        h.firewall_checked(&Ok("rule found".into()), now);
+        let notices = h.due(now);
+        assert_eq!(kinds(&notices), vec![(Check::Firewall, Kind::Unknown)]);
+        assert_eq!(
+            notices[0].text(),
+            "\u{2139}\u{fe0f} hik-f2b: the firewall answers the check, but the last ban \
+             failed and no ban is waiting any more; whether the firewall accepts bans is not \
+             known until the next ban (after 20 min)"
+        );
+        assert!(h.alerted().is_empty());
+        // no reminder, and later read checks are not news
+        h.firewall_checked(&Ok(String::new()), now + HEALTH_CHECK_INTERVAL);
+        assert!(h.due(now + 2 * REMIND_EVERY).is_empty());
+        // the next ban that fails is a new problem, the next one accepted
+        // is not news
+        h.ban_tried(BanAttempt::Accepted, now + 3 * REMIND_EVERY);
+        assert!(h.due(now + 3 * REMIND_EVERY).is_empty());
+        writes_failed(&mut h, now + 4 * REMIND_EVERY);
+    }
+
+    #[test]
+    fn a_write_problem_not_yet_alerted_is_withdrawn_silently() {
+        let mut h = health();
+        h.ban_tried(BanAttempt::Unreachable("HTTP 500"), T0);
+        h.bans_ended(BansEnded::CutShort, 1, T0);
+        h.bans_ended(BansEnded::Complete, 0, T0 + 60);
+        h.firewall_checked(&Ok(String::new()), T0 + 60);
+        assert!(open_at(&mut h, T0 + 60).is_empty());
+        assert!(h.due(T0 + 2 * REMIND_EVERY).is_empty());
+    }
+
+    #[test]
+    fn a_read_check_that_works_leaves_a_write_problem_open_while_bans_wait() {
+        let mut h = health();
+        writes_failed(&mut h, T0);
+        // the loop did not try: rate limited, then stopped
+        for (end, at) in [(BansEnded::RateLimited, 1), (BansEnded::Stopped, 2)] {
+            let now = T0 + AFTER + at * HEALTH_CHECK_INTERVAL;
+            h.bans_ended(end, 2, now);
+            h.firewall_checked(&Ok(String::new()), now);
+            let firewall: Vec<_> = kinds(&h.due(now))
+                .into_iter()
+                .filter(|(c, _)| *c == Check::Firewall)
+                .collect();
+            assert!(firewall.is_empty(), "{:?}: {:?}", end, firewall);
+            assert!(h.alerted().contains(&"firewall".to_string()), "{:?}", end);
+        }
+        // the next attempt shows: accepted, the problem is over
+        let now = T0 + 2 * AFTER;
+        h.ban_tried(BanAttempt::Accepted, now);
+        h.bans_ended(BansEnded::Complete, 0, now);
+        assert_eq!(kinds(&h.due(now)), vec![(Check::Firewall, Kind::Recovered)]);
+        assert!(h.alerted().is_empty());
+    }
+
+    #[test]
+    fn a_read_check_that_finds_no_rule_does_not_end_a_write_problem_either() {
+        // the router answers the check: as for a check that works, only
+        // the rule is news
+        let mut h = health();
+        writes_failed(&mut h, T0);
+        let now = T0 + 2 * AFTER;
+        h.bans_ended(BansEnded::RateLimited, 2, now);
+        h.firewall_checked(&Err(HealthError::NotEnforced("no rule".into())), now);
+        assert!(h.due(now).is_empty());
+        assert_eq!(h.alerted(), vec!["firewall"]);
+        h.bans_ended(BansEnded::Complete, 0, now + 60);
+        h.firewall_checked(&Err(HealthError::NotEnforced("no rule".into())), now + 60);
+        assert_eq!(
+            kinds(&h.due(now + 60)),
+            vec![(Check::Firewall, Kind::Unknown)]
+        );
+        assert_eq!(
+            reasons(&h.due(now + AFTER)),
+            vec![(Check::Rule, "no rule".to_string())]
+        );
+    }
+
+    #[test]
+    fn a_ban_that_the_firewall_answers_ends_a_write_problem() {
+        for attempt in [BanAttempt::Accepted, BanAttempt::Listed] {
+            let mut h = health();
+            writes_failed(&mut h, T0);
+            h.ban_tried(attempt, T0 + 2 * AFTER);
+            assert_eq!(
+                kinds(&h.due(T0 + 2 * AFTER)),
+                vec![(Check::Firewall, Kind::Recovered)],
+                "{:?}",
+                attempt
+            );
+            // and the read checks after it are not news
+            h.bans_ended(BansEnded::Complete, 0, T0 + 2 * AFTER);
+            h.firewall_checked(&Ok(String::new()), T0 + 2 * AFTER);
+            assert!(h.due(T0 + 3 * AFTER).is_empty(), "{:?}", attempt);
+        }
+        let mut h = health();
+        writes_failed(&mut h, T0);
+        bypass(&mut h, None, T0 + 2 * AFTER);
+        assert_eq!(
+            kinds(&h.due(T0 + 2 * AFTER)),
+            vec![(Check::Firewall, Kind::Recovered)]
+        );
+    }
+
+    #[test]
+    fn a_read_check_that_fails_lets_a_later_one_end_a_write_problem() {
+        // an unreachable router: the bans fail, expire, the read check
+        // fails too; then the router is back
+        let mut h = health();
+        h.ban_tried(BanAttempt::Unreachable("cannot reach the firewall"), T0);
+        h.bans_ended(BansEnded::CutShort, 1, T0);
+        assert_eq!(h.due(T0 + AFTER).len(), 1);
+        let now = T0 + 2 * AFTER;
+        h.bans_ended(BansEnded::Complete, 0, now);
+        h.firewall_checked(&Err(HealthError::Unusable("timed out".into())), now);
+        assert!(h.due(now).is_empty());
+        assert_eq!(h.alerted(), vec!["firewall"]);
+        let back = now + HEALTH_CHECK_INTERVAL;
+        h.bans_ended(BansEnded::Complete, 0, back);
+        h.firewall_checked(&Ok(String::new()), back);
+        let notices = h.due(back);
+        assert_eq!(kinds(&notices), vec![(Check::Firewall, Kind::Recovered)]);
+        assert_eq!(
+            notices[0].text(),
+            "\u{2705} hik-f2b: the firewall is usable again (after 25 min)"
+        );
+    }
+
+    #[test]
+    fn a_refused_ban_ends_what_only_writes_showed() {
+        // the router answered the write about the address: the next read
+        // check that works ends the firewall problem, as before; the
+        // refusal is its own problem
+        let mut h = health();
+        writes_failed(&mut h, T0);
+        let now = T0 + 2 * AFTER;
+        h.ban_tried(
+            BanAttempt::Refused {
+                ip: IP,
+                error: "HTTP 400",
+            },
+            now,
+        );
+        h.bans_ended(BansEnded::Complete, 1, now);
+        assert!(h.due(now).is_empty());
+        h.firewall_checked(&Ok(String::new()), now + 60);
+        assert_eq!(
+            kinds(&h.due(now + 60)),
+            vec![(Check::Firewall, Kind::Recovered)]
+        );
+        assert_eq!(h.alerted(), Vec::<String>::new());
+        assert_eq!(open_at(&mut h, now + 60), vec![Check::BanRefused]);
     }
 
     #[test]

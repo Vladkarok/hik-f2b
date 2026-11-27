@@ -174,7 +174,10 @@
 //!   address that a check that answered finds listed and cannot remove,
 //!   which is over at the first such check that leaves none listed; with
 //!   the safe list, the missing rule at each check that answered, and a
-//!   write the router refuses, which only a write that works ends):
+//!   write the router refuses, which only a write that works ends; a
+//!   firewall that only a failed ban found unusable, which a check that
+//!   works ends only after a check failed, and otherwise withdraws once no
+//!   ban waits, while a ban that the router answers ends it):
 //!   alert once after `alert_after`, reminder after 24 h, one recovery or
 //!   "unknown" when an alerted problem ends, nothing for a short one, state
 //!   lost on restart. `health/condition` (all): an unreachable firewall is
@@ -592,7 +595,8 @@ struct Cycle {
     refused: bool,
     /// A ban was applied or found already listed.
     ban_pass: bool,
-    /// The router answered a check or accepted a ban.
+    /// The router accepted a ban or listed it, or answered a check that
+    /// ended the firewall problem.
     router_pass: bool,
     notices: Vec<String>,
 }
@@ -603,6 +607,10 @@ struct Health {
     /// key -> (since, last alert or reminder)
     open: BTreeMap<String, (i64, Option<i64>)>,
     closed: Vec<String>,
+    /// The last ban attempt found the firewall unreachable, and no check
+    /// failed since: the `firewall` problem is one that only writes show,
+    /// which a check that works does not end.
+    write_failed: bool,
 }
 
 impl Health {
@@ -2246,7 +2254,7 @@ impl Sim {
             transport: false,
             refused: false,
             ban_pass: false,
-            router_pass: checked,
+            router_pass: false,
             notices: Vec::new(),
         };
         let polls: Vec<(String, bool)> = self
@@ -2306,6 +2314,7 @@ impl Sim {
                     }
                     self.on_ban(ip, Ban::Listed)?;
                     cycle.ban_pass = true;
+                    self.health.write_failed = false;
                     self.health.pass("firewall");
                     self.health.pass("ban-refused");
                     self.health.fail("ban-bypassed", self.host);
@@ -2319,6 +2328,7 @@ impl Sim {
                     }
                     if kind != Ban::Reported {
                         cycle.ban_pass = true;
+                        self.health.write_failed = false;
                         self.health.pass("firewall");
                         self.health.pass("ban-refused");
                     }
@@ -2327,12 +2337,14 @@ impl Sim {
                 Line::Transport(ip) => {
                     self.on_request(ip, "ban request")?;
                     cycle.transport = true;
+                    self.health.write_failed = true;
                     self.health.fail("firewall", self.host);
                     events.push(format!("unreachable for {}", ip));
                 }
                 Line::Refused(ip) => {
                     self.on_request(ip, "ban request")?;
                     cycle.refused = true;
+                    self.health.write_failed = false;
                     self.health.fail("ban-refused", self.host);
                     events.push(format!("refused {}", ip));
                 }
@@ -2412,9 +2424,19 @@ impl Sim {
             self.health.withdraw("ban-refused");
         }
         if check_failed {
+            self.health.write_failed = false;
             self.health.fail("firewall", self.host);
         } else if checked {
-            self.health.pass("firewall");
+            // A check that works ends a problem that only bans showed only
+            // when no ban is left to show it: it is withdrawn.
+            if !self.health.write_failed {
+                cycle.router_pass = true;
+                self.health.pass("firewall");
+            } else if !cycle.pending_after {
+                cycle.router_pass = true;
+                self.health.write_failed = false;
+                self.health.withdraw("firewall");
+            }
             self.health.pass("firewall-rule");
         }
         // no count of the address-list in a cycle

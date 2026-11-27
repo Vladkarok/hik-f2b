@@ -16,6 +16,19 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   tests and the simulation start hik-f2b with that step, as the service
   does.
 
+### Fixed
+
+- When the router answered reads but every ban got an error such as
+  HTTP 500, the `firewall` health alert was ended by the next check once
+  the waiting bans had expired, with the message `the firewall is usable
+  again`, although no ban had been accepted. The checks only read. Now a
+  problem that only failed bans showed is ended by a ban that the router
+  accepts. If no ban is waiting any more when a check works, hik-f2b sends
+  one message that says this is not known (`health unknown [firewall]`)
+  and no more reminders. A router that could not be reached at all, so
+  that a check failed too, is still reported as usable again by the next
+  check that works.
+
 ## [0.5.1] - 2026-11-26
 
 ### Changed

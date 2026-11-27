@@ -1456,6 +1456,39 @@ fn a_stop_ends_the_cycle_after_its_current_step() {
     assert_eq!(h.engine.state().ledger.waiting(), 2);
 }
 
+/// A stop that arrives while the last notification of a cycle is sent
+/// skips nothing, and no line says that the rest of the poll is skipped.
+/// One that arrives while the first of two is sent leaves the second
+/// waiting, and the line says so.
+#[test]
+fn a_stop_after_the_last_step_of_a_cycle_skips_nothing() {
+    let mut h = Harness::new(true);
+    h.burst("10:01", ATTACKER, 5);
+    let stop = h.engine.stop_flag();
+    h.fake.lock().unwrap().stop_on_message = Some(stop.clone());
+    util::capture_log();
+    h.cycle("10:02:00");
+    assert_eq!(h.banned(), vec![ATTACKER]);
+    assert_eq!(h.engine.queued_notifications(), 0);
+    let log = util::captured_log();
+    assert_eq!(logged(&log, "stop requested"), 0, "{:?}", log);
+
+    stop.store(false, Ordering::SeqCst);
+    h.burst("10:03", "198.51.100.8", 5);
+    h.burst("10:03", "198.51.100.9", 5);
+    util::capture_log();
+    h.cycle("10:04:00");
+    assert_eq!(h.banned().len(), 3);
+    assert_eq!(h.engine.queued_notifications(), 1);
+    let log = util::captured_log();
+    assert_eq!(
+        logged(&log, "stop requested: the rest of this poll is skipped"),
+        1,
+        "{:?}",
+        log
+    );
+}
+
 /// `Engine::run` saves the state of a cycle that a stop cut short, and does
 /// not start another.
 #[test]

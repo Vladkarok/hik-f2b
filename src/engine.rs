@@ -449,9 +449,12 @@ impl Engine {
             self.periodic_check(host_now);
         }
         self.report_health(host_now);
-        self.outbox.send(host_now, &self.stop);
+        // A stop that comes while the last notifications are sent, or
+        // after, skips nothing: then the line below would not be true.
+        let stopped = self.stopping();
+        let held = self.outbox.send(host_now, &self.stop);
         self.cleanup(host_now);
-        if self.stopping() {
+        if stopped || held {
             crate::info!(
                 "stop requested: the rest of this poll is skipped; waiting bans and \
                  notifications wait for the next start"

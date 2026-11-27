@@ -22,6 +22,9 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 - With an NVR that ignores the search position and lists newest first,
   the WARNING `the NVR returned the same result page twice` was logged
   once per search, up to four times per poll. It is logged once per poll.
+- `stop requested: the rest of this poll is skipped` was logged also when
+  the stop came while the last notification was sent, or after it, when
+  nothing was skipped. It is no longer logged then.
 
 ## [0.5.2] - 2026-11-27
 

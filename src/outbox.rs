@@ -66,8 +66,9 @@ impl Outbox {
     /// messenger costs at most one timeout per poll; a notification is
     /// dropped after `NOTIFY_ATTEMPTS`. When the messenger asks to wait (too
     /// many messages), nothing is sent until then, and that wait is not a
-    /// failed attempt. `stop` is looked at before each send.
-    pub fn send(&mut self, host_now: u64, stop: &AtomicBool) {
+    /// failed attempt. `stop` is looked at before each send. Returns
+    /// whether the stop left notifications waiting.
+    pub fn send(&mut self, host_now: u64, stop: &AtomicBool) -> bool {
         if self.dropped > 0 {
             crate::warn!(
                 "{} notification(s) dropped: {} already wait to be sent",
@@ -78,17 +79,17 @@ impl Outbox {
         }
         let Some(notifier) = &self.notifier else {
             self.queue.clear();
-            return;
+            return false;
         };
         if self.send_after > host_now {
             if self.send_after - host_now <= MAX_NOTIFY_WAIT {
-                return;
+                return false;
             }
             self.send_after = 0;
         }
         while let Some((text, attempts)) = self.queue.first().cloned() {
             if stop.load(Ordering::Relaxed) {
-                break;
+                return true;
             }
             match notifier.send(&text) {
                 Ok(()) => {
@@ -121,6 +122,7 @@ impl Outbox {
                 }
             }
         }
+        false
     }
 }
 
@@ -441,6 +443,19 @@ mod tests {
         r.tape.borrow_mut().stop_after = None;
         r.stop.store(false, Ordering::Relaxed);
         assert_eq!(r.send(T + 120).0, texts(&["b", "c"]));
+    }
+
+    #[test]
+    fn a_stop_during_the_last_send_leaves_nothing_waiting() {
+        let mut r = Run::new();
+        r.queue(&["a"]);
+        r.tape.borrow_mut().stop_after = Some((1, Arc::clone(&r.stop)));
+        assert!(!r.outbox.send(T, &r.stop), "nothing was left waiting");
+        r.stop.store(false, Ordering::Relaxed);
+        r.queue(&["b", "c"]);
+        r.tape.borrow_mut().stop_after = Some((1, Arc::clone(&r.stop)));
+        assert!(r.outbox.send(T + 60, &r.stop), "c waits");
+        assert_eq!(r.outbox.waiting(), 1);
     }
 
     #[test]

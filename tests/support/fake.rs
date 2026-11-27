@@ -180,6 +180,9 @@ pub struct Fake {
     /// Set this flag when a PUT arrives (a stop signal in the middle of a
     /// cycle).
     pub stop_on_put: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Set this flag when a Telegram message arrives (a stop signal while
+    /// the last step of a cycle runs).
+    pub stop_on_message: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Firewall rules.
     pub rules: Vec<Rule>,
     /// `path?query` of every rule lookup.
@@ -728,6 +731,9 @@ fn route(
                 TOKEN
             );
             return reply(500, json, out);
+        }
+        if let Some(flag) = &f.stop_on_message {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
         }
         f.tg_sent.push(body.to_string());
         return reply(200, json, "{\"ok\":true}");

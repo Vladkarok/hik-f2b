@@ -42,6 +42,10 @@ pub const CLOCK_JUMP: i64 = 900;
 const MAX_SEARCHES: usize = 4;
 /// Upper bound on remembered log entries per NVR.
 pub const MAX_SEEN: usize = 50_000;
+/// Upper bound on the NVRs whose cursors are read from a state file. The
+/// lines of further names are not used (the WARNING of `State::load`
+/// counts them). Without it only the file size would bound them.
+pub const MAX_NVRS: usize = 256;
 
 /// What the reader needs from an NVR: its clock and a search of its log.
 pub trait LogSource {
@@ -166,6 +170,11 @@ impl CursorLines {
     /// else whether it was used.
     pub(crate) fn line(&mut self, cursors: &mut Cursors, f: &[&str]) -> Option<bool> {
         let positioned = &mut self.positioned;
+        if let ["nvr" | "seen", name, ..] = f {
+            if !cursors.by_name.contains_key(*name) && cursors.by_name.len() >= MAX_NVRS {
+                return Some(false);
+            }
+        }
         match f {
             ["nvr", name, since, offset] if name_ok(name) => {
                 let offset = match *offset {
@@ -1787,6 +1796,19 @@ mod tests {
             captured_log(),
             vec!["DEBUG nvr1: entry without time or address skipped"]
         );
+    }
+
+    #[test]
+    fn the_nvrs_of_a_state_file_are_bounded() {
+        let mut text = String::from("hik-f2b-state 2\n");
+        for i in 0..=MAX_NVRS {
+            text.push_str(&format!("nvr n{} 1000 0\nseen n{} {:032x} 1\n", i, i, i));
+        }
+        let st = State::parse(&text);
+        assert_eq!(st.cursors.iter().count(), MAX_NVRS);
+        assert!(st.cursors.get(&format!("n{}", MAX_NVRS - 1)).is_some());
+        assert!(st.cursors.get(&format!("n{}", MAX_NVRS)).is_none());
+        assert_eq!(st.cursors[&format!("n{}", MAX_NVRS - 1)].seen(), 1);
     }
 
     #[test]

@@ -28,6 +28,10 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 - The warning about a readable config that holds a password or token
   also counted a `bot_token` in a `[telegram]` section with
   `enabled = no`, which is not used. Only the secrets that are used count.
+- The number of NVRs whose read positions are taken from the state file
+  was bounded only by the size of the file. It is bounded at 256; the
+  lines of further NVRs are not used and are counted in the WARNING about
+  lines that could not be used.
 
 ## [0.5.2] - 2026-11-27
 

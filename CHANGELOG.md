@@ -8,6 +8,18 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 
 ## [Unreleased]
 
+### Fixed
+
+- When the router refused bans with HTTP 400 (not "already listed"),
+  hik-f2b tried every waiting ban in every poll, at two requests each: up to
+  2000 requests per poll with a full queue. Now a poll stops after the
+  router has refused 3 bans and leaves the other waiting bans for the next
+  polls, with one WARNING when this starts. A waiting ban that was not
+  refused yet is tried first, and the refused ones are tried again in turn,
+  so a ban that the router always refuses does not hold back the others.
+  The order is kept in memory only; the state file does not change. The
+  `ban-refused` alert and the periodic firewall check work as before.
+
 ## [0.5.2] - 2026-11-27
 
 ### Changed

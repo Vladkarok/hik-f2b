@@ -38,7 +38,7 @@ use crate::config::{Config, DEFAULT_MESSAGE};
 use crate::country::{self, Code};
 use crate::health::{BanAttempt, BansEnded, Health, Kind, Notice, NvrRead};
 use crate::ignored::IgnoredNames;
-use crate::ledger::{Outcome, Rules, Turn, MAX_USER};
+use crate::ledger::{Outcome, Refusals, Rules, Turn, MAX_REFUSALS_PER_POLL, MAX_USER};
 use crate::names::RESOLVE_EVERY;
 use crate::nvr::{Nvr, NvrError};
 use crate::outbox::Outbox;
@@ -75,6 +75,13 @@ pub struct Engine {
     ignored: IgnoredNames,
     /// The firewall check round, with what it remembers between checks.
     round: Round,
+    /// Which waiting bans the firewall refused, and in which order: the
+    /// order in which they are tried (in memory only).
+    refusals: Refusals,
+    /// Whether the last ban loop that ended on its own left waiting bans
+    /// for the next polls after `MAX_REFUSALS_PER_POLL` refusals: that is
+    /// logged when it starts.
+    deferring: bool,
 }
 
 /// The first grace period (`Engine::grace`) after the engine started. The
@@ -171,6 +178,8 @@ impl Engine {
             own,
             ignored,
             round: Round::new(),
+            refusals: Refusals::default(),
+            deferring: false,
         };
         engine.state.ledger.fit(&Rules::of(
             &engine.cfg,
@@ -461,17 +470,28 @@ impl Engine {
 
     /// Applies waiting bans. The firewall turning out to be unusable
     /// (unreachable, refusing our login or answering with an error) ends the
-    /// attempts for this cycle.
+    /// attempts for this cycle. So do `MAX_REFUSALS_PER_POLL` bans that the
+    /// firewall refused: each costs two requests (see `Mikrotik::ban`), and
+    /// a firewall that refuses one ban mostly refuses all. The bans are
+    /// tried in the order `Refusals` gives, so that the rest are tried in
+    /// the next polls.
     fn flush_pending(&mut self, now: u64) {
         let bantime = self.cfg.bantime;
         let due = self.state.ledger.due(
             &Rules::of(&self.cfg, self.own.set(), self.ignored.addresses()),
             now,
         );
+        let due = self.refusals.order(due);
         let mut end = BansEnded::Complete;
+        let mut refused = 0;
+        let mut deferred = false;
         for ip in due {
             if self.stopping() {
                 end = BansEnded::Stopped;
+                break;
+            }
+            if refused >= MAX_REFUSALS_PER_POLL {
+                deferred = true;
                 break;
             }
             let p = match self.state.ledger.next_ban(
@@ -533,6 +553,8 @@ impl Engine {
                         crate::error!("cannot ban {} on {}, will retry: {}", ip, fw.describe(), e);
                         self.health
                             .ban_tried(BanAttempt::Refused { ip, error: &e }, now);
+                        self.refusals.refused(ip);
+                        refused += 1;
                         (String::new(), Outcome::NotApplied, false)
                     }
                     Err(e) => {
@@ -599,6 +621,9 @@ impl Engine {
                 now,
                 outcome,
             );
+            if outcome != Outcome::NotApplied {
+                self.refusals.forget(ip);
+            }
             if notify {
                 // The flag only goes to the chat.
                 let country = code
@@ -619,6 +644,17 @@ impl Engine {
                 );
                 self.outbox.queue(text);
             }
+        }
+        if end != BansEnded::Stopped {
+            if deferred && !self.deferring {
+                crate::warn!(
+                    "the firewall refused {} bans in this poll: the other waiting bans are left \
+                     for the next polls, which try the bans not refused yet first and the others \
+                     in turn",
+                    MAX_REFUSALS_PER_POLL
+                );
+            }
+            self.deferring = deferred;
         }
         self.health
             .bans_ended(end, self.state.ledger.waiting(), now);

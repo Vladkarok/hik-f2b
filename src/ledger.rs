@@ -25,6 +25,9 @@ pub const MAX_TRACKED: usize = 10_000;
 pub const MAX_FAIL_TIMES: usize = 200_000;
 /// Upper bound on bans waiting to be applied.
 pub const MAX_PENDING: usize = 1000;
+/// The most bans the firewall may refuse in one poll before the other
+/// waiting bans are left for the next polls (see `Refusals`).
+pub const MAX_REFUSALS_PER_POLL: usize = 3;
 /// Failure times kept per address in a state file that is read (the ledger
 /// keeps fewer, see `fail_limits`).
 const MAX_TIMES: usize = 4096;
@@ -679,6 +682,53 @@ impl Ledger {
         for times in self.fails.values_mut() {
             times.sort_unstable();
         }
+    }
+}
+
+/// The order in which the waiting bans are tried while the firewall
+/// refuses some of them (`MAX_REFUSALS_PER_POLL`), kept in memory only: the
+/// state file does not hold it, and after a restart every waiting ban is
+/// one that was not refused yet.
+///
+/// A refusal may be about one address. So a ban that was not refused yet is
+/// tried before the bans that were, and these are tried in turn, the least
+/// recently refused first: while `MAX_REFUSALS_PER_POLL` refusals end each
+/// poll, every waiting ban is tried again within as many polls as it takes
+/// to try all those before it, and no ban that is always refused can keep
+/// the others from being tried.
+#[derive(Debug, Default)]
+pub struct Refusals {
+    /// The address of each waiting ban that was refused, with the number
+    /// of that refusal (`count` then).
+    last: BTreeMap<Ipv4Addr, u64>,
+    /// Refusals so far.
+    count: u64,
+}
+
+impl Refusals {
+    /// The order in which to try `due` (as `Ledger::due` returns them,
+    /// oldest first): the ones not refused yet, oldest first, then the
+    /// others, the least recently refused first. Forgets every address that
+    /// is not in `due`: its ban no longer waits.
+    pub fn order(&mut self, due: Vec<Ipv4Addr>) -> Vec<Ipv4Addr> {
+        let waiting: BTreeSet<Ipv4Addr> = due.iter().copied().collect();
+        self.last.retain(|ip, _| waiting.contains(ip));
+        let (mut refused, new): (Vec<Ipv4Addr>, Vec<Ipv4Addr>) =
+            due.into_iter().partition(|ip| self.last.contains_key(ip));
+        refused.sort_by_key(|ip| self.last[ip]);
+        new.into_iter().chain(refused).collect()
+    }
+
+    /// The firewall refused the ban of `ip`.
+    pub fn refused(&mut self, ip: Ipv4Addr) {
+        self.count += 1;
+        self.last.insert(ip, self.count);
+    }
+
+    /// The ban of `ip` no longer waits (applied, or found listed): a ban
+    /// of it that waits later is a new one.
+    pub fn forget(&mut self, ip: Ipv4Addr) {
+        self.last.remove(&ip);
     }
 }
 
@@ -1510,5 +1560,74 @@ mod tests {
         let loaded = read(&text);
         assert_eq!(loaded, l);
         assert_eq!(lines(&loaded), text);
+    }
+
+    /// Plays `polls` polls of `Refusals` against a firewall that refuses
+    /// the bans of `refused` and accepts the others (which then no longer
+    /// wait), at most `MAX_REFUSALS_PER_POLL` refusals per poll, as the
+    /// engine does. Returns the addresses tried in each poll.
+    fn play(waiting: &[Ipv4Addr], refused: &[Ipv4Addr], polls: usize) -> Vec<Vec<Ipv4Addr>> {
+        let mut r = Refusals::default();
+        let mut waiting = waiting.to_vec();
+        let mut out = Vec::new();
+        for _ in 0..polls {
+            let mut tried = Vec::new();
+            let mut refusals = 0;
+            for ip in r.order(waiting.clone()) {
+                if refusals == MAX_REFUSALS_PER_POLL {
+                    break;
+                }
+                tried.push(ip);
+                if refused.contains(&ip) {
+                    r.refused(ip);
+                    refusals += 1;
+                } else {
+                    waiting.retain(|w| *w != ip);
+                }
+            }
+            out.push(tried);
+        }
+        out
+    }
+
+    #[test]
+    fn bans_not_refused_yet_come_first_then_the_others_in_turn() {
+        let a: Vec<Ipv4Addr> = (1..=7).map(address).collect();
+        let polls = play(&a, &a, 4);
+        assert_eq!(polls[0], a[0..3]);
+        assert_eq!(polls[1], a[3..6]);
+        // the last one not refused yet, then the least recently refused
+        assert_eq!(polls[2], vec![a[6], a[0], a[1]]);
+        assert_eq!(polls[3], vec![a[2], a[3], a[4]]);
+    }
+
+    #[test]
+    fn bans_that_are_always_refused_do_not_hold_back_the_others() {
+        let a: Vec<Ipv4Addr> = (1..=8).map(address).collect();
+        // the two oldest, and three in the middle, are always refused
+        let refused = [a[0], a[1], a[3], a[4], a[5]];
+        let polls = play(&a, &refused, 4);
+        assert_eq!(polls[0], vec![a[0], a[1], a[2], a[3]]);
+        assert_eq!(polls[1], vec![a[4], a[5], a[6], a[7], a[0]]);
+        assert_eq!(polls[2], vec![a[1], a[3], a[4]]);
+        assert_eq!(polls[3], vec![a[5], a[0], a[1]]);
+    }
+
+    #[test]
+    fn a_new_ban_is_tried_before_the_refused_ones_and_gone_ones_are_forgotten() {
+        let (a, b, c) = (address(1), address(2), address(3));
+        let mut r = Refusals::default();
+        assert_eq!(r.order(vec![a, b]), vec![a, b]);
+        r.refused(a);
+        r.refused(b);
+        assert_eq!(r.order(vec![a, b, c]), vec![c, a, b]);
+        r.refused(a);
+        assert_eq!(r.order(vec![a, b, c]), vec![c, b, a]);
+        // b no longer waits: forgotten, a ban of it later is a new one
+        assert_eq!(r.order(vec![a, c]), vec![c, a]);
+        assert_eq!(r.order(vec![a, b, c]), vec![b, c, a]);
+        // a is banned, and waits again before the next poll
+        r.forget(a);
+        assert_eq!(r.order(vec![a, b, c]), vec![a, b, c]);
     }
 }

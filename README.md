@@ -643,7 +643,12 @@ If the address is already in the address-list, the router refuses a second
 entry and hik-f2b counts the address as already banned; it does not change the
 existing entry. Whenever the router refuses an entry and the error is not the
 known duplicate message, hik-f2b asks the router whether the address is
-listed. So this does not depend on the wording of RouterOS error messages. An
+listed. So this does not depend on the wording of RouterOS error messages.
+A refused ban therefore costs two requests. In one poll, hik-f2b tries bans
+until the router has refused 3 of them, and leaves the other waiting bans for
+the next polls; one WARNING says so when this starts. A waiting ban that was
+not refused yet is tried first, and the refused ones are tried again in turn,
+so every waiting ban is tried again within a few polls. An
 address that is still listed with a timeout when you switch to `permanent`
 therefore gets a permanent entry only the next time it is banned, after the
 timed entry has expired. If you want that sooner, remove the timed entry by
@@ -910,7 +915,9 @@ and always in its log. It watches:
 - **Refused bans:** the router answers, but refuses to add an address to the
   address-list (HTTP 400), and the address is not listed. For example, the
   router user's group has lost the `write` policy. The checks every 5 minutes only read, so they cannot clear this
-  problem. Only a ban that the router accepts ends it. If every refused ban
+  problem. They still run while bans are refused. Only a ban that the router
+  accepts ends it. Each poll tries bans until the router has refused 3,
+  and leaves the rest for the next polls. If every refused ban
   expires or is dropped while the problem is alerted, nothing is left to show
   whether it is over. Then hik-f2b sends one message that says so, sends no
   more reminders, and does not claim a recovery. The next refused ban starts

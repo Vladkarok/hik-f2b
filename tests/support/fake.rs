@@ -158,6 +158,9 @@ pub struct Fake {
     /// Answer reads, refuse every PUT: a router user whose group lacks the
     /// `write` policy.
     pub refuse_writes: bool,
+    /// Refuse the bans of these addresses only, as `refuse_writes` does:
+    /// a refusal that is about one address.
+    pub refuse_bans: Vec<String>,
     pub router_requests: u32,
     /// Error detail for a duplicate entry; `None` = today's RouterOS text.
     pub duplicate_text: Option<String>,
@@ -673,7 +676,7 @@ fn route(
                 f.put_log.push((address, "down"));
                 return reply(500, json, "{\"error\":500,\"message\":\"down\"}");
             }
-            if f.refuse_writes {
+            if f.refuse_writes || f.refuse_bans.contains(&address) {
                 let outcome = if listed { "refused-listed" } else { "refused" };
                 f.put_log.push((address, outcome));
                 // RouterOS error format; the detail is the console's text

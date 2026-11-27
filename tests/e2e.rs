@@ -13,6 +13,7 @@ mod mmdb;
 
 use fake::*;
 use hik_f2b::action::{Firewall, Notifier};
+use hik_f2b::ledger::MAX_REFUSALS_PER_POLL;
 use hik_f2b::state::State;
 use hik_f2b::telegram::Telegram;
 use hik_f2b::util;
@@ -2548,6 +2549,156 @@ fn a_refused_ban_costs_two_requests_per_address() {
     drop(f);
     assert_eq!(h.engine.state().ledger.waiting(), 3);
     assert_eq!(h.engine.alerted_problems(), Vec::<String>::new());
+}
+
+/// The addresses `198.51.100.1` to `198.51.100.n` (`n` at most 20), each
+/// with five failed logins, one a second, from 10:01:05 on, so that a poll
+/// at 10:03:00 reads them all: a ban waits for each, the lower address the
+/// older.
+fn waiting_bans(h: &Harness, n: usize) -> Vec<String> {
+    (1..=n)
+        .map(|i| {
+            let address = format!("198.51.100.{}", i);
+            for k in 0..5 {
+                let second = 65 + (i - 1) * 5 + k;
+                h.add(
+                    &format!("10:{:02}:{:02}", second / 60, second % 60),
+                    &address,
+                );
+            }
+            address
+        })
+        .collect()
+}
+
+/// The addresses of the ban requests the router got since the last call,
+/// with how each ended (see `Fake::put_log`).
+fn ban_requests(h: &Harness) -> Vec<(String, &'static str)> {
+    std::mem::take(&mut h.fake.lock().unwrap().put_log)
+}
+
+/// Issue 7: a router that refuses every ban with HTTP 400. Each refusal
+/// costs two requests (the ban, then the look-up), so a poll tries at most
+/// `MAX_REFUSALS_PER_POLL` of the waiting bans and leaves the rest for the
+/// next polls, which go on where it stopped. One line says so, when it
+/// starts.
+#[test]
+fn refused_bans_cost_a_bounded_number_of_requests_per_poll() {
+    let mut h = Harness::new(false);
+    h.fake.lock().unwrap().refuse_writes = true;
+    let addresses = waiting_bans(&h, 20);
+    util::capture_log();
+    let before = h.fake.lock().unwrap().rest_requests;
+    h.cycle("10:03:00");
+    let f = h.fake.lock().unwrap();
+    assert_eq!(f.rest_requests - before, 2 * MAX_REFUSALS_PER_POLL as u32);
+    assert_eq!(f.lookups.len(), MAX_REFUSALS_PER_POLL);
+    drop(f);
+    assert_eq!(h.engine.state().ledger.waiting(), 20);
+    let tried: Vec<String> = ban_requests(&h).into_iter().map(|(a, _)| a).collect();
+    assert_eq!(tried, addresses[..MAX_REFUSALS_PER_POLL]);
+    // the next polls take the others in turn, then start again
+    let mut seen = tried;
+    for _ in 0..6 {
+        h.advance(30);
+        let tried: Vec<String> = ban_requests(&h).into_iter().map(|(a, _)| a).collect();
+        assert_eq!(tried.len(), MAX_REFUSALS_PER_POLL, "{:?}", tried);
+        seen.extend(tried);
+    }
+    assert_eq!(seen[..20], addresses[..]);
+    assert_eq!(seen[20..], addresses[..1]);
+    let log = util::captured_log();
+    let line = format!(
+        "WARNING the firewall refused {} bans in this poll: the other waiting bans are left \
+         for the next polls, which try the bans not refused yet first and the others in turn",
+        MAX_REFUSALS_PER_POLL
+    );
+    assert_eq!(exactly(&log, &line), 1, "{:?}", log);
+    // a refusal is an answer of the router: the periodic firewall check
+    // is not skipped (it ran at 10:05:00 and is due again at 10:10:00)
+    let checks = h.fake.lock().unwrap().rule_queries.len();
+    run(&mut h, 4, 60); // 10:10:00
+    assert!(h.fake.lock().unwrap().rule_queries.len() > checks);
+    // writes are allowed again: every waiting ban is applied in one poll
+    h.fake.lock().unwrap().refuse_writes = false;
+    h.advance(30);
+    assert_eq!(h.engine.state().ledger.waiting(), 0);
+    assert_eq!(h.banned().len(), 20);
+}
+
+/// Issue 7: a refusal can be about one address. Five addresses whose bans
+/// are always refused are the oldest; they keep neither the others from
+/// being banned nor each other from being tried again.
+#[test]
+fn bans_refused_for_some_addresses_do_not_hold_back_the_others() {
+    let mut h = Harness::new(false);
+    let addresses = waiting_bans(&h, 9);
+    let (poisoned, others) = addresses.split_at(5);
+    h.fake.lock().unwrap().refuse_bans = poisoned.to_vec();
+    h.cycle("10:03:00");
+    let first = ban_requests(&h);
+    assert_eq!(
+        first,
+        poisoned[..MAX_REFUSALS_PER_POLL]
+            .iter()
+            .map(|a| (a.clone(), "refused"))
+            .collect::<Vec<_>>()
+    );
+    // the bans not refused yet come first: the two other refused ones and
+    // the four that the router accepts, then the least recently refused
+    h.advance(30);
+    let second = ban_requests(&h);
+    let expected: Vec<(String, &str)> = poisoned[MAX_REFUSALS_PER_POLL..]
+        .iter()
+        .map(|a| (a.clone(), "refused"))
+        .chain(others.iter().map(|a| (a.clone(), "accepted")))
+        .chain([(poisoned[0].clone(), "refused")])
+        .collect();
+    assert_eq!(second, expected);
+    assert_eq!(h.banned(), others);
+    // the refused ones in turn, the least recently refused first
+    let mut retried = Vec::new();
+    for _ in 0..2 {
+        h.advance(30);
+        let tried = ban_requests(&h);
+        assert_eq!(tried.len(), MAX_REFUSALS_PER_POLL, "{:?}", tried);
+        retried.extend(tried.into_iter().map(|(a, _)| a));
+    }
+    let mut expected = poisoned[1..].to_vec();
+    expected.extend(poisoned[..2].iter().cloned());
+    assert_eq!(retried, expected);
+    assert_eq!(h.engine.state().ledger.waiting(), 5);
+}
+
+/// Issue 7: what was refused is kept in memory only. After a restart the
+/// waiting bans are all new to the engine and are tried oldest first, the
+/// cap still holds, and every one is tried within a few polls.
+#[test]
+fn a_restart_keeps_refused_bans_waiting_and_takes_them_in_turn_again() {
+    let mut h = Harness::new(false);
+    h.fake.lock().unwrap().refuse_writes = true;
+    let addresses = waiting_bans(&h, 7);
+    h.cycle("10:03:00");
+    h.advance(30);
+    let before: Vec<String> = ban_requests(&h).into_iter().map(|(a, _)| a).collect();
+    assert_eq!(before[..], addresses[..2 * MAX_REFUSALS_PER_POLL]);
+    let saved = h.engine.state().serialize();
+    h.restart();
+    assert_eq!(h.engine.state().serialize(), saved);
+    assert_eq!(h.engine.state().ledger.waiting(), 7);
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        h.advance(30);
+        let tried = ban_requests(&h);
+        assert!(tried.len() <= MAX_REFUSALS_PER_POLL, "{:?}", tried);
+        seen.extend(tried.into_iter().map(|(a, _)| a));
+    }
+    assert_eq!(seen[..7], addresses[..]);
+    h.fake.lock().unwrap().refuse_writes = false;
+    h.advance(30);
+    let mut banned = h.banned();
+    banned.sort_by_key(|a| ip(a));
+    assert_eq!(banned, addresses);
 }
 
 #[test]

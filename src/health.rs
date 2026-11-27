@@ -368,7 +368,10 @@ enum SafeWrite<'a> {
 /// How the ban loop of a poll ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BansEnded {
-    /// Every due ban was tried.
+    /// Every due ban was tried, or the loop ended after
+    /// `ledger::MAX_REFUSALS_PER_POLL` refusals and left the rest for the
+    /// next polls. Either way the rate limit held no ban back and the
+    /// firewall answered every ban that was tried.
     Complete,
     /// `max_bans_per_hour` was reached with bans still due.
     RateLimited,

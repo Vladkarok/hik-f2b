@@ -29,7 +29,11 @@
 //!   below and above the thresholds the engine treats as a jump, a DST
 //!   change, an RTC reset to 2000-01-01 and its correction, and the end of
 //!   DST on an NVR that cannot be reached for an hour while failed logins
-//!   are logged (they are read only after the step).
+//!   are logged (they are read only after the step). Also floods as in
+//!   `Backlog`, some of them dense (30 to 45 entries a second), and some
+//!   followed after a few polls by the end of DST on that NVR, so that a
+//!   resync after a step, or a first poll, finds more entries than one poll
+//!   reads.
 //!
 //! Every class also has failed logins from the host's own address (`OWN`,
 //! the address the harness reaches every device from): with hik-f2b's user
@@ -91,6 +95,9 @@
 //!   engine read at that poll (the fake's skew); several entries share a
 //!   device time only after a device clock went back, and then at most as
 //!   many are counted as were logged.
+//! - `count/cut` (all): no failed login of an NVR is counted from a poll
+//!   whose resync (or first poll) could not read its whole window (its
+//!   WARNING) until a resync reads it whole (its INFO line).
 //! - `count/shift` (all): a failed login is counted at a host time that
 //!   differs from its true host time by at most what the engine allows:
 //!   `CLOCK_JUMP` for each change of the NVR's offset the engine stored
@@ -555,6 +562,10 @@ struct NvrSim {
     offset_changes: usize,
     started: bool,
     last_flood: i64,
+    /// Since when (cycle, host time) a resync whose read was cut is due.
+    cut: Option<(usize, i64)>,
+    /// Polls of this NVR that read while such a resync was due.
+    cut_polls: usize,
     /// Host times of its entries, in the order written (ascending).
     times: Vec<i64>,
 }
@@ -665,6 +676,10 @@ enum Line {
     Dropped(Ipv4Addr),
     Skipped(usize, i64, i64),
     SkippedAll(usize),
+    /// A resync (or first poll) that could not read its whole window, and
+    /// one that read it whole.
+    ResyncCut(usize),
+    Resynced(usize),
     Notice(String),
     /// A failed login said to come from an own address.
     OwnLogin(Ipv4Addr),
@@ -860,6 +875,17 @@ fn classify(line: &str) -> Line {
     }
     if let Some((nvr, rest)) = text.split_once(": ") {
         if let Some(n) = nvr_index(nvr) {
+            if rest.contains(
+                "than one read returns, so not all of them can be recorded as already seen; ",
+            ) {
+                return Line::ResyncCut(n);
+            }
+            if rest.starts_with("first run, watching log entries from ")
+                || rest.ends_with(" existing log entry recorded as already seen")
+                || rest.ends_with(" existing log entries recorded as already seen")
+            {
+                return Line::Resynced(n);
+            }
             for marker in ["SKIPPING the log window ", "not every log entry in "] {
                 if let Some((from, to)) = skipped(rest, marker) {
                     return Line::Skipped(n, from, to);
@@ -1166,6 +1192,11 @@ struct Sim {
     /// because bans waited.
     write_withdrawn: usize,
     write_held: usize,
+    /// Resyncs whose read was cut: how many, and the most polls and host
+    /// seconds one lasted.
+    cuts: usize,
+    cut_polls: usize,
+    cut_seconds: i64,
     /// The safe list, if the scenario has one.
     safe: Option<SafeSim>,
     /// The host name in `ignoreip`, if the scenario has one, and the
@@ -1252,6 +1283,8 @@ impl Sim {
                 offset_changes: 0,
                 started: false,
                 last_flood: i64::MIN / 2,
+                cut: None,
+                cut_polls: 0,
                 times: Vec::new(),
             })
             .collect();
@@ -1288,6 +1321,9 @@ impl Sim {
             server_error: false,
             write_withdrawn: 0,
             write_held: 0,
+            cuts: 0,
+            cut_polls: 0,
+            cut_seconds: 0,
             safe,
             name,
             name_rng,
@@ -1820,6 +1856,9 @@ impl Sim {
             table.push((5, Kind::Flood));
         }
         if class == Class::Clock {
+            table.push((2, Kind::Flood));
+        }
+        if class == Class::Clock {
             table.push((10, Kind::Clock));
         }
         table.push((3, Kind::Own));
@@ -2063,15 +2102,20 @@ impl Sim {
     fn flood(&mut self) -> Result<(), String> {
         let n = self.rng.below(self.p.nvrs as u64) as usize;
         if self.host - self.nvr[n].last_flood < 7400 {
-            // one flood per findtime + lookback at most: the window holds
-            // what four searches read
+            // one flood per findtime + lookback at most: in `Backlog` the
+            // window holds what four searches read
             self.host += 30;
             self.note("poll after 30s".to_string());
             return self.cycle();
         }
         self.nvr[n].last_flood = self.host;
+        let clock = self.p.class == Class::Clock;
         let size = self.rng.range(3300, 7000);
-        let rate = self.rng.range(4, 8);
+        let rate = if clock && self.rng.chance(50) {
+            self.rng.range(30, 45)
+        } else {
+            self.rng.range(4, 8)
+        };
         let duration = size / rate;
         let mut items: Vec<(i64, String, &str, Option<Ipv4Addr>)> = Vec::new();
         for i in 0..size {
@@ -2085,9 +2129,14 @@ impl Sim {
             }
         }
         let mut attackers = Vec::new();
-        for _ in 0..self.rng.range(0, 2) {
+        // in `Clock` also late in the flood, where a resync after a step
+        // back reads it last
+        for _ in 0..self.rng.range(i64::from(clock), 2) {
             let address = self.rng.pick(&PERSISTENT);
-            let from = self.host + self.rng.range(0, duration / 2);
+            let from = self.host
+                + self
+                    .rng
+                    .range(0, if clock { duration } else { duration / 2 });
             for k in 0..self.p.maxretry as i64 + 1 {
                 items.push((
                     from + 3 * k,
@@ -2110,6 +2159,16 @@ impl Sim {
         self.host += duration;
         if self.rng.chance(50) {
             self.restart()?;
+        }
+        if clock && self.rng.chance(50) {
+            // the end of DST soon after: the flood, read now, lies ahead of
+            // the new time
+            for _ in 0..self.rng.range(1, 4) {
+                self.host += 30;
+                self.note("poll after 30s".to_string());
+                self.cycle()?;
+            }
+            self.step_clock(n, -3600);
         }
         Ok(())
     }
@@ -2309,8 +2368,36 @@ impl Sim {
                 }
                 Line::NameLog(text) => about_name.push(text),
                 Line::Counted(n, ip, ts) => {
+                    if let Some((_, since)) = self.nvr[n].cut {
+                        return Err(format!(
+                            "[count/cut] a failed login of {} on {} was counted while a resync \
+                             whose read was cut was due (since +{}s)",
+                            ip,
+                            self.nvr[n].name,
+                            since - self.t0
+                        ));
+                    }
                     self.on_count(n, ip, ts)?;
                     events.push(format!("{}+1", ip));
+                }
+                Line::ResyncCut(n) => {
+                    if self.nvr[n].cut.is_none() {
+                        self.nvr[n].cut = Some((index, self.host));
+                        self.nvr[n].cut_polls = 0;
+                        self.cuts += 1;
+                    }
+                    events.push(format!("nvr{} resync cut", n + 1));
+                }
+                Line::Resynced(n) => {
+                    if let Some((_, since)) = self.nvr[n].cut.take() {
+                        self.cut_polls = self.cut_polls.max(self.nvr[n].cut_polls + 1);
+                        self.cut_seconds = self.cut_seconds.max(self.host - since);
+                        events.push(format!(
+                            "nvr{} resync whole after {} poll(s)",
+                            n + 1,
+                            self.nvr[n].cut_polls + 1
+                        ));
+                    }
                 }
                 Line::Bypass(ip) => {
                     if !self.listed(&ip.to_string()) {
@@ -2419,6 +2506,11 @@ impl Sim {
             self.on_request(ip, "ban request")?;
             if !["refused", "down", "status"].contains(&outcome) {
                 cycle.router_pass = true;
+            }
+        }
+        for nvr in self.nvr.iter_mut() {
+            if nvr.cut.is_some_and(|(at, _)| at < index) && nvr.mode == Mode::Ok {
+                nvr.cut_polls += 1;
             }
         }
         self.name_logged(&about_name, &expected)?;
@@ -3156,8 +3248,10 @@ fn run_class(class: Class) {
     // (after they left its answer), scenarios with the router answering
     // bans with HTTP 500, those with a ban that got it, notices that
     // withdrew the firewall problem, checks that worked while only failed
-    // bans had shown it (withdrawing it, or leaving it open)
-    let mut stats = [0usize; 21];
+    // bans had shown it (withdrawing it, or leaving it open), scenarios
+    // with a resync whose read was cut, such resyncs, the most polls and
+    // host seconds one lasted
+    let mut stats = [0usize; 25];
     for &seed in &seeds {
         let mut sim = Sim::new(seed);
         let result = match catch_unwind(AssertUnwindSafe(|| sim.run())) {
@@ -3209,9 +3303,17 @@ fn run_class(class: Class) {
                 .count(),
             sim.write_withdrawn,
             sim.write_held,
+            usize::from(sim.cuts > 0),
+            sim.cuts,
+            0,
+            0,
         ];
-        for (total, n) in stats.iter_mut().zip(seen) {
-            *total += n;
+        for (i, (total, n)) in stats.iter_mut().zip(seen).enumerate() {
+            match i {
+                23 => *total = (*total).max(sim.cut_polls),
+                24 => *total = (*total).max(sim.cut_seconds as usize),
+                _ => *total += n,
+            }
         }
         match result {
             Err(violation) => failures.push(sim.report(&violation)),
@@ -3228,8 +3330,9 @@ fn run_class(class: Class) {
          list in {} scenario(s) ({} write(s)), ignoreip name in {} scenario(s) ({} look-up(s), \
          {} change(s), {} ban(s) or report(s) of its addresses), bans answered with HTTP 500 \
          in {} scenario(s) ({} with a failed ban), firewall problem withdrawn {} time(s) with a \
-         notice ({} withdrawn, {} left open by a check that worked); peak fake threads {} (at \
-         most {}){}",
+         notice ({} withdrawn, {} left open by a check that worked), a resync with its read \
+         cut in {} scenario(s) ({} such resync(s), the longest {} poll(s) or {} s); peak fake \
+         threads {} (at most {}){}",
         class,
         seeds.len(),
         stats[0],
@@ -3255,6 +3358,10 @@ fn run_class(class: Class) {
         stats[18],
         stats[19],
         stats[20],
+        stats[21],
+        stats[22],
+        stats[23],
+        stats[24],
         fake::peak_threads(),
         MAX_FAKE_THREADS,
         conntrack

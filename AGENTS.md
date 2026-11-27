@@ -36,7 +36,8 @@ Before a release, also run
   `hik-f2b.example.ini`. Its exception lists are in `docs-check.py`.
 - To run the guard on every commit and push, enable the hooks once:
   `git config core.hooksPath .githooks`. If the push changes Rust code and
-  cargo is installed, the pre-push hook also runs `cargo fmt --check`.
+  cargo is installed, the pre-push hook also runs `cargo fmt --check` on the
+  pushed commit, not on the working tree.
 - `release-verify.sh` checks a published release in the registry; the
   release workflow runs it, and its header shows how to run it by hand.
 - To add your own private strings, name a file outside the repository:

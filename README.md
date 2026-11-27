@@ -1420,6 +1420,14 @@ written to the router. The two cases that 0.5.2 fixes were not made to happen
 on these devices: the router did not answer a ban with an error, and no NVR
 clock changed. Only the tests and the simulation make them happen.
 
+Release candidate 0.6.0-rc.1 (the published `linux/amd64` image) was run on
+27 November 2026 the same way, with the config of two NVRs unchanged.
+`--check` passed, `--dump` for 72 hours printed the same lines as 0.5.2, and
+a 200-second dry run on a copy of the state file had no warnings. Nothing was
+written to the router. What 0.6.0 changes was not made to happen on these
+devices: the router refused no ban, no second of an NVR's log held more
+entries than one search returns, and the state was far from its bounds.
+
 CI (GitHub Actions) tries the deploy files on every push, with a dummy config
 only: the router and the NVR are addresses that nothing answers, the secrets
 are dummy values.

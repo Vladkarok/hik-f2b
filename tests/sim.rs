@@ -84,6 +84,15 @@
 //!   so its true time is at most `findtime` plus its shift before the poll.)
 //! - `safety/rate` (all): at most `max_bans_per_hour` bans and reports in
 //!   any hour, across restarts.
+//! - `bans/refused` (all): at most `MAX_REFUSALS_PER_POLL` ban requests of
+//!   a cycle are refused, and at most one finds the router unusable.
+//!   `bans/order` (all): a waiting ban that the engine running now has not
+//!   had refused is asked before any that it has, and those are asked in
+//!   the order of their last refusal (the model keeps that order as the
+//!   engine does, in memory: a restart forgets it). `bans/all` (all with a
+//!   router but `DryRun`): a cycle with fewer refusals than that, no
+//!   ban request that found the router unusable (or unreachable) and no
+//!   rate limit has asked for every ban that still waits after it.
 //! - `state` (all): the state loads back from its file format to the same
 //!   state after every cycle (and through the file on every restart);
 //!   `caps` (all): the bounded collections stay within their bounds.
@@ -228,7 +237,7 @@
 mod fake;
 
 use fake::{Entry, Fake, Harness, Opts, SKEW};
-use hik_f2b::ledger::Ledger;
+use hik_f2b::ledger::{Ledger, MAX_REFUSALS_PER_POLL};
 use hik_f2b::names::RESOLVE_EVERY;
 use hik_f2b::reader::{CLOCK_JUMP, MAX_SEEN};
 use hik_f2b::state::State;
@@ -1155,6 +1164,11 @@ struct Sim {
     expiry: Vec<(String, i64)>,
     gens: Vec<Gen>,
     by_ip: HashMap<Ipv4Addr, Vec<usize>>,
+    /// The addresses whose bans the engine running now got refused and
+    /// that still wait, each with the number of its last refusal (as
+    /// `ledger::Refusals` keeps them), and the number of refusals so far.
+    refusals: HashMap<Ipv4Addr, u64>,
+    refusal_count: u64,
     unsorted: bool,
     cycles: Vec<Cycle>,
     /// The failed logins logged after the start, by (nvr, address, device
@@ -1303,6 +1317,8 @@ impl Sim {
             expiry: Vec::new(),
             gens: Vec::new(),
             by_ip: HashMap::new(),
+            refusals: HashMap::new(),
+            refusal_count: 0,
             unsorted: false,
             cycles: Vec::new(),
             generated: HashMap::new(),
@@ -2077,6 +2093,8 @@ impl Sim {
         self.note(format!("restart, {}", what));
         self.h.restart();
         self.instance += 1;
+        // kept in memory only: a new engine knows of no refusal
+        self.refusals.clear();
         self.configs.push(self.nets.clone());
         self.health = Health::default();
         self.last_bypass = None;
@@ -2498,6 +2516,7 @@ impl Sim {
                 Line::ListSizeFailed => sizes.push(None),
             }
         }
+        let mut requested = Vec::new();
         for (address, outcome) in puts {
             let ip: Ipv4Addr = match address.parse() {
                 Ok(ip) => ip,
@@ -2507,7 +2526,9 @@ impl Sim {
             if !["refused", "down", "status"].contains(&outcome) {
                 cycle.router_pass = true;
             }
+            requested.push((ip, outcome));
         }
+        self.ban_turns(&requested, limited || cycle.transport)?;
         for nvr in self.nvr.iter_mut() {
             if nvr.cut.is_some_and(|(at, _)| at < index) && nvr.mode == Mode::Ok {
                 nvr.cut_polls += 1;
@@ -2898,6 +2919,88 @@ impl Sim {
     }
 
     /// A ban request or report for `ip`: exempt, or not backed by the log?
+    /// `bans/refused`, `bans/order`, `bans/all`: the ban requests of a
+    /// cycle, in the order sent, with how the fake router answered each
+    /// (a request whose connection it dropped is not among them); `cut`:
+    /// the cycle hit the rate limit or found the router unusable.
+    fn ban_turns(&mut self, requested: &[(Ipv4Addr, &str)], cut: bool) -> Result<(), String> {
+        let refused = requested.iter().filter(|(_, o)| *o == "refused").count();
+        let failed = requested
+            .iter()
+            .filter(|(_, o)| ["down", "status"].contains(o))
+            .count();
+        if refused > MAX_REFUSALS_PER_POLL {
+            return Err(format!(
+                "[bans/refused] {} ban requests refused in one cycle, at most {}",
+                refused, MAX_REFUSALS_PER_POLL
+            ));
+        }
+        if failed > 1 {
+            return Err(format!(
+                "[bans/refused] {} ban requests in one cycle found the router unusable, at most 1",
+                failed
+            ));
+        }
+        let ledger = &self.h.engine.state().ledger;
+        let asked: HashSet<Ipv4Addr> = requested.iter().map(|(ip, _)| *ip).collect();
+        let waiting: Vec<Ipv4Addr> = self
+            .by_ip
+            .keys()
+            .copied()
+            .filter(|ip| ledger.is_waiting(*ip))
+            .collect();
+        // A ban not refused yet is asked before the refused ones, and these
+        // the least recently refused first.
+        let first_refused = requested
+            .iter()
+            .filter_map(|(ip, _)| self.refusals.get(ip))
+            .max()
+            .copied();
+        if let Some(latest) = first_refused {
+            for ip in &waiting {
+                if asked.contains(ip) {
+                    continue;
+                }
+                match self.refusals.get(ip) {
+                    None => {
+                        return Err(format!(
+                            "[bans/order] {} waits and was not refused yet, but a ban refused \
+                             before was asked instead",
+                            ip
+                        ))
+                    }
+                    Some(seq) if *seq < latest => {
+                        return Err(format!(
+                            "[bans/order] {} was refused before a ban that was asked again, \
+                             but was not asked",
+                            ip
+                        ))
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        // Fewer refusals than the cap, the router usable, no rate limit:
+        // every ban that still waits was asked.
+        if refused < MAX_REFUSALS_PER_POLL && failed == 0 && !cut && !self.p.report_once() {
+            if let Some(ip) = waiting.iter().find(|ip| !asked.contains(ip)) {
+                return Err(format!(
+                    "[bans/all] {} waits but was not asked, with {} refusal(s) in the cycle",
+                    ip, refused
+                ));
+            }
+        }
+        for (ip, outcome) in requested {
+            if *outcome == "refused" {
+                self.refusal_count += 1;
+                self.refusals.insert(*ip, self.refusal_count);
+            }
+        }
+        let still: HashSet<Ipv4Addr> = waiting.into_iter().collect();
+        self.refusals.retain(|ip, _| still.contains(ip));
+        Ok(())
+    }
+
     fn on_request(&self, ip: Ipv4Addr, what: &str) -> Result<(), String> {
         self.named_exempt(ip, what)?;
         if exempt(&self.nets, ip) {

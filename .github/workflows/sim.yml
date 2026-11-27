@@ -42,11 +42,14 @@ concurrency:
 jobs:
   sim:
     runs-on: ubuntu-24.04
-    # Measured here on 2026-11-21: 4000 seeds per class took 7.5 to 10.5
-    # minutes for the test (the Backlog class the longest; runners differ
-    # in speed) and 9 to 12 for the job. SIM_TIME_LIMIT (minutes,
-    # the test alone) stops the test before the job's timeout, so that the
-    # job summary is still written; the build takes a few minutes more.
+    # Measured here on 2026-11-27: 4000 seeds per class took 46 minutes for
+    # the test (the Clock class the longest, since its scenarios flood NVRs
+    # whose clock steps) and 47 for the job. Before the Clock class had
+    # floods it was 7.5 to 10.5 minutes for the test (2026-11-21, the
+    # Backlog class the longest; runners differ in speed). SIM_TIME_LIMIT
+    # (minutes, the test alone) stops the test before the job's timeout, so
+    # that the job summary is still written; the build takes a few minutes
+    # more.
     timeout-minutes: 90
     defaults:
       run:

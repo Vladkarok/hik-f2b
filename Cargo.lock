@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "hik-f2b"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "md-5",
  "regex-lite",

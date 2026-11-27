@@ -8,6 +8,15 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-27
+
+### Changed
+
+- A config may have at most 8 `[nvr:<name>]` sections: with more, hik-f2b
+  does not start, and `--check` says so (see the entry about issue 9 below).
+  This is why the second number of the version changes. A config with up to
+  8 NVRs needs no change.
+
 ### Fixed
 
 - When the router refused bans with HTTP 400 (not "already listed"),
@@ -604,7 +613,8 @@ be built from source.
   a sandboxed systemd unit, unit and end-to-end tests, CI, and documentation
   in English and Ukrainian.
 
-[Unreleased]: https://github.com/Vladkarok/hik-f2b/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/Vladkarok/hik-f2b/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/Vladkarok/hik-f2b/compare/v0.5.2...v0.6.0
 [0.5.2]: https://github.com/Vladkarok/hik-f2b/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/Vladkarok/hik-f2b/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/Vladkarok/hik-f2b/compare/v0.4.1...v0.5.0

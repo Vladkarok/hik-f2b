@@ -37,6 +37,11 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
   time-shaped in it, also free text such as `description`. Now only a
   field whose name holds `time` or `date` is used. The tested firmware
   writes `StartDateTime` and is not affected.
+- A stop waited for the read of an NVR to end: with an NVR that answers
+  many result pages, each just under the request timeout of 25 s, up to
+  200 pages (about 80 minutes), far beyond the 60 s stop timeout of the
+  files in `deploy/`. A stop now ends the search after the result page
+  under way; the read position of that NVR stays where it was.
 
 ## [0.5.2] - 2026-11-27
 

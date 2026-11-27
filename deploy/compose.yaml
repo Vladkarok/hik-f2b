@@ -40,8 +40,9 @@ services:
     # On a stop, hik-f2b finishes the step of the poll it is in, saves its
     # state and exits. The longest step it cannot interrupt is one ban sent
     # to a router that does not answer: the request and the lookup that may
-    # follow it, 25 s each (http::DEFAULT_TIMEOUT in the source). 60 s covers
-    # this and the save; the default of 10 s does not.
+    # follow it, 25 s each (http::DEFAULT_TIMEOUT in the source). A search of
+    # an NVR log stops after the result page under way. 60 s covers this and
+    # the save; the default of 10 s does not.
     stop_grace_period: 60s
     volumes:
       - ./hik-f2b.ini:/etc/hik-f2b/hik-f2b.ini:ro,Z

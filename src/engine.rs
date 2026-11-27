@@ -154,10 +154,16 @@ impl Engine {
         own: OwnAddresses,
         ignored: IgnoredNames,
     ) -> Result<Engine, String> {
+        let stop = Arc::new(AtomicBool::new(false));
         let readers = cfg
             .nvrs
             .iter()
-            .map(|nvr| Nvr::new(nvr).map(|client| LogReader::new(&nvr.name, client)))
+            .map(|nvr| {
+                Nvr::new(nvr).map(|mut client| {
+                    client.stop_on(Arc::clone(&stop));
+                    LogReader::new(&nvr.name, client)
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
         let template = cfg
             .telegram
@@ -173,7 +179,7 @@ impl Engine {
             outbox: Outbox::new(notifier),
             template,
             country_failure: None,
-            stop: Arc::new(AtomicBool::new(false)),
+            stop,
             startup: Startup::NotPolled,
             own,
             ignored,
@@ -414,6 +420,13 @@ impl Engine {
                 Poll::BackingOff => {
                     self.health
                         .nvr_polled(self.readers[i].name(), NvrRead::NotTried, host_now);
+                }
+                // A stop ended the read between two result pages: the
+                // NVR was not read, its cursor stays where it was.
+                Poll::Failed(NvrError::Other(_)) if self.stopping() => {
+                    self.health
+                        .nvr_polled(self.readers[i].name(), NvrRead::NotTried, host_now);
+                    break;
                 }
                 Poll::Failed(NvrError::Auth(e)) => {
                     crate::error!(

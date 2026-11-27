@@ -5,6 +5,8 @@ use crate::{http, util};
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::net::IpAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Per page. With `MAX_PAGES` and `MAX_EVENTS` this keeps one poll within a
 /// few MiB however the device (or whoever answers in its place) behaves.
@@ -587,6 +589,9 @@ pub struct Nvr {
     pub url: String,
     agent: ureq::Agent,
     auth: DigestAuth,
+    /// The service's stop flag (`stop_on`), looked at before each result
+    /// page; none for `--check` and `--dump`.
+    stop: Option<Arc<AtomicBool>>,
 }
 
 impl Nvr {
@@ -597,7 +602,15 @@ impl Nvr {
             agent: http::agent(&cfg.url, cfg.ca_file.as_deref(), http::DEFAULT_TIMEOUT)
                 .map_err(|e| format!("nvr {}: {}", cfg.name, e))?,
             auth: DigestAuth::new(&cfg.user, &cfg.password),
+            stop: None,
         })
+    }
+
+    /// Ends a search with an error when `flag` is set before one of its
+    /// pages is asked for, so that a stop does not wait for the rest of a
+    /// search of many pages: only for the page under way.
+    pub fn stop_on(&mut self, flag: Arc<AtomicBool>) {
+        self.stop = Some(flag);
     }
 
     /// One ISAPI request with Digest authentication. At most three requests
@@ -740,6 +753,13 @@ impl Nvr {
         let id = util::random_hex();
         let search_id = format!("{}-0000-4000-8000-{}0000", &id[..8], &id[8..16]);
         for _ in 0..max_pages {
+            if self
+                .stop
+                .as_ref()
+                .is_some_and(|s| s.load(Ordering::Relaxed))
+            {
+                return Err(NvrError::Other("stop requested".to_string()));
+            }
             let body = format!(
                 "<?xml version=\"1.0\" encoding=\"utf-8\"?><CMSearchDescription>\
                  <searchID>{}</searchID><metaId>{}</metaId><timeSpanList><timeSpan>\

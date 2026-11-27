@@ -183,6 +183,9 @@ pub struct Fake {
     /// Set this flag when a Telegram message arrives (a stop signal while
     /// the last step of a cycle runs).
     pub stop_on_message: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Set this flag when a log search request arrives (a stop signal
+    /// while an NVR is read).
+    pub stop_on_search: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Firewall rules.
     pub rules: Vec<Rule>,
     /// `path?query` of every rule lookup.
@@ -504,6 +507,9 @@ fn route(
         }
         if path == "/ISAPI/ContentMgmt/logSearch" && method == "POST" {
             f.search_requests += 1;
+            if let Some(flag) = &f.stop_on_search {
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             let out = match f.raw_pages.pop_front() {
                 Some(raw) => raw,
                 None => search_page(&mut f, body),

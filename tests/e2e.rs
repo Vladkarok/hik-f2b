@@ -1489,6 +1489,38 @@ fn a_stop_after_the_last_step_of_a_cycle_skips_nothing() {
     );
 }
 
+/// A stop that arrives while an NVR answers a search of many pages ends
+/// the paging after the page under way: the poll of that NVR is not tried,
+/// its cursor stays where it was, and the next start reads the window.
+#[test]
+fn a_stop_ends_the_paging_of_a_search() {
+    let mut h = Harness::new(false);
+    h.cycle("10:00:00");
+    let start = util::parse_ts(&format!("{}10:00:30", DAY)).unwrap();
+    for n in 0..350 {
+        Harness::add_at(&h.fake, &device(start + n / 4), "192.168.1.50");
+    }
+    h.burst("10:02", ATTACKER, 5);
+    let since = h.since("nvr1");
+    let stop = h.engine.stop_flag();
+    h.fake.lock().unwrap().stop_on_search = Some(stop.clone());
+    let before = h.fake.lock().unwrap().search_requests;
+    util::capture_log();
+    h.cycle("10:03:00");
+    assert_eq!(h.fake.lock().unwrap().search_requests - before, 1);
+    assert_eq!(h.since("nvr1"), since);
+    assert_eq!(h.fails(ATTACKER), 0);
+    let log = util::captured_log();
+    assert_eq!(logged(&log, "poll failed"), 0, "{:?}", log);
+    assert_eq!(logged(&log, "stop requested"), 1, "{:?}", log);
+    // the next start reads all of it
+    h.fake.lock().unwrap().stop_on_search = None;
+    stop.store(false, Ordering::SeqCst);
+    h.restart();
+    h.advance(30);
+    assert_eq!(h.banned(), vec![ATTACKER]);
+}
+
 /// `Engine::run` saves the state of a cycle that a stop cut short, and does
 /// not start another.
 #[test]

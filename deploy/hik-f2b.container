@@ -51,7 +51,8 @@ NoNewPrivileges=true
 # saves its state and exits. The longest step it cannot interrupt is one ban
 # sent to a router that does not answer: the request and the lookup that may
 # follow it, 25 s each (http::DEFAULT_TIMEOUT in the source). An NVR that
-# does not answer ends its poll after one such request. 60 s covers this and
+# does not answer ends its poll after one such request, and a search of its
+# log stops after the result page under way. 60 s covers this and
 # the save; Podman's default of 10 s does not. It stays below systemd's
 # TimeoutStopSec (90 s by default). It is set here because the Quadlet of
 # Podman 4.9 has no StopTimeout= key.

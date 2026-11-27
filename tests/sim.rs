@@ -11,7 +11,8 @@
 //!   (`203.0.113.16/29`, exempt or not), from private addresses, and odd
 //!   entries (IPv4-mapped IPv6, IPv6, no address, a malformed address,
 //!   another log type). Polls at regular and irregular intervals. The router
-//!   reachable, unreachable (transport error) or refusing writes while reads
+//!   reachable, unreachable (transport error), refusing writes while reads
+//!   work, or answering bans with HTTP 500 while reads and the other writes
 //!   work, and addresses listed by hand ("already listed"); a listed address
 //!   mostly stops reaching the NVR. Restarts with the saved state, with the
 //!   same config or with `ignoreip` changed (the owner's network or one
@@ -180,11 +181,13 @@
 //!   ban waits, while a ban that the router answers ends it):
 //!   alert once after `alert_after`, reminder after 24 h, one recovery or
 //!   "unknown" when an alerted problem ends, nothing for a short one, state
-//!   lost on restart. `health/condition` (all): an unreachable firewall is
-//!   observed only while the router is unreachable, a refused ban only while
-//!   it refuses writes. `health/stretch` (`Firewall`, `Backlog`): when the
-//!   router keeps a waiting ban from being applied for `alert_after`
-//!   (unreachable, or refusing), the alert has been sent by the first cycle
+//!   lost on restart. `health/condition` (all): a firewall check fails only
+//!   while the router is unreachable, a ban finds the firewall unusable
+//!   only while it is unreachable or answers bans with HTTP 500, and a ban is
+//!   refused only while it refuses writes. `health/stretch` (`Firewall`,
+//!   `Backlog`): when the router keeps a waiting ban from being applied for
+//!   `alert_after` (unreachable, answering bans with HTTP 500, or
+//!   refusing), the alert has been sent by the first cycle
 //!   after that.
 //! - `start/count` (all): an engine start whose firewall check the router
 //!   answered ends with one request for the entries of the address-list
@@ -511,6 +514,8 @@ enum Router {
     Ok,
     Unreachable,
     Refusing,
+    /// Every ban gets HTTP 500; reads and the other writes work.
+    ServerError,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1154,6 +1159,13 @@ struct Sim {
     /// Removals of `OWN` and reports of it in a dry run.
     own_removed: usize,
     own_kept: usize,
+    /// Whether the router answered bans with HTTP 500 at some time.
+    server_error: bool,
+    /// Checks that worked while only failed bans had shown the firewall
+    /// problem: those that withdrew it, and those that left it open
+    /// because bans waited.
+    write_withdrawn: usize,
+    write_held: usize,
     /// The safe list, if the scenario has one.
     safe: Option<SafeSim>,
     /// The host name in `ignoreip`, if the scenario has one, and the
@@ -1273,6 +1285,9 @@ impl Sim {
             own_notices: 0,
             own_removed: 0,
             own_kept: 0,
+            server_error: false,
+            write_withdrawn: 0,
+            write_held: 0,
             safe,
             name,
             name_rng,
@@ -1373,6 +1388,7 @@ impl Sim {
         self.settle()?;
         if matches!(self.p.class, Class::Firewall | Class::Backlog) {
             self.check_stretches("firewall", Router::Unreachable)?;
+            self.check_stretches("firewall", Router::ServerError)?;
             self.check_stretches("ban-refused", Router::Refusing)?;
         }
         if self.p.class != Class::Clock {
@@ -1843,10 +1859,9 @@ impl Sim {
             Kind::Router => {
                 let mode = if self.router != Router::Ok {
                     Router::Ok
-                } else if self.rng.chance(50) {
-                    Router::Unreachable
                 } else {
-                    Router::Refusing
+                    self.rng
+                        .pick(&[Router::Unreachable, Router::Refusing, Router::ServerError])
                 };
                 self.set_router(mode);
                 Ok(())
@@ -1930,7 +1945,9 @@ impl Sim {
             let mut f = self.h.fake.lock().unwrap();
             f.router_unreachable = mode == Router::Unreachable;
             f.refuse_writes = mode == Router::Refusing;
+            f.ban_status = (mode == Router::ServerError).then_some(500);
         }
+        self.server_error |= mode == Router::ServerError;
         self.note(format!("router {:?}", mode));
     }
 
@@ -2436,6 +2453,9 @@ impl Sim {
                 cycle.router_pass = true;
                 self.health.write_failed = false;
                 self.health.withdraw("firewall");
+                self.write_withdrawn += 1;
+            } else {
+                self.write_held += 1;
             }
             self.health.pass("firewall-rule");
         }
@@ -2448,9 +2468,15 @@ impl Sim {
         if own.logins > 0 {
             events.push(format!("{} own failed login(s) not counted", own.logins));
         }
-        if (cycle.transport || check_failed) && self.router != Router::Unreachable {
+        if check_failed && self.router != Router::Unreachable {
             return Err(format!(
-                "[health/condition] the firewall was found unreachable while the router was {:?}",
+                "[health/condition] the firewall check failed while the router was {:?}",
+                self.router
+            ));
+        }
+        if cycle.transport && ![Router::Unreachable, Router::ServerError].contains(&self.router) {
+            return Err(format!(
+                "[health/condition] a ban found the firewall unusable while the router was {:?}",
                 self.router
             ));
         }
@@ -3127,8 +3153,11 @@ fn run_class(class: Class) {
     // alerts, own address removed, own address reported in a dry run,
     // scenarios with a safe list, writes to it, scenarios with a name in
     // ignoreip, its look-ups and changes, bans and reports of its addresses
-    // (after they left its answer)
-    let mut stats = [0usize; 16];
+    // (after they left its answer), scenarios with the router answering
+    // bans with HTTP 500, those with a ban that got it, notices that
+    // withdrew the firewall problem, checks that worked while only failed
+    // bans had shown it (withdrawing it, or leaving it open)
+    let mut stats = [0usize; 21];
     for &seed in &seeds {
         let mut sim = Sim::new(seed);
         let result = match catch_unwind(AssertUnwindSafe(|| sim.run())) {
@@ -3167,6 +3196,19 @@ fn run_class(class: Class) {
                 .iter()
                 .filter(|(_, ip, k)| *k != Ban::Listed && NAMED.contains(&ip.to_string().as_str()))
                 .count(),
+            usize::from(sim.server_error),
+            usize::from(
+                sim.cycles
+                    .iter()
+                    .any(|c| c.router == Router::ServerError && c.transport),
+            ),
+            sim.cycles
+                .iter()
+                .flat_map(|c| &c.notices)
+                .filter(|n| *n == "unknown firewall")
+                .count(),
+            sim.write_withdrawn,
+            sim.write_held,
         ];
         for (total, n) in stats.iter_mut().zip(seen) {
             *total += n;
@@ -3184,7 +3226,10 @@ fn run_class(class: Class) {
          reports {}, health alerts {} (ban-bypassed {}), addresses due for liveness {}, \
          addresses with a shift {}, own address removed {} (reported in a dry run {}), safe \
          list in {} scenario(s) ({} write(s)), ignoreip name in {} scenario(s) ({} look-up(s), \
-         {} change(s), {} ban(s) or report(s) of its addresses); peak fake threads {} (at most {}){}",
+         {} change(s), {} ban(s) or report(s) of its addresses), bans answered with HTTP 500 \
+         in {} scenario(s) ({} with a failed ban), firewall problem withdrawn {} time(s) with a \
+         notice ({} withdrawn, {} left open by a check that worked); peak fake threads {} (at \
+         most {}){}",
         class,
         seeds.len(),
         stats[0],
@@ -3205,6 +3250,11 @@ fn run_class(class: Class) {
         stats[13],
         stats[14],
         stats[15],
+        stats[16],
+        stats[17],
+        stats[18],
+        stats[19],
+        stats[20],
         fake::peak_threads(),
         MAX_FAKE_THREADS,
         conntrack

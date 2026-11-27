@@ -166,6 +166,9 @@ pub struct Fake {
     pub rest_status: Option<u16>,
     /// Answer every PUT with this HTTP status, reads work.
     pub put_status: Option<u16>,
+    /// Answer every ban (a PUT to `cctv_ban`) with this HTTP status; reads
+    /// and the other writes work.
+    pub ban_status: Option<u16>,
     /// Answer every REST request with HTTP 200 and an HTML page, as a proxy
     /// in front of the router might.
     pub rest_html: bool,
@@ -183,8 +186,8 @@ pub struct Fake {
     pub identity_requests: u32,
     /// (address, outcome) of every PUT that reached the router: `accepted`,
     /// `duplicate`, `refused`, `refused-listed` (refused, but the address is
-    /// listed), `down` or `status` (answered with `rest_status` or
-    /// `put_status`).
+    /// listed), `down` or `status` (answered with `rest_status`,
+    /// `put_status` or `ban_status`).
     pub put_log: Vec<(String, &'static str)>,
     /// (address, outcome) of every DELETE of an address-list entry that
     /// reached the router: `removed`, `refused` (`refuse_writes`), `status`
@@ -360,6 +363,10 @@ fn route(
             .or(f.put_status.filter(|_| method == "PUT"))
             .or(f.delete_status.filter(|_| method == "DELETE"));
         let status = status.or(f.put_status.filter(|_| method == "PATCH"));
+        let ban = method == "PUT"
+            && path.starts_with("/rest/ip/firewall/address-list")
+            && between(body, "\"list\":\"", "\"") == "cctv_ban";
+        let status = status.or(f.ban_status.filter(|_| ban));
         if let Some(code) = status {
             if path.starts_with("/rest/ip/firewall/address-list") && method == "PUT" {
                 let address = between(body, "\"address\":\"", "\"").to_string();

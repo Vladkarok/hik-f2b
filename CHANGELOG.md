@@ -8,6 +8,12 @@ published as the container image `ghcr.io/vladkarok/hik-f2b:<version>`
 
 ## [Unreleased]
 
+### Changed
+
+- The code was restructured, with no change in behaviour: what the router
+  answers to a request is sorted in one place instead of four, and that
+  sorting has unit tests.
+
 ## [0.5.1] - 2026-11-26
 
 ### Changed

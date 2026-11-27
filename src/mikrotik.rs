@@ -15,6 +15,7 @@ use crate::action::{BanError, BanTime, Checked, Firewall, HealthError, Kept, Rem
 use crate::config::MikrotikCfg;
 use crate::{http, util};
 use std::net::Ipv4Addr;
+use std::ops::Range;
 
 const MAX_BODY: u64 = 1024 * 1024;
 
@@ -161,6 +162,16 @@ fn id_of(object: &str) -> Option<&str> {
     ok.then_some(id)
 }
 
+/// What the router answered to one request, when the answer can be used.
+#[derive(Debug, PartialEq)]
+enum Answer {
+    /// A status the caller accepts, with the reply body.
+    Body(String),
+    /// HTTP 4xx other than 401 and 403: an answer about this request
+    /// (`HTTP <code>: <detail>`).
+    AboutRequest(String),
+}
+
 /// The start of an answer, for an error message.
 fn shown(body: &str) -> String {
     format!("{:?}", util::sanitize(body.trim(), 40))
@@ -211,14 +222,40 @@ impl Mikrotik {
             .query(".proplist", properties)
             .set("Authorization", &self.auth)
             .call();
+        match Self::classify(result, 200..201)? {
+            Answer::Body(body) => Ok(body),
+            // A question that the router does not accept: as for any other
+            // error status, it says nothing about one address.
+            Answer::AboutRequest(message) => Err(BanError::Router(message)),
+        }
+    }
+
+    /// Sorts what came back for one request. `accepted` holds the statuses
+    /// that mean the request was done. Every request to the router goes
+    /// through here, so that all of them tell an answer about this request
+    /// from an error that would come back for every request.
+    fn classify(
+        result: Result<ureq::Response, ureq::Error>,
+        accepted: Range<u16>,
+    ) -> Result<Answer, BanError> {
         match result {
-            Ok(resp) if resp.status() == 200 => {
-                http::read_body(resp, MAX_BODY).map_err(BanError::Transport)
+            Ok(resp) if accepted.contains(&resp.status()) => {
+                // read also when the caller does not need it, so that the
+                // connection can be used again
+                http::read_body(resp, MAX_BODY)
+                    .map(Answer::Body)
+                    .map_err(BanError::Transport)
             }
             Ok(resp) => Err(BanError::Router(format!(
                 "unexpected HTTP {}",
                 resp.status()
             ))),
+            Err(ureq::Error::Status(code, resp))
+                if (400..500).contains(&code) && code != 401 && code != 403 =>
+            {
+                // An answer about this request.
+                Ok(Answer::AboutRequest(Self::failure(code, resp)))
+            }
             Err(ureq::Error::Status(code, resp)) => Err(Self::status_error(code, resp)),
             Err(e) => Err(BanError::Transport(util::sanitize(&e.to_string(), 200))),
         }
@@ -383,9 +420,8 @@ impl Mikrotik {
             .set("Authorization", &self.auth)
             .set("Content-Type", "application/json")
             .send_string(&body);
-        match result {
-            Ok(resp) if (200..300).contains(&resp.status()) => {
-                let answer = http::read_body(resp, MAX_BODY).map_err(BanError::Transport)?;
+        match Self::classify(result, 200..300)? {
+            Answer::Body(answer) => {
                 if is_object(&answer) {
                     Ok(true)
                 } else {
@@ -399,15 +435,7 @@ impl Mikrotik {
                     )))
                 }
             }
-            Ok(resp) => Err(BanError::Router(format!(
-                "unexpected HTTP {}",
-                resp.status()
-            ))),
-            Err(ureq::Error::Status(code, resp))
-                if (400..500).contains(&code) && code != 401 && code != 403 =>
-            {
-                // An answer about this request.
-                let message = Self::failure(code, resp);
+            Answer::AboutRequest(message) => {
                 if message.contains(DUPLICATE_TEXT) {
                     return Ok(false);
                 }
@@ -420,8 +448,6 @@ impl Mikrotik {
                     Err(e) => Err(e),
                 }
             }
-            Err(ureq::Error::Status(code, resp)) => Err(Self::status_error(code, resp)),
-            Err(e) => Err(BanError::Transport(util::sanitize(&e.to_string(), 200))),
         }
     }
 
@@ -439,23 +465,9 @@ impl Mikrotik {
             .set("Authorization", &self.auth)
             .set("Content-Type", "application/json")
             .send_string(&body);
-        match result {
-            Ok(resp) if (200..300).contains(&resp.status()) => {
-                // read, so that the connection can be used again
-                http::read_body(resp, MAX_BODY).map_err(BanError::Transport)?;
-                Ok(())
-            }
-            Ok(resp) => Err(BanError::Router(format!(
-                "unexpected HTTP {}",
-                resp.status()
-            ))),
-            Err(ureq::Error::Status(code, resp))
-                if (400..500).contains(&code) && code != 401 && code != 403 =>
-            {
-                Err(BanError::Refused(Self::failure(code, resp)))
-            }
-            Err(ureq::Error::Status(code, resp)) => Err(Self::status_error(code, resp)),
-            Err(e) => Err(BanError::Transport(util::sanitize(&e.to_string(), 200))),
+        match Self::classify(result, 200..300)? {
+            Answer::Body(_) => Ok(()),
+            Answer::AboutRequest(message) => Err(BanError::Refused(message)),
         }
     }
 
@@ -476,28 +488,13 @@ impl Mikrotik {
             .delete(&format!("{}/ip/firewall/address-list/{}", self.base, id))
             .set("Authorization", &self.auth)
             .call();
-        match result {
-            Ok(resp) if (200..300).contains(&resp.status()) => {
-                // read, so that the connection can be used again
-                http::read_body(resp, MAX_BODY).map_err(BanError::Transport)?;
-                Ok(())
-            }
-            Ok(resp) => Err(BanError::Router(format!(
-                "unexpected HTTP {}",
-                resp.status()
-            ))),
-            Err(ureq::Error::Status(code, resp))
-                if (400..500).contains(&code) && code != 401 && code != 403 =>
-            {
-                let message = Self::failure(code, resp);
-                match self.ids(ip) {
-                    Ok(ids) if !ids.iter().any(|i| i == id) => Ok(()),
-                    Ok(_) => Err(BanError::Refused(message)),
-                    Err(e) => Err(e),
-                }
-            }
-            Err(ureq::Error::Status(code, resp)) => Err(Self::status_error(code, resp)),
-            Err(e) => Err(BanError::Transport(util::sanitize(&e.to_string(), 200))),
+        match Self::classify(result, 200..300)? {
+            Answer::Body(_) => Ok(()),
+            Answer::AboutRequest(message) => match self.ids(ip) {
+                Ok(ids) if !ids.iter().any(|i| i == id) => Ok(()),
+                Ok(_) => Err(BanError::Refused(message)),
+                Err(e) => Err(e),
+            },
         }
     }
 
@@ -815,5 +812,208 @@ mod tests {
         assert_eq!(left_out(1, 0), "; left out: 1 disabled");
         assert_eq!(left_out(0, 2), "; left out: 2 invalid");
         assert_eq!(left_out(1, 2), "; left out: 1 disabled, 2 invalid");
+    }
+
+    fn response(status: u16, body: &str) -> ureq::Response {
+        ureq::Response::new(status, "Status", body).unwrap()
+    }
+
+    fn status(code: u16, body: &str) -> ureq::Error {
+        ureq::Error::Status(code, response(code, body))
+    }
+
+    #[test]
+    fn an_accepted_status_gives_the_body() {
+        let body = r#"{".id":"*1"}"#;
+        assert_eq!(
+            Mikrotik::classify(Ok(response(200, body)), 200..201),
+            Ok(Answer::Body(body.to_string()))
+        );
+        assert_eq!(
+            Mikrotik::classify(Ok(response(204, "")), 200..300),
+            Ok(Answer::Body(String::new()))
+        );
+    }
+
+    #[test]
+    fn a_body_that_cannot_be_read_is_a_transport_error() {
+        let big = "x".repeat(MAX_BODY as usize + 1);
+        assert_eq!(
+            Mikrotik::classify(Ok(response(200, &big)), 200..300),
+            Err(BanError::Transport("response is too large".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_success_status_outside_the_accepted_ones_is_unexpected() {
+        assert_eq!(
+            Mikrotik::classify(Ok(response(204, "")), 200..201),
+            Err(BanError::Router("unexpected HTTP 204".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_client_error_other_than_401_and_403_is_an_answer_about_this_request() {
+        for code in [400, 404, 409, 499] {
+            assert_eq!(
+                Mikrotik::classify(
+                    Err(status(code, "failure: already have such entry")),
+                    200..300
+                ),
+                Ok(Answer::AboutRequest(format!(
+                    "HTTP {}: failure: already have such entry",
+                    code
+                ))),
+                "{}",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn a_refused_login_is_a_login_error() {
+        for code in [401, 403] {
+            assert_eq!(
+                Mikrotik::classify(Err(status(code, "not allowed")), 200..300),
+                Err(BanError::Login(format!("HTTP {}: not allowed", code))),
+                "{}",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn a_server_error_is_a_router_error() {
+        for code in [500, 503] {
+            assert_eq!(
+                Mikrotik::classify(Err(status(code, "<html>proxy error</html>")), 200..300),
+                Err(BanError::Router(format!(
+                    "HTTP {}: <html>proxy error</html>",
+                    code
+                ))),
+                "{}",
+                code
+            );
+        }
+    }
+
+    #[test]
+    fn an_error_without_a_status_is_a_transport_error() {
+        // an unknown scheme fails before any socket is opened
+        let result = ureq::get("nosuchscheme://192.0.2.1/rest").call();
+        let text = match &result {
+            Err(e @ ureq::Error::Transport(t)) => {
+                assert_eq!(t.kind(), ureq::ErrorKind::UnknownScheme);
+                util::sanitize(&e.to_string(), 200)
+            }
+            other => panic!("not a transport error: {:?}", other),
+        };
+        assert!(!text.is_empty());
+        assert_eq!(
+            Mikrotik::classify(result, 200..300),
+            Err(BanError::Transport(text))
+        );
+    }
+
+    const TABLE: &str = "ip/firewall/raw";
+
+    fn safe_verdict(rules: SafeRules) -> Result<String, String> {
+        rules.verdict(TABLE, "own", "blocked")
+    }
+
+    #[test]
+    fn a_usable_safe_rule_is_enough() {
+        let ok = Ok("2 enabled accept rule(s) in /ip/firewall/raw with \
+                     src-address-list=own before the drop rule for blocked"
+            .to_string());
+        let usable = SafeRules {
+            usable: 2,
+            ..SafeRules::default()
+        };
+        assert_eq!(safe_verdict(usable), ok);
+        // rules that do not count do not matter then
+        let mixed = SafeRules {
+            usable: 2,
+            disabled: 1,
+            invalid: 1,
+            other_action: 1,
+            after: 1,
+        };
+        assert_eq!(safe_verdict(mixed), ok);
+    }
+
+    #[test]
+    fn no_safe_rule_says_to_add_one() {
+        assert_eq!(
+            safe_verdict(SafeRules::default()),
+            Err(
+                "no rule in /ip/firewall/raw has src-address-list=own: add one with \
+                 action=accept above the drop rule for blocked, in the same table"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn safe_rules_that_do_not_count_name_each_reason_and_its_fix() {
+        let one = |rules: SafeRules, found: &str, fix: &str| {
+            assert_eq!(
+                safe_verdict(rules),
+                Err(format!(
+                    "no rule in /ip/firewall/raw with src-address-list=own counts ({}): {}",
+                    found, fix
+                ))
+            );
+        };
+        let none = SafeRules::default;
+        one(
+            SafeRules {
+                disabled: 1,
+                ..none()
+            },
+            "1 disabled",
+            "enable it",
+        );
+        one(
+            SafeRules {
+                invalid: 2,
+                ..none()
+            },
+            "2 invalid",
+            "make it valid",
+        );
+        one(
+            SafeRules {
+                other_action: 3,
+                ..none()
+            },
+            "3 with another action",
+            "set action=accept",
+        );
+        one(
+            SafeRules { after: 4, ..none() },
+            "4 after the drop rule",
+            "move it above the drop rule",
+        );
+        one(
+            SafeRules {
+                usable: 0,
+                disabled: 1,
+                invalid: 2,
+                other_action: 3,
+                after: 4,
+            },
+            "1 disabled, 2 invalid, 3 with another action, 4 after the drop rule",
+            "enable it, make it valid, set action=accept, move it above the drop rule",
+        );
+        one(
+            SafeRules {
+                invalid: 1,
+                after: 2,
+                ..none()
+            },
+            "1 invalid, 2 after the drop rule",
+            "make it valid, move it above the drop rule",
+        );
     }
 }
